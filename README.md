@@ -20,8 +20,7 @@ please see this file "README.md" and the txt like "readme.txt","GPL.txt" in ISOf
 The following,
 
 `In the "ISO files and their ISO Extracted dirs" `, 
-
- 	I named  ``the files whose localed in the Directorys "tolset" and "project" `` as `contextA`
+	I named  ``the files whose localed in the Directorys "tolset" and "project"``  as  ***contextA***
 
 
 
@@ -82,7 +81,7 @@ and the other files in `contextA` is all LICENSE **KL-01**(author said )
 
 在 `ISO镜像文件及其解压出来的目录（如30days-Origin-ISOfiles） `中，
 
-​      我把 ``"tolset"和"project"两个目录`` 称为 `contextA`
+​      我把 ``"tolset"和"project"两个目录`` 称为  ***contextA***
 
 
 
