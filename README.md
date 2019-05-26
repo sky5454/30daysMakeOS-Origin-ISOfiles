@@ -11,7 +11,7 @@ The hex tools `Bz1621.zip`
 
 And the same dirs is their Extracted files.    
 
-  
+  <br/>
 
 ### LICENSE
 
@@ -22,13 +22,13 @@ The following,
 `In the "ISO files and their ISO Extracted dirs" `,   
 	I named  ``the files whose localed in the Directorys "tolset" and "project"``  as  ***contextA***
 
-
+<br/>
 
 And about the `contextA` has 3 different LICENSE: GPL, LGPL, KL-01  
 
 **NOTE:** The other files which isn't in contextA has another unfree LISENCE , maybe.  
 
-
+<br/>
 
 only those files in`contextA` is **GPL**
 
@@ -83,13 +83,13 @@ and the other files in `contextA` is all LICENSE **KL-01**(author said )
 
 ​      我把 ``"tolset"和"project"两个目录`` 称为  ***contextA***
 
-
+<br/>
 
 在 `contextA` 中有三种不同的许可协议： GPL, LGPL, KL-01  
 
 **NOTE:** 不属于 `contextA` 的可能是非自由的许可协议  
 
-
+<br/>
 
 在`contextA`里，只有以下文件是 **GPL**
 
