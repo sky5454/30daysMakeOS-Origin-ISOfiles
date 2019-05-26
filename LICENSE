@@ -11,7 +11,10 @@ as `contextA`
 
 
 And about the `contextA` has 3 different LICENSE: GPL, LGPL, KL-01
-please see the file "README.md"
+please see the file "README.md" and the txt like "readme.txt","GPL.txt" in ISOfiles.
+
+NOTE:** The other files which isn't in contextA has another unfree LISENCE , maybe.  
+NOTE:** The other files which isn't in contextA has another unfree LISENCE , maybe.  
 
 
 ======================================================
@@ -27,4 +30,7 @@ please see the file "README.md"
 
 
 在 `contextA` 中有三种不同的许可协议： GPL, LGPL, KL-01，
-具体请看"README.md"
+具体请看"README.md"以及ISO里的txt文件，如"readme.txt","GPL.txt"
+
+NOTE:** 不属于 `contextA` 的可能是非自由的许可协议  
+NOTE:** 不属于 `contextA` 的可能是非自由的许可协议  

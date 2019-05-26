@@ -15,6 +15,8 @@ And the same dirs is their Extracted files.
 
 ### LICENSE
 
+please see this file "README.md" and the txt like "readme.txt","GPL.txt" in ISOfiles.  
+
 The following,
 
 `In the "ISO files and their ISO Extracted dirs" `, 
@@ -23,11 +25,13 @@ The following,
 
 
 
-And about the `contextA` has 3 different LICENSE: GPL, LGPL, KL-01
+And about the `contextA` has 3 different LICENSE: GPL, LGPL, KL-01  
+
+**NOTE:** The other files which isn't in contextA has another unfree LISENCE , maybe.  
 
 
 
-only those files in`contextA` is <b>GPL</b>
+only those files in`contextA` is **GPL**
 
 ```GPL
 ccl.exe
@@ -37,7 +41,7 @@ make.exe
 upx.exe
 ```
 
-only those files in `contextA` is <b>LGPL</b>
+only those files in `contextA` is **LGPL**
 
 ```LGPL
 t5lzma.exe
@@ -46,11 +50,13 @@ qemu/bios.bin
 qemu/SDL.dll
 ```
 
-and the other files in `contextA` is all LICENSE `KL-01`(author said )
+and the other files in `contextA` is all LICENSE **KL-01**(author said )  
 
-  <br/>
 
-  <br/>
+
+ <br/>
+
+ <br/>
 
 <hr/>
 
@@ -70,6 +76,8 @@ and the other files in `contextA` is all LICENSE `KL-01`(author said )
 
 ### LICENSE许可协议
 
+具体请看本"README.md"以及ISO里的txt文件，如"readme.txt","GPL.txt"  
+
 在以下说明里，
 
 在 `ISO镜像文件及其解压出来的目录（如30days-Origin-ISOfiles） `中，
@@ -78,11 +86,13 @@ and the other files in `contextA` is all LICENSE `KL-01`(author said )
 
 
 
-在 `contextA` 中有三种不同的许可协议： GPL, LGPL, KL-01
+在 `contextA` 中有三种不同的许可协议： GPL, LGPL, KL-01  
+
+**NOTE:** 不属于 `contextA` 的可能是非自由的许可协议  
 
 
 
-在`contextA`里，只有以下文件是 <b>GPL</b>
+在`contextA`里，只有以下文件是 **GPL**
 
 ```GPL
 ccl.exe
@@ -92,7 +102,7 @@ make.exe
 upx.exe
 ```
 
-在`contextA`里，只有以下文件是 <b>LGPL</b>
+在`contextA`里，只有以下文件是 **LGPL**
 
 ```LGPL
 t5lzma.exe
@@ -101,8 +111,8 @@ qemu/bios.bin
 qemu/SDL.dll
 ```
 
-在`contextA`中的其他文件均为 `KL-01`协议（作者如是说）  
+在`contextA`中的其他文件均为 **KL-01** 协议（作者如是说）  
 
 =============End
 
-  <br/>
+<br/>
