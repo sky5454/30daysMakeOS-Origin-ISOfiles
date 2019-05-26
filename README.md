@@ -1,17 +1,17 @@
 # 30daysMakeOS-Origin-ISOfiles
 《30天自制操作系统》光盘完整原版镜像文件
 
-the full files from Internet, it also with the [CSDN community's zip](https://download.csdn.net/download/gaohuaid/8316111)
+the full files from Internet, which are also same as the [CSDN community's zip](https://download.csdn.net/download/gaohuaid/8316111)
 
 The full file: `《30天自制操作系统》原版-30days-Origin.iso `
 
 The hex tools `Bz1621.zip`
 
-And the same dirs is their Extracted files.
+And the same dirs is their Extracted files.  
 
-  
+  <br/>
 
-  
+  <br/>
 
 <hr/>
 
