@@ -1,0 +1,79 @@
+# ASKA Makefile for use with GNU Make 
+# and Mingw GNU gcc/g++
+# By Sakamoto, Naruyoshi (RisaPapa)
+# ringring@zb4.so-net.ne.jp
+
+# Compile Tested with Mingw1.1
+# Mingw1.1 Download URL:
+# http://prdownloads.sourceforge.net/mingw/MinGW-1.1.tar.gz 
+
+# Setting Up Environment Variables
+# 
+# REM ### autoexec.bat
+# 
+# set MINGW=c:\mingw
+# set PATH=%MINGW%\bin;%MINGW%\lib\gcc-lib\mingw32\2.95.3-6;%PATH%
+# set GCC_EXEC_PREFIX=%MINGW%\lib\gcc-lib\mingw32\2.95.3-6
+# set LIBRARY_PATH=%MINGW%\lib;%MINGW%\lib\gcc-lib\mingw32\2.95.3-6
+# set C_INCLUDE_PATH=%MINGW%\include
+# set CPLUS_INCLUDE_PATH=%MINGW%\include\g++-3
+# set OBJC_INCLUDE_PATH=%MINGW%\lib\gcc-lib\mingw32\2.95.3-6\include\obj
+# REM set LANG=C-SJIS
+# 
+# Memory Setting For Environment Variables On Windows98
+# 
+# REM ### config.sys
+#
+# shell=C:\WINDOWS\COMMAND.COM /P /E:4096
+#
+
+
+#
+# Macro Fix
+#
+
+O = o
+A = a
+C = c
+CPP = cpp
+CC = g++
+LD = g++
+GC = gcc
+CFLAGS = -O2 -I. -DLINUX
+CPPFLAGS =
+PGNAME = aska
+
+#
+# SRC Directory
+#
+
+SRCDIR=
+
+#
+# Target
+#
+
+SRCS =${SRCDIR}main.${CPP} ${SRCDIR}parser.${CPP} ${SRCDIR}module.${CPP} \
+	${SRCDIR}generator.${CPP} ${SRCDIR}filepath.${CPP} ${SRCDIR}scanner.${CPP} \
+	${SRCDIR}stringx.${CPP} ${SRCDIR}table.${CPP} ${SRCDIR}textmodule.${CPP}
+
+OBJS = ${SRCDIR}main.${O} ${SRCDIR}parser.${O} ${SRCDIR}module.${O} \
+	${SRCDIR}generator.${O} ${SRCDIR}filepath.${O} ${SRCDIR}scanner.${O} \
+	${SRCDIR}stringx.${O} ${SRCDIR}table.${O} ${SRCDIR}textmodule.${O}
+
+%.${O} : ${SRCDIR}%.${CPP}
+	${CC} ${CPPFLAGS} ${CFLAGS} -c $*.${CPP}
+
+all: ${PGNAME}
+
+${PGNAME}: ${OBJS}
+	${LD} -o ${PGNAME} ${OBJS} ${LDFLAGS}
+	strip ${PGNAME}
+
+distclean: clean
+
+clean:
+	rm -f .depend a.out core ${PGNAME}
+	rm -f ${SRCDIR}*.${O} *~
+
+# Are You Ready to Be A Member of OSASK Project Now?

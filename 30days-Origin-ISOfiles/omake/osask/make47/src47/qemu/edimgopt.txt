@@ -1,0 +1,2 @@
+ovrcopy from:osask_qe.sys to:@:OSASK.SYS
+copy from:qemu/OSASK0.PSF to:@:

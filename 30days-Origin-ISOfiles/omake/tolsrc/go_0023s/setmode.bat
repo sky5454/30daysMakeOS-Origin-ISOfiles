@@ -1,0 +1,1 @@
+copy include\rules.%1 include\rules.mak

@@ -1,0 +1,7892 @@
+/* "pioneer0":ぐいぐいの標準ライブラリ ver.3.7
+    copyright(C) 2005 H.Kawai (川合秀実), I.Tak., KIYOTO */
+
+/* これは、アプリケーションを書きやすくするための各種サービスを提供するプログラム。
+   結局のところ、処理をshellcallに取り次いでいるだけ。
+   shellcallの仕様は流動的なので、このライブラリがその変化を吸収しているともいえる。 */
+
+/* スタックは1KBくらいあれば問題は無いだろう。 */
+
+#include "osaskinc.ask"
+
+segment CODE(USE32, PARA);
+default(code == CODE);
+default(data == CODE);
+
+#define SAFEAPI_FLAG 2
+
+#if (defined(SAFEAPI_FLAG))
+	void signal_cut_mode();
+	/* 一文ではないので、if文などでは{}で括るのを忘れずに */
+	#define SAFE_CUT(msg)	signal_cut_mode(); asmout(msg);
+#else
+	#define SAFE_CUT(msg)	INT(0x03)
+#endif
+/* softint禁止の関係で、SAFE_CUTできない場合 */
+#define SAFE_CUT0(msg)	INT(0x03)
+
+#if (defined(WIN9X))
+	#define	DEFAULT_TBOX_BCOL	8
+
+#elif (defined(TMENU))
+	#define DEFAULT_TBOX_BCOL	15
+
+#elif (defined(CHO_OSASK))
+	#define DEFAULT_TBOX_BCOL	8
+
+#elif (defined(NEWSTYLE))
+	#define DEFAULT_TBOX_BCOL	8
+
+#elif (defined(WIN31))
+	#define	DEFAULT_TBOX_BCOL	15
+
+#endif
+
+struct WORK { /* 256bytes */
+	char signature[8]; int children_back, children_next;
+	int softint_EIP, softint_CS, nest /* user用 */, read_ptr /* system用 */;
+	int softint_ret_buf[16], softint_mask_buf[16]; /* system用 */
+	int signalbox_read_free, signalbox_eos, signalbox_rewind, signaldw /* user用 */;
+	int signalbox_write_free, signalbox_write_ptr,
+		signalbox_write_ptr0, signalbox_write_ptr1; /* user用 */
+	char signalbox_status, ending_count, [14];
+	/* 空きは144バイト */
+};
+
+struct WINDOW {	/* 128bytes */
+	char signature[8];
+	int chain_back, chain_next;
+	int children_back, children_next;
+	int x_size, y_size, x_ofs, y_ofs;
+	int slot;
+	unsigned char mode0, draw_enable, siglen, sigflag;
+	int signalhead[16];
+	unsigned char flags; /* bit3:frame only */
+	/* 空きは63バイト */
+};
+/* closetextbox/コンポーネントの描画を抑制した。コンポーネントにも付けるフラグ */
+#define WINFLAG_MUSTREDRAW	1
+/* drawblockが実行されたが描画を抑制した。*/
+#define WINFLAG_DIRTYGBOX	2
+/* title色が変わった */
+#define WINFLAG_TITLE		4
+/* ウィンドウがコンポーネントで一杯なので枠しか描画しない */
+#define WINFLAG_FRAMEONLY	8
+/* ユーザがウィンドウ全体を自力で描画するので↑の判定をしない */
+#define WINFLAG_USERCONTROL	16
+
+struct TEXTBOX { /* 64bytes */
+	char signature[8];
+	int chain_back, chain_next;
+	int x_size, y_size, x0, y0;
+	int option, backcolor, charset, window;
+	int blank;
+	char flags;
+	void [11]; /* 空きは11バイト */
+	int buffer[0];
+};
+
+struct GRAPHBOX { /* 64bytes */
+	char signature[8];
+	int chain_back, chain_next;
+	unsigned char mode, [1], flags, [1];
+	int mode_opt, x_bsize, y_bsize; /* バッファ属性(これはユーザーが管理する) */
+	int x_vsize, y_vsize, x0, y0; /* 表示上の属性(これもユーザーが管理する) */
+	int window, vbuf0, vx0, vy0;
+	int buffer[0];
+};
+
+void drawcomponent();
+void drawwindow();
+void drawwindow_back();
+void drawwindow_frame();
+void textbox_drawback(); /* テキストボックスの背景描画ルーチン */
+void lineconv();
+void sendusersignal();
+void titlebox_redraw();
+
+/*
+	スロットの使用状況
+		0x0000～0x0170 : shell-call側でリザーブ
+		0x01c0～0x01e0 : システムタイマー
+		0x01f0         : pioneerのワークエリア位置などを保存
+		0x0200～0x03f0 : ユーザーに解放
+*/
+
+void far pioneer0()
+/* Lv3のライブラリー
+   セグメントは、DS == FS == SSである事を仮定している。
+   コマンドはDS:EBX以降に格納されている。 */
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+
+	PUSHAD();
+	(offset) cmd = EBX;
+	CMP(cmd[0], 0x0004);
+	asmout("JE cmd004");
+	/* 最初のコマンドが初期化コマンドではない */
+
+	EBX = 0xffffffff;
+	EAX = 0x0004; /* read user-slot command */
+	ECX = 0x01f0; /* スロット番号(pioneerワークスロット) */
+	CALL(0x0017,0); /* shell-call */
+	(offset) work = EDX;
+
+	/* softint禁止 */
+	LEA(EBX, work->softint_mask_buf[0]); /* add_nest */
+//	work->softint_mask_buf[ 8] = 0xff80; /* (Llv変更しない) */
+	(int) [DS:EBX + 8] = 0xff80;
+	CALL(0x0017,0); /* shell-call(softint抑制) */
+
+asmout("nextcmd: equ $");
+	EAX = cmd[0];
+	if ((unsigned) EAX < 0x0130) {
+		TEST(EAX, 0x03);
+		if (== 0)
+			asmout("JMP DWORD CS:[EAX+.cmd_jumptable]");
+	}
+
+	/* コマンド番号エラー
+	   EAX    受理されなかったコマンド番号
+	   DS:ESI そのコマンドへのポインタ */
+
+cmderr:
+	LEA(EBX, work->softint_mask_buf[0]); /* add_nest(Llv変更しない) */
+	CALL(0x0017,0); /* shell-call(softint許可) */
+	(int) [SS:ESP + 16 /* EBX */] = (offset) cmd;
+	SAFE_CUT("DB ..$-$-1,'Invalid command ',0,'@',6,'.'");
+//	TEST(ESP, ESP); // ZF = 0
+	POPAD();
+	return;
+
+	ALIGN(4);
+cmd_jumptable:
+	asmout("DD cmd000,  .cmderr, cmd008,  cmd00c ");
+	asmout("DD cmd010,  cmd014,  cmd018,  cmd01c ");
+	asmout("DD cmd020,  cmd024,  cmd028,  cmd02c ");
+	asmout("DD cmd030,  cmd034,  .cmderr, cmd03c ");
+	asmout("DD cmd040,  cmd044,  cmd048,  cmd04c ");
+	asmout("DD cmd050,  cmd054,  cmd058,  cmd05c ");
+	asmout("DD cmd060,  .cmderr, cmd068,  cmd06c ");
+	asmout("DD cmd070,  cmd074,  cmd078,  cmd07c ");
+	asmout("DD cmd080,  cmd084,  .cmderr, cmd08c ");
+	asmout("DD .cmderr, .cmderr, .cmderr, .cmderr");
+	asmout("DD cmd0a0,  .cmderr, cmd0a8,  cmd0ac ");
+	asmout("DD cmd0b0,  .cmderr, .cmderr, .cmderr");
+	asmout("DD cmd0c0,  cmd0c4,  cmd0c8,  .cmderr");
+	asmout("DD cmd0d0,  .cmderr, .cmderr, .cmderr");
+	asmout("DD cmd0e0,  cmd0e4,  cmd0e8,  cmd0ec ");
+	asmout("DD cmd0f0,  .cmderr, .cmderr, .cmderr");
+	asmout("DD .cmderr, .cmderr, cmd108,  cmd10c ");
+	asmout("DD cmd050,  cmd114,  cmd118,  .cmderr");
+	asmout("DD cmd120,  .cmderr, .cmderr, .cmderr");
+}
+
+void far cmd000()
+/* 終了コマンド */
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+
+	(int) [SS:ESP + 16 /* EBX */] = (offset) cmd;
+
+	/* 待機中の割り込みを検査 */
+	if (work->nest == 0) { /* 割り込みはマスクされていない */
+		if (work->signalbox_read_free != 0) { /* バッファにシグナルがある */
+			PUSH(EAX); /* ESP -= 4;の代わり */
+			if ((unsigned) (int) [SS:ESP + 16 /* ESP */] != 1) {
+				/* ハンドラからの帰還要求は出ていない */
+
+				/* 新規割り込み
+				   スタックの積み替え
+
+				 <積み替え後のスタック構成>
+				   +0 ～  +31 : PUSHADイメージ
+				  +32 ～  +43 : EIP, CS, EFLAGS
+				  +44 ～  +59 : ES, DS, FS, GS
+				  +60 ～  +91 : PUSHADイメージ
+				  +92 ～ +103 : EIP, CS, EFLAGS
+
+				   +0 ～  +43は、shellcallルーチンのために用意する
+							(読み込まれると取り去られる)
+				  +44 ～ +103は、ハンドラが参照するために用意される */
+
+				PUSH(GS);
+				PUSH(FS);
+				PUSH(DS);
+				PUSH(ES);
+				PUSHFD();
+				ESP -= 40;
+				EAX = (int) [SS:ESP +  64]; // EDI
+				ECX = (int) [SS:ESP +  68]; // ESI
+				EDX = (int) [SS:ESP +  72]; // EBP
+				(int) [SS:ESP +  60] = EAX;
+				(int) [SS:ESP +  64] = ECX;
+				(int) [SS:ESP +  68] = EDX;
+				EAX = (int) [SS:ESP +  80]; // EBX
+				ECX = (int) [SS:ESP +  84]; // EDX
+				EDX = (int) [SS:ESP +  88]; // ECX
+				(int) [SS:ESP +  76] = EAX;
+				(int) [SS:ESP +  80] = ECX;
+				(int) [SS:ESP +  84] = EDX;
+				EAX = (int) [SS:ESP +  92]; // EAX
+				ECX = (int) [SS:ESP +  96]; // EIP
+				EDX = (int) [SS:ESP + 100]; // CS
+				(int) [SS:ESP +  88] = EAX;
+				(int) [SS:ESP +  92] = ECX;
+				(int) [SS:ESP +  96] = EDX;
+				EAX = (int) [SS:ESP + 40]; // EFLAGS
+				(int) [SS:ESP + 100] = EAX;
+			} else {
+				/* ハンドラからの帰還要求が出ている */
+
+				/* スタックの上位(+44 ～ +103)は完成している
+				   下位(+0 ～ +43)を作り直す */
+				EAX = (int) [SS:ESP + 100]; // EFLAGS
+				(int) [SS:ESP + 40] = EAX;
+			}
+			EAX = work->softint_EIP; /* ハンドラへのベクタ */
+			ECX = work->softint_CS;
+			(int) [SS:ESP + 32] = EAX;
+			(int) [SS:ESP + 36] = ECX;
+			(int) [SS:ESP + 12] = 2; /* リターン時のLlv */
+			work->nest--; /* 割り込んだので、マスクカウントを減少 */
+			PUSH(FS);
+			LEA(EBX, work->softint_ret_buf[0]);
+			work->softint_ret_buf[ 4] = 0;
+			work->softint_ret_buf[ 8] = 0x0080; /* 割り込み抑制解除 */
+			CALL(0x0017,0); /* GUIGUI統合shellcall */
+			INT(0x03); /* エラーが無い限り、ここにはこない */
+		}
+	}
+
+	/* ハンドラへの分岐はない */
+	if ((unsigned) (int) [SS:ESP + 12] == 1) {
+		/* 帰還 */
+		ESP += 40; /* いらない部分を捨てる(EDI～EAX, CS:EIP) */
+		POP(ES);
+		POP(DS);
+		POP(EAX); /* FSへ直接ロードせずに、EAXに入れておく */
+		POP(GS);
+		(int) [SS:ESP + 12] = 2; /* リターン時のLlv */
+		PUSH(EAX); /* ここで復帰後のFSを積む */
+		LEA(EBX, work->softint_ret_buf[0]);
+		work->softint_ret_buf[ 4] = 0;
+		work->softint_ret_buf[ 8] = 0x0080; /* 割り込み抑制解除 */
+		CALL(0x0017,0); /* GUIGUI統合shellcall */
+		INT(0x03); /* エラーが無い限り、ここにはこない */
+	}
+
+	/* 何もないので、普通の正常終了 */
+	LEA(EBX, work->softint_mask_buf[0]); /* add_nest(Llv変更しない) */
+	CALL(0x0017,0); /* shell-call */
+//	(int) [SS:ESP + 16 /* EBX */] = (offset) cmd;
+	CMP(EAX, EAX); /* ZF = 1, CF = 0 */
+	POPAD();
+	return;
+}
+
+void cmd0004_getbECX();
+void cmd0004_getb(); /* CFに返す */
+void cmd0004_decode();
+void cmd0004_decode2();
+void cmd0004_decode_tek1();
+void cmd0004_decode_tek2();
+void cmd0004_decode_tek5();
+
+void far cmd004()
+/* pioneer0ライブラリ初期化コマンド */
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+
+	/* work初期化(256bytes)
+	   optionフィールドをもつ(malloc領域などのため)
+	   malloc領域などの設定は、別のコマンドであとからやる。 */
+	EAX = cmd[4] /* opt */;
+	TEST(AL, 0x03);
+	if (!= 0)
+		goto special;
+	XCHG(EAX, (offset) work);
+	(offset) cmd += 8;
+	(int) work->signature[0] = 0x6e6f6970 ; /* pion */
+	(int) work->signature[4] = 0x30726565 ; /* eer0 */
+	LEA(EAX, work->children_back);
+	work->children_back = EAX;
+	work->children_next = EAX;
+	EAX = 0;
+//	work->nest = 0xffffffff;
+	work->read_ptr = EAX /* 0 */;
+	work->softint_ret_buf[ 0] = 0x0208;
+	work->softint_ret_buf[12] = EAX /* 0 */;
+	work->signalbox_read_free = EAX /* 0 */;
+	work->softint_mask_buf[ 0] = 0x0204;
+	work->softint_mask_buf[ 4] = EAX /* 0 */;
+	work->softint_mask_buf[ 8] = 0xff80;
+	work->softint_mask_buf[12] = EAX /* 0x0000 */;
+	work->signaldw = EAX /* 0 */;
+	#if (defined (SAFEAPI_FLAG))
+		work->signalbox_status = AL;
+	#endif
+//	work->signalbox_write_ptr = 0xfffffffe;
+	work->ending_count = 0x80; /* bit7:生存フラグ, bit6-0:終了カウント */
+	EAX--;
+	work->nest = EAX /* 0xffffffff */;
+	EAX--;
+	work->signalbox_write_ptr = EAX /* 0xfffffffe */;
+	/* ベクタ初期化 */
+	PUSH(FS);
+	PUSH(CS);
+	POP(FS);
+	asmout("MOV EBX,.cmd0004_cmd");
+	CALL(0x0017,0); /* shell-call */
+	POP(FS);
+	/* slot 0x01f0に(offset) workを書き込み */
+	PUSH((int) 0);
+	PUSH((offset) work);
+	ESP -= 8;
+	PUSH((int) 0x01f0); /* slot-no. */
+	PUSH((int) 0x0080); /* write user-slot */
+	EBX = ESP;
+	/* ユーザー割り込み抑制 */
+	CALL(0x0017,0); /* shell-call */
+	ESP += 24;
+	asmout("JMP nextcmd");
+
+special2:
+	EAX = *cmd /* opt */;
+	CMP(EAX, 0x0004);
+	asmout("JE cmd004");
+	TEST(AL, 0x03);
+	if (== 0) {
+		SAFE_CUT0("DB ..$-$-1,'special:SpecialEnd or Init command expected instead of ',0,'@',6,'.'");
+	}
+	(offset) cmd -= 4;
+
+special:
+	(offset) cmd += 4;
+	if (EAX == 0xffffff81) {
+		/* opt == 0xffffff81 : l2d3圧縮データー展開 */
+		/* cmd, opt(subcmd), bytes, source(48bit), subcmd, ... */
+		/* 展開先はES:EDI */
+		POP(EDI);
+		PUSH(DS);
+		PUSH(ESI);
+		PUSH(EBP);
+		EBP = cmd[4];
+		LDS(ESI, [DS:ESI + 8]);
+		cmd0004_decode();
+		POP(EBP);
+		POP(ESI);
+		POP(DS);
+		PUSH(EDI);
+		(offset) cmd += 16;
+		goto special2;
+	}
+	if (EAX == 0xffffff82) {
+		/* opt == 0xffffff82 : tek0圧縮データー展開 */
+		/* cmd, opt(subcmd), bytes, source(48bit), subcmd, ... */
+		/* 展開先はES:EDI */
+		POP(EDI);
+		PUSH(DS);
+		PUSH(ESI);
+		PUSH(EBP);
+		EBP = cmd[4];
+		LDS(ESI, [DS:ESI + 8]);
+		cmd0004_decode2();
+		POP(EBP);
+		POP(ESI);
+		POP(DS);
+		PUSH(EDI);
+		(offset) cmd += 16;
+		goto special2;
+	}
+	if (EAX == 0xffffff83) {
+		/* opt == 0xffffff83 : tek1圧縮データー展開 */
+		/* cmd, opt(subcmd), bytes, source(48bit), subcmd, ... */
+		/* 展開先はES:EDI */
+		POP(EDI);
+		PUSH(DS);
+		PUSH(ESI);
+		PUSH(EBP);
+		EBP = cmd[4];
+		LDS(ESI, [DS:ESI + 8]);
+		cmd0004_decode_tek1();
+		POP(EBP);
+		POP(ESI);
+		POP(DS);
+		PUSH(EDI);
+		(offset) cmd += 16;
+		goto special2;
+	}
+	if (EAX == 0xffffff85) {
+		/* opt == 0xffffff85 : tek2圧縮データー展開 */
+		/* cmd, opt(subcmd), bytes, source(48bit), subcmd, ... */
+		/* 展開先はES:EDI */
+		POP(EDI);
+		PUSH(DS);
+		PUSH(ESI);
+		PUSH(EBP);
+		EBP = cmd[4];
+		LDS(ESI, [DS:ESI + 8]);
+		cmd0004_decode_tek2();
+		POP(EBP);
+		POP(ESI);
+		POP(DS);
+		PUSH(EDI);
+		(offset) cmd += 16;
+		goto special2;
+	}
+	if (EAX == 0xffffff89) {
+		/* opt == 0xffffff89 : tek5圧縮データー展開 */
+		/* subcmd, bytes, source(48bit), subcmd, ... */
+		/* 展開先はES:EDI */
+		PUSH(DS);
+		PUSH(ESI);
+		PUSH(EBP);
+		EBP = cmd[4];
+		LDS(ESI, cmd[8]);
+		MOV(EAX, DS);
+		EAX &= 0xfffc;
+		if (EAX != 0x0004)
+			INT(0x03); /* このAPIではコードセグメントのみ */
+		LSL(EDX, AX);
+		EDX++;
+		cmd0004_decode_tek5();
+		POP(EBP);
+		POP(ESI);
+		POP(DS);
+		(offset) cmd += 16;
+		goto special2;
+	}
+	if (EAX == 0xffffffff) {
+		/* 特別終了 */
+		POPAD();
+		return;
+	}
+	SAFE_CUT0("DB ..$-$-1,'special:Invalid special command ',0,'.'");
+
+	ALIGN(4);
+cmd0004_cmd:
+	asmout("DD 0200H, pioneer_softint, 010000C7H, 0201H"); /* softint_vector */
+	asmout("DD 0204H, 0, 0281H"); /* to Llv2(nestを80に) */
+	asmout("DD 0300H, 01C0H"); /* 獲得(この時、インターバルモードが解除される) */
+asmout("cmd004_cmd2: equ $");
+	asmout("DD 0310H, 01C0H"); /* 現在時刻設定 */
+	asmout("DD 0318H, 01C0H, 0140H, 1, 0080H"); /* メッセージ設定 */
+	DD(0x0000);
+}
+
+void cmd0004_getb()
+{
+	char *src == DS:ESI;
+
+	BL--;
+	if ((signed) < 0) {
+		BL = 7;
+		BH = *src;
+		(offset) src++;
+	}
+	BH <<= 1;
+	return;
+}
+
+void cmd0004_getbECX()
+{
+	char *src == DS:ESI;
+
+	do {
+		BL--;
+		if ((signed) < 0) {
+			BL = 7;
+			BH = *src;
+			(offset) src++;
+		}
+		BH <<= 1;
+	//	RCL(EAX, 1);
+		ADC(EAX, EAX);
+		ECX--;
+	} while (!= 0);
+	TEST(EAX, EAX);
+	return;
+}
+
+void cmd0004_decode()
+/* これはもう主たるデコーダーではないので、多少遅くなってもいいからコンパクトに！ */
+{
+	char *dst == ES:EDI;
+
+	EBX = 0;
+	ECX = 0;
+	for (;;) {
+		EDX = (offset) &cmd0004_getbECX;
+		EAX = 0;
+		ECX++;
+	//	cmd0004_getbECX(); /* 1bit入力 */
+		CALL(EDX);
+		if (!= 0) { /* EAX == 1 */
+			CL = 8;
+		//	cmd0004_getbECX(); /* 8bit入力 */
+			CALL(EDX);
+			ECX++;
+			goto putc;
+		}
+		CL = 2;
+	//	cmd0004_getbECX(); /* 2bit入力 */
+		CALL(EDX);
+	//	CL = 1;
+		if (== 0) {
+			CL = 4;
+		//	cmd0004_getbECX(); /* 4bit入力 */
+			CALL(EDX);
+			CL = 4 - 1;
+			if (== 0) {
+				CL = 8;
+			//	cmd0004_getbECX(); /* 8bit入力 */
+				CALL(EDX);
+				CL = 19 - 1;
+				if (== 0) {
+					CL = 16;
+				//	cmd0004_getbECX(); /* 16bit入力 */
+					CALL(EDX);
+					if ((unsigned) EAX <= 127) {
+						XCHG(EAX, ECX);
+						EAX++; /* 最初のbitは1に決まっているから */
+					//	cmd0004_getbECX(); /* nbit入力 */
+						CALL(EDX);
+					}
+				}
+			}
+		}
+		/* distanceはmaxで30bit(1GB) */
+		EAX += ECX;
+		PUSH(EAX);
+		EAX = 0;
+		EAX--;
+		do {
+			CL = 4;
+		//	cmd0004_getbECX(); /* 4bit入力 */
+			CALL(EDX);
+			(signed int) EAX >>= 1;
+		} while (CF == 1);
+		POP(ECX);
+		XCHG(EAX, EDX);
+		do {
+			AL = dst[EDX];
+putc:
+			*dst = AL;
+			(offset) dst++;
+			EBP--;
+			if (== 0)
+				goto fin;
+			ECX--;
+		} while (!= 0);
+	}
+fin:
+	return;
+}
+
+void cmd0004_getl1a()
+/* ECXに返す */
+/* ECX = 1で呼ぶこと */
+{
+//	ECX = 1;
+	cmd0004_getb();
+	if (CF == 0) {
+		do {
+			cmd0004_getb();
+		//	RCL(ECX, 1);
+			ADC(ECX, ECX);
+			cmd0004_getb();
+		} while (CF == 0);
+	}
+	return;
+}
+
+void cmd0004_getl1b()
+/* ECXに返す */
+/* ECX = 1で呼ぶこと */
+{
+//	ECX = 1;
+	cmd0004_getb();
+	if (CF == 0) {
+		do {
+			cmd0004_getb();
+		//	RCL(ECX, 1);
+			ADC(ECX, ECX);
+			cmd0004_getb();
+		} while (CF == 0);
+		ECX++;
+		return;
+	}
+	cmd0004_getb();
+	ADC(ECX, 0);
+	return;
+}
+
+void cmd0004_getl0a()
+/* EBPに返す */
+/* 進入条件：EBP = 0, ECX = 0 */
+{
+	do {
+		EBP++;
+		cmd0004_getb();
+		if (CF != 0)
+			goto fin;
+		EDX--;
+	} while (!= 0);
+	ECX++; /* ECX = 1; */
+	cmd0004_getl1b();
+	EBP += ECX;
+	ECX = 0;	
+fin:
+	return;
+}
+
+void cmd0004_decode2()
+{
+	char *dst == ES:EDI;
+	unsigned int *z1 == SS:ESP, *z0 == SS:ESP + 4, *mode == SS:ESP + 8;
+	unsigned int *l_ofs == SS:ESP + 12, *dis_s == SS:ESP + 16;
+	unsigned int *bytes == SS:ESP + 20;
+	EBX = 0;
+	ECX = 0;
+	EAX = 0;
+	PUSH(EBP); /* bytes */
+	do {
+		CL = 9;
+		cmd0004_getbECX(); /* 9bit入力 */
+		(unsigned int) EAX >>= 1;
+	} while (CF == 0);
+	PUSH(EAX); /* dis_s */
+	EAX = 0;
+	CL = 2;
+	cmd0004_getbECX(); /* 2bit入力 */
+	PUSH(EAX); /* l_ofs */
+	EAX = (offset) &cmd0004_getl1a;
+	cmd0004_getb();
+	if (CF != 0) {
+	//	EAX = (offset) &cmd0004_getl1b;
+		asmout("ADD EAX,cmd0004_getl1b-cmd0004_getl1a");
+	//	DB(0x83, 0xc0); asmout("DB cmd0004_getl1b-cmd0004_getl1a");
+	}
+	PUSH(EAX); /* mode */
+	LEA(EDX, [ECX + 2]); /* EDX = 2; */
+	do {
+		EAX = 0;
+		CL = 2;
+		cmd0004_getbECX(); /* 2bit入力 */
+		asmout("MOVSX EAX,BYTE PTR CS:[#table+EAX]");
+		PUSH(EAX); /* z0, z1 */
+		EDX--;
+	} while (!= 0);
+
+	EBP = 0;
+	do {
+		/* "0"-phase (非圧縮フェーズ) */
+		EDX = *z0;
+		cmd0004_getl0a(); /* EBPに返す */
+		*bytes -= EBP;
+		do {
+			CL = 8;
+			cmd0004_getbECX();
+			*dst = AL;
+			(offset) dst++;
+			EBP--;
+		} while (!= 0);
+		if (ECX == *bytes)
+			break;
+
+		/* "1"-phase (圧縮フェーズ) */
+		EDX = *z1;
+		cmd0004_getl0a(); /* EBPに返す */
+		do {
+			/* getdf */
+			unsigned int stopbits == EAX, distance == EDX;
+		//	distance = 0xffffffff;
+			LEA(EDX, [ECX - 1]);
+			ECX++; /* l1aやl1bのため */
+			stopbits = *dis_s;
+			do {
+				do {
+					cmd0004_getb();
+				//	RCL(distance, 1);
+					ADC(distance, distance);
+					stopbits >>= 1;
+				} while (CF == 0);
+				if (/* stopbits */ == 0)
+					break;
+				cmd0004_getb();
+			} while (CF == 0);
+
+			CALL(*mode); /* l1a or l1b */
+			ECX += *l_ofs;
+			*bytes -= ECX;
+			do {
+				AL = dst[EDX];
+				*dst = AL;
+				(offset) dst++;
+				ECX--;
+			} while (!= 0);
+			EBP--;
+		} while (!= 0);
+	} while (ECX != *bytes);
+
+	ESP += 24;
+	return;
+
+table:
+	DB(0xff, 4, 8, 16);
+}
+
+void getnum_s7s()
+/* DS:ESIからリード */
+{
+	EAX = 0;
+	do {
+		EAX <<= 8;
+		LODSB();
+		(unsigned int) EAX >>= 1;
+	} while (CF == 0);
+	return; /* CF = 1, TEST(EAX, EAX); */
+}
+
+void cmd0004_decode_tek1()
+{
+	PUSHFD();
+	CLD();
+	getnum_s7s();
+	TEST(AL, 0x40);
+	if (!= 0)
+		getnum_s7s(); /* オプション情報へのポインタを読み飛ばす */
+	LODSB();
+	if (AL != 0x01)
+		INT(0x03); /* 補助バッファ検出 */
+	if (EBP == 0)
+		goto fin;
+
+	EBP += EDI;
+	ECX = 0;
+	PUSH(EDI);
+	do {
+		CL = (unsigned char) [DS:ESI];
+		ESI++;
+		EBX = ECX; /* by */
+		ECX &= 0x0f;
+		if (== 0)
+			goto getlong_by;
+getlong_by0:
+		(unsigned int) EBX >>= 4;
+		if (== 0)
+			goto getlong_lz;
+getlong_lz0:
+		asmout("REP MOVSB");
+		if ((unsigned) EDI >= EBP)
+			break;
+		do {
+			EDX = (unsigned char) [DS:ESI];
+			ESI++;
+			ECX = EDX;
+			EDX &= 0x0f;
+			(unsigned int) EDX >>= 1;
+			if (CF == 0) {
+				do {
+					EDX <<= 8;
+					DL = [DS:ESI];
+					ESI++;
+					(unsigned int) EDX >>= 1;
+				} while (CF == 0);
+			}
+			ECX >>= 4;
+			if (== 0)
+				goto long_cp;
+long_cp0:
+			ECX++;
+			NOT(EDX);
+			PUSH(ESI);
+			LEA(EAX, [EDI + ECX]);
+			LEA(ESI, [EDI + EDX]);
+			if ((unsigned) EAX > EBP)
+				goto fix_ECX;
+fix_ECX1:
+			if ((unsigned) ESI < [SS:ESP + 4])
+				goto err;
+			asmout("REP ES MOVSB");
+			POP(ESI);
+			EBX--;
+		} while (!= 0);
+	} while ((unsigned) EDI < EBP);
+	POP(EAX);
+fin:
+	POPFD();
+	return;
+
+getlong_lz:
+	getnum_s7s();
+	XCHG(EAX, EBX);
+	goto getlong_lz0;
+
+getlong_by:
+	getnum_s7s();
+	XCHG(EAX, ECX);
+	goto getlong_by0;
+
+long_cp:
+	getnum_s7s();
+	XCHG(EAX, ECX);
+	goto long_cp0;
+
+fix_ECX:
+	ECX = EBP;
+	ECX -= EDI;
+	goto fix_ECX1;
+
+err:
+	INT(0x03);
+}
+
+void getnum_s7()
+/* DS:ESIからリード */
+/* ECX, EDX 破壊 */
+{
+	int tmp0 == ECX, tmp1 == EDX;
+	EAX = 0;
+	LODSB();
+	(unsigned int) EAX >>= 1;
+	if (CF == 0) {
+		tmp1 = 0;
+		tmp0 = 0;
+		tmp1++;
+		do {
+			tmp1 <<= 7;
+			EAX <<= 8;
+			tmp0 += tmp1;
+			LODSB();
+			(unsigned int) EAX >>= 1;
+		} while (CF == 0);
+		EAX += tmp0; /* CF = 0, TEST(EAX, EAX); */
+	}
+	return;
+}
+
+void cmd0004_decode_tek2()
+{
+	PUSHFD();
+	CLD();
+	getnum_s7s();
+	TEST(AL, 0x40);
+	if (!= 0)
+		getnum_s7s(); /* オプション情報へのポインタを読み飛ばす */
+	LODSB();
+	if (AL != 0x01)
+		INT(0x03); /* 補助バッファ検出 */
+	if (EBP == 0)
+		goto fin;
+
+	EBP += EDI;
+	DH = 0;
+	PUSH(EDI);
+	PUSH(EBP);
+	PUSH(3);
+	PUSH(2);
+	PUSH(1);
+	PUSH(0);
+	EBP = ESP;
+	do {
+		/* byの長さの取得 */
+		/* これは長くなりやすい */
+		ECX = 0;
+		do {
+			ECX++;
+			if ((unsigned) ECX >= 17)
+				goto long_by0;
+			if (DH == 0) {
+				DH = 8;
+				DL = [DS:ESI];
+				ESI++;
+			}
+			DH--;
+			(unsigned char) DL >>= 1;
+		} while (CF == 0);
+long_by1:
+		asmout("REP MOVSB");
+		if ((unsigned) EDI >= [SS:EBP + 16])
+			break;
+
+		/* lzの長さの取得 */
+		ECX = 0;
+		do {
+			ECX++;
+			if ((unsigned) ECX >= 17)
+				goto long_lz0;
+			if (DH == 0) {
+				DH = 8;
+				DL = [DS:ESI];
+				ESI++;
+			}
+			DH--;
+			(unsigned char) DL >>= 1;
+		} while (CF == 0);
+long_lz1:
+		EBX = ECX;
+		PUSH(EDX);
+		do {
+			EDX = (unsigned char) [DS:ESI];
+			ESI++;
+			PUSH(EDX);
+			EDX &= 0x0f;
+			(unsigned int) EDX >>= 1;
+			if (CF == 0) {
+				EAX = (unsigned char) [DS:ESI];
+				ESI++;
+				(unsigned int) EAX >>= 1;
+				if (CF == 0)
+					goto long_ds0;
+	long_ds1:
+				LEA(EDX, [EDX + EAX * 8 + 8]);
+			}
+			PUSH(EDI);
+			ECX = [SS:EBP +  8];
+			EAX = [SS:EBP +  4];
+			EDI = [SS:EBP +  0];
+			EDX -= 6;
+			if ((unsigned) < 0)
+				goto repdis_hit;
+	repdis_hit3:
+			[SS:EBP + 12] = ECX;
+	repdis_hit2:
+			[SS:EBP +  8] = EAX;
+	repdis_hit1:
+			[SS:EBP +  4] = EDI;
+	repdis_hit0:
+			POP(EDI);
+			[SS:EBP +  0] = EDX;
+			POP(ECX);
+			NOT(EDX);
+			(unsigned int) ECX >>= 4;
+			if (== 0)
+				goto long_cp0;
+			ECX++;
+	long_cp1:
+			PUSH(ESI);
+			LEA(EAX, [EDI + ECX]);
+			LEA(ESI, [EDI + EDX]);
+			if ((unsigned) EAX > [SS:EBP + 16])
+				goto fix_ECX;
+fix_ECX1:
+			if ((unsigned) ESI < [SS:EBP + 20])
+				goto err;
+			asmout("REP ES MOVSB");
+			POP(ESI);
+			EBX--;
+		} while (!= 0);
+		POP(EDX);
+	} while ((unsigned) EDI < [SS:EBP + 16]);
+	ESP += 24;
+fin:
+	POPFD();
+	return;
+
+long_by0:
+	getnum_s7s();
+	ECX += EAX;
+	goto long_by1;
+
+long_lz0:
+	getnum_s7s();
+	ECX += EAX;
+	goto long_lz1;
+
+long_ds0:
+	PUSH(EDX);
+	ESI--;
+	getnum_s7();
+	POP(EDX);
+	goto long_ds1;
+
+long_cp0:
+	ECX = (unsigned char) [DS:ESI];
+	ESI++;
+	ECX += 17 * 2;
+	(unsigned int) ECX >>= 1;
+	if (CF != 0)
+		goto long_cp1;
+	PUSH(EDX);
+	ESI--;
+	getnum_s7();
+	POP(EDX);
+	LEA(ECX, [EAX + 17]);
+	goto long_cp1;
+
+repdis_hit:
+	if (DL == -6)
+		goto repdis0_hit;
+	if (DL == -5)
+		goto repdis1_hit;
+	if (DL == -4)
+		goto repdis2_hit;
+	if (DL == -2)
+		goto rel0;
+	if (DL == -1)
+		goto rel1;
+	EDX = [SS:EBP + 12];
+	goto repdis_hit3;
+repdis0_hit:
+	EDX = [SS:EBP + 0];
+	goto repdis_hit0;
+repdis1_hit:
+	EDX = [SS:EBP + 4];
+	goto repdis_hit1;
+repdis2_hit:
+	EDX = [SS:EBP + 8];
+	goto repdis_hit2;
+
+rel0:
+	[SS:EBP + 12] = ECX;
+	[SS:EBP +  8] = EAX;
+	getnum_s7();
+	LEA(EDX, [EDI + EAX + 1]);
+	goto repdis_hit1;
+
+rel1:
+	[SS:EBP + 12] = ECX;
+	[SS:EBP +  8] = EAX;
+	getnum_s7();
+	NEG(EAX);
+	LEA(EDX, [EDI + EAX - 1]);
+	goto repdis_hit1;
+
+fix_ECX:
+	ECX = [SS:EBP + 16];
+	ECX -= EDI;
+	goto fix_ECX1;
+
+err:
+	INT(0x03);
+}
+
+void decodemain();
+void decodemain1();
+
+struct STR_BITMODEL { /* 32バイト */
+	unsigned char t, m, s, dmy;
+	unsigned int prb0, prb1, tmsk, ntm, lt, lt0, prb01;
+};
+
+struct STR_TEK5 { /* 320x4 */
+	int p;
+	unsigned int range, code, lit1, repdis[16];
+	STR_BITMODEL bm[1024]; /* 32 * 32 */
+	int ptbm[64]; /* 16 * 4 */
+	int nowPos, state, posStateMask;
+	unsigned char lc8, lc, lit0cntmsk, dmy_uc;
+	int literalPosMask, outSize, outStream, q0, dmy2[128];
+};
+
+struct STR_LZMA {
+	int repdis[16], nowPos, state, posStateMask;
+	unsigned char lc8, lc, previousIsMatch, previousByte;
+	int literalPosMask, outSize, outStream;
+	int rd_src, rd_src1, rd_range, rd_code;
+	int p[1234];
+};
+
+void setbm();
+
+/* ASKAのバグ回避用 */
+#define aBM		bm[EDI]
+
+void lzrestore_tek5()
+/* ESI, EDI, EBP */
+{
+	LODSB();
+	AH = AL;
+	AL &= 0x0f;
+	if (AL == 0x01)
+		goto tek5_z0;
+	if (AL == 0x05)
+		goto tek5_z1;
+	if (AL == 0x09)
+		goto tek5_z2;
+err:
+	EAX = 0;
+	EAX++;
+	return;
+tek5_z0:
+	(unsigned char) EAX >>= 12;
+	CL = 9 * 5;
+	EAX &= 0x0f;
+	if (!= 0) {
+		if ((unsigned) AL >= 3)
+			goto err;
+		asmout("MOV AL,[CS:.prm_table-1+EAX]");
+	} else
+		LODSB();
+	DIV(CL);
+	ROR(EAX, 8); /* pbを24-31へ, AHをALへ */
+	CL = 9;
+	AH = 0;
+	DIV(CL);
+	CL = AL; /* lp */
+	CL += AH; /* lc */
+	EBX = 768; /* LZMA_LIT_SIZE */
+	SHL(EBX, CL);
+	EBX += 1846; /* LZMA_BASE_SIZE */
+
+	ECX = ESP;
+	do {
+		PUSH(1024);
+		EBX--;
+	} while (!= 0);
+	PUSH(EAX); /* rd->Code */
+	PUSH(-1); /* rd->Range */
+	PUSH(EDI); /* rd->BufferLim -> outstream0 */
+	PUSH(ESI);
+	PUSH(EDI);
+	PUSH(EBP); /* 出力サイズ */
+	EDI = ECX;
+
+	CL = AL; /* lp */
+	EBX = 256;
+	CL += AH; /* lc */
+	SHL(EBX, CL);
+	EBX += 1846 /* Literal */;
+
+	EDX = 0;
+	EDX++;
+	CL = AL; /* lp */
+	SHL(EDX, CL);
+	EDX--;
+	PUSH(EDX); /* literalPosMask */
+	AL = 8;
+	AL -= AH;
+	/* AH:lc, AL:8-lc */
+	PUSH(EAX); /* 8-lc, lc, 0, pb */
+	ROL(EAX, 8);
+	EDX = 0;
+	EDX++;
+	CL = AL; /* pb */
+	SHL(EDX, CL);
+	EDX--;
+	PUSH(EDX); /* posStateMask */
+	PUSH(0); /* state */
+	PUSH(1); /* nowPos */
+	PUSH(-4); /* rep0-3 */
+	PUSH(-3);
+	PUSH(-2);
+	PUSH(-1);
+
+	EBP = ESP;
+	PUSH(EDI); /* 旧スタック */
+	/* 合計で64KBくらいの余裕がほしい */
+
+	CL = 4;
+	do {
+		EAX <<= 8;
+		LODSB();
+		CL--;
+	} while (!= 0);
+	STR_LZMA *work0 == SS:EBP;
+	work0->rd_src = ESI;
+	work0->rd_code = EAX;
+	work0->p[1846 * 4] = EBX;
+
+	decodemain();
+
+	POP(EAX);
+	XCHG(EAX, ESP);
+	EAX = 0;
+	return;
+
+prm_table:
+	DB(0x5d, 0x00);
+
+tek5_z1:
+tek5_z2:
+	BL = AL;
+	(unsigned char) EAX >>= 12;
+	CL = 9 * 5;
+	EAX &= 0x0f;
+	if (!= 0) {
+		if ((unsigned) AL >= 2)
+			goto err;
+		asmout("MOV AL,[CS:.prm_table1-1+EAX]");
+	} else
+		LODSB();
+	DIV(CL);
+	/* AL = lp; AH = lc + pb * 9; */
+	BH = AL; /* lp */
+	AL = AH;
+	CL = 9;
+	AH = 0;
+	DIV(CL);
+	/* AL = pb, AH = lc, BH = lp */
+	CL = BH;
+	CL += AH;
+	EDX = 768;
+	SHL(EDX, CL);
+	EDX += 2064;
+	ECX = ESP;
+	do {
+		PUSH(0x8000);
+		EDX--;
+	} while (!= 0);
+	ESP -= 128;
+	EDX++; /* EDX = 1 */
+	PUSH(EDI); /* q0 */
+	PUSH(EDI); /* q */
+	EDI = ECX; /* old ESP */
+	PUSH(EBP); /* siz */
+	CL = BH; /* lp */
+	SHL(EDX, CL);
+	EDX--;
+	PUSH(EDX); /* literalPosMask */
+	EDX = 0x00780008;
+	DH = AH;
+	DL -= AH;
+	PUSH(EDX); /* とりあえず lit0cntmsk=0x78 */
+	EDX |= -1;
+	CL = AL; /* pb */
+	SHL(EDX, CL);
+	NOT(EDX);
+	PUSH(EDX); /* posStateMask */
+	PUSH(0); /* state */
+	PUSH(1); /* nowPos */
+	DL = 16;
+	do {
+		PUSH(8); /* ptbm */
+		DL--;
+	} while (!= 0);
+	ESP -= 1024;
+	PUSH(-4); /* rep0-3 */
+	PUSH(-3);
+	PUSH(-2);
+	PUSH(-1);
+	EDX = 256;
+	CL = AH;
+	CL += BH;
+	SHL(EDX, CL);
+	EDX += 320 + 2064;
+	PUSH(EDX); /* lit1 */
+	/* 以降EAX破壊 */
+	BH = -1;
+	if (BL == 0x09) {
+		LODSB();
+		BH = AL;
+	}
+	CL = 4;
+	do {
+		EAX <<= 8;
+		LODSB();
+		CL--;
+	} while (!= 0);
+	PUSH(EAX); /* code(仮) */
+	PUSH(-1); /* range */
+	PUSH(ESI);
+	EBP = ESP;
+	PUSH(EDI); /* 旧スタック */
+
+	STR_TEK5 *work == SS:EBP;
+//	STR_BITMODEL *bm == SS:EBP + EDI;
+	STR_BITMODEL *bm == SS:EBP;
+	EDI = 32;
+	do {
+		aBM.lt  = 1;
+		aBM.lt0 = 16 * 1024;
+		if ((unsigned) EDI < 160) { /* 32 + 4 * 32 */
+			aBM.lt  = 0x7fffffff;
+			aBM.lt0 = 0x80000000;
+		}
+		if ((unsigned) EDI >= 800) /* 32 + 24 * 32 */
+			aBM.lt0 = 8 * 1024;
+		aBM.t = 5;
+		aBM.m = 5;
+		aBM.s = 0;
+		EDI += 32;
+	} while ((unsigned) EDI < 1056); /* 32 + 32 * 32 */
+//	bm[64].t = 5; /* bm[1], for fchgprm */
+	bm[64].m = 3;
+	bm[96].t = 9; /* bm[2], for tbmt, tbmm */
+	bm[96].m = 2;
+	TEST(BH, 0x40);
+	if (!= 0) {
+		bm[128].t = 0; /* bm[3], for fchglt */
+		bm[128].m = 1;
+		(int) [SS:EBP + 1536] = 0xffff; /* (320 + 64) * 4 == fchglt */
+	}
+	bm[736].t = 0; /* bm[22], for repg3 */
+	bm[736].m = 1;
+	(int) [SS:EBP + 1540] = 0xffff; /* (320 + 65) * 4 == repg3 */
+	AL = 18;
+	(char) [SS:EBP + 1096] = AL; /* 32 + 1024 + 4 * 10 == ptbm[10] */
+	(char) [SS:EBP + 1100] = AL; /* 32 + 1024 + 4 * 11 == ptbm[11] */
+	(char) [SS:EBP + 1104] = AL; /* 32 + 1024 + 4 * 12 == ptbm[12] */
+	if (BL == 0x05) {
+		/* z1 */
+		bm[736].lt  = 0x7fffffff; /* bm[22], for repg3 */
+		bm[736].lt0 = 0x80000000;
+	} else {
+		EDI = 32 + 1024;
+		AL = 8;
+		do {
+			(char) [SS:EBP + EDI] = AL;
+			EDI += 4;
+			EAX++;
+		} while ((unsigned) AL < 22);
+		CL = BH;
+		AL = 0x7f;
+		CL &= 0x03;
+		SHR(AL, CL);
+		AL &= 0x78;
+		work->lit0cntmsk = AL;
+		TEST(BH, 0x04);
+		if (== 0)
+			(char) [SS:EBP + 1060]--; /* 32 + 1024 +  1 * 4 == ptbm[ 1] */
+		TEST(BH, 0x08);
+		if (== 0)
+			(char) [SS:EBP + 1076]--; /* 32 + 1024 +  5 * 4 == ptbm[ 5] */
+		TEST(BH, 0x10);
+		if (== 0)
+			(char) [SS:EBP + 1092]--; /* 32 + 1024 +  9 * 4 == ptbm[ 9] */
+		TEST(BH, 0x20);
+		if (== 0)
+			(char) [SS:EBP + 1100]--; /* 32 + 1024 + 11 * 4 == ptbm[11] */
+	}
+	EDI = 32 + 1024;
+	do {
+		EAX = [SS:EBP + EDI];
+		EAX++;
+		EAX *= 32;
+		[SS:EBP + EDI] = EAX;
+		EDI += 4;
+	} while ((unsigned) EDI < 1120); /* 32 + 1024 + 16 * 4 */
+	EDI = 32;
+	do {
+		setbm();
+		EDI += 32;
+	} while ((unsigned) EDI < 1056); /* 32 + 32 * 32 */
+
+	decodemain1();
+
+	POP(EAX);
+	XCHG(EAX, ESP);
+	EAX = 0;
+	return;
+
+prm_table1:
+	DB(0x00);
+}
+
+/* 以下z0専用 */
+
+#define kTopValue				0x01000000
+#define kNumBitModelTotalBits 	11
+#define kBitModelTotal			0x0800
+#define kNumMoveBits			5
+
+void rdd_direct();
+void rdd_bit();
+void rdd_bittree();
+void rdd_literal();
+void getlen();
+
+void rdd_direct()
+/* EBP, ECX, ESI */
+{
+	STR_LZMA *work == SS:EBP;
+	unsigned int result == EDX, range == EDI, code == EAX;
+	unsigned char *src == DS:ESI;
+	do {
+		if ((unsigned) range < kTopValue)
+			goto shift;
+shift1:
+		range >>= 1;
+		CMP(code, range); /* >= なら CF = 0 */
+		if ((unsigned) >=)
+			code -= range; /* 相変わらずCF = 0 */
+		RCL(result, 1);
+		ECX--;
+	} while (!= 0);
+	return;
+shift:
+	code <<= 8;
+	range <<= 8;
+	LODSB();
+	goto shift1;	/* 1回でかならず足りるかどうかはそれより前による */
+}
+
+/* 00000011111 */
+/* 11111100001 */
+/* どちらにしても、1回で足りる */
+
+void rdd_bittree()
+{
+	EDX = 1;
+}
+
+void rdd_bittree0()
+/* 結果は上位ビットにごみがつくので、呼び出し元でマスクせよ */
+/* EBX:prob0 */
+{
+	STR_LZMA *work == SS:EBP;
+	unsigned int result == EDX, range == EDI, code == EAX;
+	unsigned int bound == EBX, prob == EDX, tmp == ECX;
+	unsigned char *src == DS:ESI;
+
+	do {
+		PUSH(EBX);
+		EBX += result;
+		PUSH(result);
+		PUSH(ECX);
+		PUSH(EBX);
+		prob = work->p[EBX * 4];
+		if ((unsigned) range < kTopValue)
+			goto shift;
+shift1:
+		bound = range;
+		tmp = prob;
+		bound >>= kNumBitModelTotalBits;
+		IMUL(bound, prob);
+		if ((unsigned) code < bound) {
+			range = bound;
+			prob--;
+			bound = 0;
+			tmp -= kBitModelTotal + 1;
+		}
+		code -= bound;
+		range -= bound;
+		(signed int) tmp >>= kNumMoveBits;
+		POP(EBX);
+		prob -= tmp; /* CFにデコード結果 */
+		POP(ECX);
+		work->p[EBX * 4] = prob;
+		POP(result);
+		POP(EBX);
+		RCL(result, 1);
+		CL--;
+	} while (!= 0);
+	return;
+shift:
+	code <<= 8;
+	range <<= 8;
+	LODSB();
+	goto shift1;
+}
+
+#define LenChoice			0
+#define LenChoice2			1
+#define LenLow				2
+#define LenMid				130
+#define LenHigh				258
+#define kLenNumLowBits		3
+#define kLenNumMidBits		3
+#define kLenNumHighBits		8
+
+void getlen()
+/* EBXにprob0, EDX:posState */
+/* EDXに返す */
+{
+	PUSH(EDX);
+	rdd_bit(); /* LenChoice */
+	if (CF == 0) {
+		POP(EDX);
+		CL = kLenNumLowBits;
+		LEA(EBX, [EBX + EDX * 8 + 2]); /* EBX += LenLow + posState << kLenNumLowBits */
+		rdd_bittree();
+		EDX -= 8;
+		return;
+	}
+	EBX++;
+	rdd_bit(); /* LenChoice2 */
+	POP(EDX);
+	if (CF == 0) {
+		CL = kLenNumMidBits;
+		LEA(EBX, [EBX + EDX * 8 + 129]); /* EBX += LenMid - 1 + posState << kLenNumMidBits */
+	//	rdd_bittree();
+	//	EDX += 8 - 8;
+	//	return;
+		goto rdd_bittree;
+	}
+	EBX += LenHigh - 1;
+	CL = kLenNumHighBits;
+	rdd_bittree();
+	EDX -= 248 + 256; /* kLenNumHighSymbols - 8 */
+	if ((unsigned) > 0) {
+		ECX = EDX;
+		EDX = 1;
+		rdd_direct();
+		LEA(ECX, [EDX - 1]);
+		EDX = 1;
+		rdd_direct();
+		EDX--;
+	}
+	EDX += 16 + 248;
+	return;
+}
+
+#define kNumPosSlotBits 		6
+#define kNumLenToPosStates1 	3
+#define kNumPosBitsMax 			4
+#define kStartPosModelIndex 	4
+#define kEndPosModelIndex		14
+#define kNumAlignBits			4
+#define kMatchMinLen			2
+
+#define IsMatch			0
+#define IsRep			192
+#define IsRepG0			204
+#define IsRepG1			216
+#define IsRepG2			228
+#define IsRep0Long		240
+#define PosSlot			432
+#define SpecPos			688
+#define Align			802
+#define LenCoder		818
+#define RepLenCoder		1332
+#define Literal			1846
+
+void rdd_bit()
+/* prob:EBX > CF */
+{
+	STR_LZMA *work == SS:EBP;
+	unsigned int range == EDI, code == EAX;
+	unsigned int bound == EBX, prob == EDX, tmp == ECX;
+	unsigned char *src == DS:ESI;
+
+	PUSH(EBX);
+	prob = work->p[EBX * 4];
+	if ((unsigned) range < kTopValue)
+		goto shift;
+shift1:
+	bound = range;
+	tmp = prob;
+	bound >>= kNumBitModelTotalBits;
+	IMUL(bound, prob);
+	if ((unsigned) code >= bound) {
+		code -= bound;
+		range -= bound;
+		(signed int) tmp >>= kNumMoveBits;
+		POP(EBX);
+		prob -= tmp; /* CF = 0 */
+		work->p[EBX * 4] = prob;
+		return;
+	}
+	prob--;
+//	tmp += - kBitModelTotal + 32 - 1;
+	tmp -= kBitModelTotal + 1;
+	range = bound;
+	(signed int) tmp >>= kNumMoveBits;
+	POP(EBX);
+	prob -= tmp; /* CF = 1 */
+	work->p[EBX * 4] = prob;
+	return;
+shift:
+//	do {
+		code <<= 8;
+		range <<= 8;
+		LODSB();
+//	} while ((unsigned) range < kTopValue);
+	goto shift1;
+}
+
+#define SEG_ES	ES
+#define SEG_CS	CS
+
+void decodemain()
+/* EBP */
+{
+	STR_LZMA *work == SS:EBP;
+	ESI = work->rd_src;
+//	EDI = work->rd_range;
+	EDI |= -1;
+	EAX = work->rd_code;
+	EBX = IsMatch;
+	rdd_bit(); /* これはかならずCF = 0になる（stk5では） */
+	if (CF != 0)
+		goto err;
+	EBX = Literal;
+	CL = 8;
+	rdd_bittree();
+	EBX = work->outStream;
+	[SEG_ES:EBX] = DL;
+	EBX++;
+	work->outStream = EBX;
+	EDX = work->nowPos;
+	if ((unsigned) EDX < work->outSize) {
+loophead:
+		EBX = work->state;
+		EDX &= work->posStateMask;
+		EBX <<= kNumPosBitsMax;
+		PUSH(EDX); /* posState */
+		EBX += EDX;
+		rdd_bit();
+		if (CF == 0) {	/* not LZ */
+			POP(EDX);
+			EBX = work->state;
+			PUSH(EDI);
+			EDX = work->nowPos;
+			EDI = work->outStream;
+		//	BL = [SEG_CS:state_table + EBX];
+			asmout("MOV BL,[CS:.state_table+EBX]");
+			EDX &= work->literalPosMask;
+			(char) work->state = BL;
+			CL = work->lc;
+			EBX = (unsigned char) [SEG_ES:EDI - 1];
+			SHL(EDX, CL);
+			CL = work->lc8;
+			SHR(EBX, CL);
+			EBX += EDX;
+		//	EDX = work->repdis[0];
+			EBX *= 256;
+			POP(EDI);
+			EBX += Literal;
+			CL = 8;
+			rdd_bittree();
+//lit11:
+			EBX = work->outStream;
+			[SEG_ES:EBX] = DL;
+			EDX = work->nowPos;
+			EBX++;
+			EDX++;
+			work->outStream = EBX;
+			work->nowPos = EDX;
+			if ((unsigned) EDX < work->outSize)
+				goto loophead;
+			goto fin;
+		}
+lzphase:
+		/* LZ */
+		EBX = work->state;
+		EBX += IsRep;
+		rdd_bit();
+		if (CF != 0) {	/* repdis */
+			EBX += IsRepG0 - IsRep;
+			rdd_bit();
+			if (CF == 0) {	/* rep[0] */
+				EBX = work->state;
+				POP(EDX);
+				EBX <<= kNumPosBitsMax;
+				PUSH(EDX);
+				LEA(EBX, [EBX + EDX + IsRep0Long]);
+				rdd_bit();
+				if (CF == 0) { /* rep[0] && len == 1 */
+					POP(EDX);
+					BL = (char) work->state;
+					PUSH(EDI);
+					CMP(BL, 7);
+					EDI = work->outStream;
+					EDX = work->repdis[0];
+					SBB(BL, BL); /* -1, 0 */
+					PUSH(EAX);
+					BL &= -2;
+					AL = [SEG_ES:EDI + EDX];
+					EDX = work->nowPos;
+					BL += 11; /* 9, 11 */
+					STOSB();
+					(char) work->state = BL;
+					EDX++;
+					work->outStream = EDI;
+					POP(EAX);
+					work->nowPos = EDX;
+					POP(EDI);
+					if ((unsigned) EDX < work->outSize)
+						goto lzdone;
+					goto fin;
+				}
+			} else {
+				EBX += IsRepG1 - IsRepG0;
+				rdd_bit();
+				EDX = work->repdis[4];
+				if (CF != 0) {	/* not rep[1] */
+					EBX += IsRepG2 - IsRepG1;
+					rdd_bit();
+					EDX = work->repdis[8];
+					if (CF != 0) {	/* not rep[2] */
+						EBX = EDX;
+						EDX = work->repdis[12];
+						work->repdis[12] = EBX;
+					}
+					EBX = work->repdis[4];
+					work->repdis[8] = EBX;
+				}
+				EBX = work->repdis[0];
+				work->repdis[0] = EDX;
+				work->repdis[4] = EBX;
+			}
+			BL = (char) work->state;
+			POP(EDX);
+			CMP(BL, 7);
+			SBB(BL, BL); /* -1, 0 */
+			BL &= -3;
+			BL += 11; /* 8, 11 */
+			(char) work->state = BL;
+			EBX = RepLenCoder;
+			getlen();
+			ECX = EDX;
+			EDX = work->repdis[0];
+		} else {
+			/* not repdis */
+			EDX = work->repdis[8];
+			EBX = work->repdis[4];
+			work->repdis[12] = EDX;
+			EDX = work->repdis[0];
+			work->repdis[8] = EBX;
+			work->repdis[4] = EDX;
+			BL = (char) work->state;
+			POP(EDX); /* posState */
+			CMP(BL, 7);
+			SBB(BL, BL); /* -1, 0 */
+			BL &= -3;
+			BL += 10; /* 7, 10 */
+			(char) work->state = BL;
+			EBX = LenCoder;
+			getlen();
+			EBX = EDX;
+			PUSH(EDX); /* len */
+			if ((unsigned) EBX >= kNumLenToPosStates1)
+				EBX = kNumLenToPosStates1;
+			EBX <<= kNumPosSlotBits;
+			CL = kNumPosSlotBits;
+			EBX += PosSlot;
+			rdd_bittree();
+			EDX &= 0x3f;
+			if ((unsigned) EDX >= kStartPosModelIndex) {
+				ECX = EDX;
+				EBX = EDX;
+				(unsigned int) ECX >>= 1;
+				EDX = 1;
+				ECX--; /* CF不変 */
+				RCL(EDX, 1);
+				if ((unsigned) EBX < kEndPosModelIndex) {
+					/* リバースでECXビットをEDXに押し込む */
+					PUSH(EDX);
+					SHL(EDX, CL);
+					NOT(EBX);
+					PUSH(ECX);
+					LEA(EBX, [EBX + EDX + SpecPos]);
+					rdd_bittree();
+					EBX = EDX;
+					POP(ECX);
+				} else {
+					ECX -= kNumAlignBits;
+					rdd_direct();
+					CL = kNumAlignBits;
+					EBX = Align;
+					PUSH(EDX);
+					rdd_bittree();
+					EBX = EDX;
+					CL = kNumAlignBits;
+				}
+				POP(EDX);
+				do {
+					(unsigned int) EBX >>= 1;
+					RCL(EDX, 1);
+					ECX--;
+				} while (!= 0);
+			}
+			NOT(EDX);
+			POP(ECX); /* len */
+			work->repdis[0] = EDX;
+		}
+	//	if (EDX == 0)
+	//		break;
+		PUSH(EDI);
+		ECX += kMatchMinLen;
+		PUSH(ESI);
+		EDI = work->outStream;
+		ESI = work->outSize;
+		ESI -= work->nowPos;
+		if ((unsigned) ECX >= ESI)
+			ECX = ESI;
+		LEA(ESI, [EDI + EDX]);
+		work->nowPos += ECX;
+		if ((unsigned) ESI < work->rd_src1)
+			goto err;
+		asmout("REP ES MOVSB");
+		work->outStream = EDI;
+		POP(ESI);
+		EDX = work->nowPos;
+		POP(EDI);
+		if ((unsigned) EDX >= work->outSize)
+			goto fin;
+lzdone:
+		EBX = work->state;
+		EDX &= work->posStateMask;
+		EBX <<= kNumPosBitsMax;
+		PUSH(EDX); /* posState */
+		EBX += EDX;
+		rdd_bit();
+		if (CF != 0)
+			goto lzphase;
+		POP(EDX);
+		EBX = work->state;
+		PUSH(EDI);
+	//	BL = [SEG_CS:state_table + EBX];
+		asmout("MOV BL,[CS:.state_table+EBX]");
+		EDX = work->nowPos;
+		(char) work->state = BL;
+		EDI = work->outStream;
+		EDX &= work->literalPosMask;
+		CL = work->lc;
+		EBX = (unsigned char) [SEG_ES:EDI - 1];
+		SHL(EDX, CL);
+		CL = work->lc8;
+		SHR(EBX, CL);
+		EBX += EDX;
+		EDX = work->repdis[0];
+		EBX *= 256;
+		CL = [SEG_ES:EDI + EDX];
+		POP(EDI);
+lit1:
+		unsigned int result == EDX, range == EDI, code == EAX;
+		unsigned int bound == EBX, prob == EDX, tmp == ECX;
+		PUSH(EBX);
+		MOV(result, 1);
+		EBX *= 2;
+		EBX += work->p[Literal * 4];
+		do {
+			ECX *= 2;
+			PUSH(EBX);
+			EBX += result;
+			PUSH(result);
+			PUSH(ECX);
+			ECX &= 0x100;
+			EBX += ECX;
+			PUSH(EBX);
+			prob = work->p[EBX * 4];
+			if ((unsigned) range < kTopValue)
+				goto lit1load0;
+lit1load1:
+			bound = range;
+			tmp = prob;
+			bound >>= kNumBitModelTotalBits;
+			IMUL(bound, prob);
+			if ((unsigned) code < bound) {
+				range = bound;
+				prob--;
+				bound = 0;
+				tmp -= kBitModelTotal + 1;
+			}
+			code -= bound;
+			range -= bound;
+			(signed int) tmp >>= kNumMoveBits;
+			POP(EBX);
+			prob -= tmp; /* CFにデコード結果 */
+			POP(ECX);
+			work->p[EBX * 4] = prob;
+			POP(result);
+			POP(EBX);
+			RCL(result, 1);
+			if ((unsigned) result >= 0x100)
+				goto finlit1;
+			DH = DL;
+			DH ^= CH;
+			TEST(DH, 1);
+			MOV(DH, 0);
+		} while (== 0);
+		EBX = result;
+		CL = 0;
+		do {
+			EBX *= 2;
+			CL++;
+		} while ((unsigned) EBX < 0x100);
+		POP(EBX);
+		EBX += Literal;
+		rdd_bittree0();
+		goto lit11;
+	}
+lit1load0:
+	code <<= 8;
+	range <<= 8;
+	LODSB();
+	goto lit1load1;
+finlit1:
+	POP(EBX);
+	goto lit11;
+lit11:
+	EBX = work->outStream;
+	[SEG_ES:EBX] = DL;
+	EDX = work->nowPos;
+	EBX++;
+	EDX++;
+	work->outStream = EBX;
+	work->nowPos = EDX;
+	if ((unsigned) EDX < work->outSize)
+		goto loophead;
+fin:
+	return;
+err:
+	INT(0x03);
+state_table:
+	DB(0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 4, 5);
+}
+
+/* 以上z0専用 */
+
+/* 以下z1/z2用 */
+
+void rdd_direct1b()
+{
+	EDX = 1;
+}
+
+void rdd_direct1()
+/* EBP, ECX, ESI > EDX, ESI */
+{
+	STR_TEK5 *work == SS:EBP;
+	unsigned int result == EDX, range == EDI, code == EAX;
+	unsigned char *src == DS:ESI;
+	range = work->range;
+	code = work->code;
+	do {
+		if ((unsigned) range < 0x01000000)
+			goto shift;
+shift1:
+		range >>= 1;
+		CMP(code, range); /* >= なら CF = 0 */
+		if ((unsigned) >=)
+			code -= range; /* 相変わらずCF = 0 */
+		RCL(result, 1);
+		ECX--;
+	} while (!= 0);
+	work->range = range;
+	work->code = code;
+	return;
+shift:
+	code <<= 8;
+	range <<= 8;
+	LODSB();
+	if ((unsigned) range >= 0x01000000)
+		goto shift1;
+	goto shift;
+}
+
+void setbm()
+/* EBP, EDI */
+/* EAX, ECX, EDXは破壊 */
+{
+//	STR_BITMODEL *bm == SS:EBP + EDI;
+	STR_BITMODEL *bm == SS:EBP;
+	CL = aBM.t;
+	EAX |= -1;
+	SHL(EAX, CL); /* EAX = -1 << t; */
+	CL = aBM.m;
+	EDX = EAX;
+	aBM.tmsk = EAX; /* tmsk = -1 << t; */
+	SHL(EDX, CL); /* EDX = -1 << (m + t); */
+	ECX = EAX;
+	NEG(EAX); /* EAX = 1 << t; */
+	ECX &= 0xffff;
+	EAX |= EDX; /* EAX = -1 << (m + t) | 1 << t; */
+	NOT(EDX); /* EDX = ~(-1 << (m + t)); */
+	EAX &= ECX;
+	EDX &= ECX;
+	aBM.prb1 = EAX;
+	aBM.prb0 = EDX;
+	EAX -= EDX;
+	aBM.prb01 = EAX;
+	return;
+}
+
+void rdd_probtree1()
+{
+	EDX = 1;
+}
+
+void rdd_probtree()
+/* rangeとcodeはworkから参照 */
+/* EDIは破壊される EBXはキープされる */
+{
+	unsigned int bound == EAX, prob == EBX, tmp == EDX, result == EDX;
+//	STR_BITMODEL *bm == SS:EBP + EDI;
+	STR_BITMODEL *bm == SS:EBP;
+	STR_TEK5 *work == SS:EBP;
+
+//	EBP, EDI, work->range, work->code, EDX, ESI, CH
+	do {
+		PUSH(EBX); /* prob0 */
+		EBX += result;
+		PUSH(EBX);
+		PUSH(result);
+		aBM.lt--;
+		EDX = [SS:EBP + EBX * 4];
+		if ((signed) <= 0)
+			goto bm_timeout0;
+		/* lt=0もこれで分岐して毎回元に戻す...のではなく、lt0の最上位か何かをフラグにさせよう */
+bm_timeout1:
+		prob = EDX;
+		EDX -= aBM.prb0; /* もしprb0よりも小さければ、この時点ででかい値になる */
+		prob &= aBM.tmsk;
+		EAX = work->range; /* スタックから拾ってもいいが */
+		if ((unsigned) EDX > aBM.prb01)
+			goto fixprob0;
+fixprob2:
+		if ((unsigned) EAX < 0x01000000)
+			goto shift;
+shift1:
+		MUL(prob);
+		CL = aBM.m;
+		SHRD(bound, EDX, 16);
+		tmp = prob;
+		if ((unsigned) work->code < bound) {
+			work->range = bound;
+			prob += aBM.tmsk;
+			tmp -= 0x10000 + 1;
+			bound = 0;
+		}
+		SAR(tmp, CL);
+		work->code -= bound;
+		tmp &= aBM.tmsk; /* tmskの上位は1（そうでないと負の値がおかしくなる） */
+		work->range -= bound;
+		prob -= tmp; /* CFにデコード結果 */
+		POP(result);
+		POP(EAX);
+		RCL(result, 1);
+		[SS:EBP + EAX * 4] = prob;
+		AL = CH;
+		CH--;
+		(unsigned char) AL >>= 4;
+		POP(EBX);
+		AL &= CH;
+		CMP(AL, 1); /* TEST(AL, CH);の結果が0ならCF=1 */
+		SBB(EAX, EAX);
+		EAX &= 32;
+		EDI += EAX;
+		TEST(CH, 0x07); /* このために、8回以上のループはできない */
+	} while (!= 0);
+	TEST(result, result);
+	return;
+shift:
+	EDX = EAX;
+	EAX = work->code;
+	do {
+		EDX <<= 8; /* range */
+		EAX <<= 8;
+		LODSB();
+	} while ((unsigned) EDX < 0x01000000);
+	work->code = EAX;
+	work->range = EDX;
+	EAX = EDX;
+	goto shift1;
+fixprob0:
+	prob = aBM.prb0;
+	if ((signed) EDX >= 0)
+		prob += aBM.prb01;
+	goto fixprob2;
+bm_timeout0:
+	EBX = aBM.lt0;
+	if ((signed) EBX >= 0) {
+		PUSH(EDX);
+		aBM.lt = EBX;
+		PUSH(ECX);
+		EBX = 320 + 64 /* &rd->probs.fchglt */;
+		PUSH(EDI);
+		EDX = 0;
+		EDI = 32 + 96 /* &rd->bm[3] */;
+		CH = 0x71;
+		rdd_probtree(); /* == 1 */
+		if (== 0)
+			goto err;
+		POP(EBX);
+		EDI = EBX;
+		EBX -= 32 /* &rd->bm[0] */;
+		PUSH(EDI);
+		EBX /= 16;
+		EDX = 0;
+		BL |= aBM.s;
+		EDI = 32 + 32 /* &rd->bm[1] */;
+		EBX += 320 + 0 /* rd->probs.fchgprm */;
+		CH = 0x71;
+		rdd_probtree();
+		POP(EDI);
+		aBM.s = DL;
+		if (== 0) {
+			PUSH(EDI);
+			EBX = 320 + 1600 - 1 /* rd->probs.tbmt - 1 */;
+			EDI = 32 + 64 /* &rd->bm[2] */;
+			CH = 0x74;
+			rdd_probtree1();
+			POP(EDI);
+			DL &= 0x0f;
+			aBM.t = DL;
+			if (DL == 15)
+				goto err;
+			PUSH(EDI);
+			EBX = 320 + 1616 - 1 /* rd->probs.tbmm - 1 */;
+			EDI = 32 + 64 /* &rd->bm[2] */;
+			CH = 0x74;
+			rdd_probtree1();
+			POP(EDI);
+			DL &= 0x0f;
+			if (== 0)
+				goto err; /* m==0はリザーブ */
+			aBM.m = DL;
+			DL += aBM.t;
+			if ((unsigned) DL > 15)
+				goto err;
+			setbm(); /* EDI */
+		}
+		POP(ECX);
+		POP(EDX);
+		goto bm_timeout1;
+	}
+	aBM.lt = 0x7fffffff;
+	goto bm_timeout1;
+err:
+	INT(0x03);
+}
+
+void rdd_probtree1_f()
+{
+	EDX = 1;
+}
+
+void rdd_probtree_f()
+/* rangeとcodeはworkから参照 */
+/* "EDIは破壊される" EBXはキープされる */
+/* BM不変型, CHにカウンタ(上位は0) */
+{
+	unsigned int bound == EAX, prob == EBX, tmp == EDX, result == EDX;
+//	STR_BITMODEL *bm == SS:EBP + EDI;
+	STR_BITMODEL *bm == SS:EBP;
+	STR_TEK5 *work == SS:EBP;
+
+//	EBP, EDI, work->range, work->code, EDX, ESI, CH
+
+	PUSH(ESI);
+	PUSH(EBX); /* prob0 */
+	EAX = aBM.prb01;
+	EBX = aBM.prb0;
+	PUSH(EAX);
+	PUSH(EBX);
+	EBX = (unsigned char) CH;
+	EAX = aBM.lt;
+	CL  = aBM.m;
+	EAX -= EBX;
+	ESI = aBM.tmsk;
+	if ((signed) <= 0)
+		goto slow;
+	aBM.lt = EAX;
+	/* これ以降ESI,EDIはどうでもいい */
+	int tmsk == ESI, code == EDI;
+	code = work->code;
+	do {
+		EBX = [SS:ESP + 8]; /* prob0 */
+		PUSH(result);
+		EBX += result;
+		EAX = work->range;
+		PUSH(EBX);
+		EDX = [SS:EBP + EBX * 4];
+		prob = EDX;
+		EDX -= [SS:ESP + 8]; /* aBM.prb0 */
+		prob &= tmsk;
+		if ((unsigned) EDX > [SS:ESP + 12] /* aBM.prb01 */)
+			goto fixprob0;
+fixprob2:
+		if ((unsigned) EAX < 0x01000000)
+			goto shift;
+shift1:
+		MUL(prob);
+		SHRD(bound, EDX, 16);
+		tmp = prob;
+		if ((unsigned) code < bound) {
+			work->range = bound;
+			tmp -= 0x10000 + 1;
+			bound = 0;
+			prob += tmsk;
+		}
+		SAR(tmp, CL);
+		code -= bound;
+		tmp &= tmsk;
+		work->range -= bound;
+		POP(EAX);
+		prob -= tmp; /* CFにデコード結果 */
+		POP(result);
+		[SS:EBP + EAX * 4] = prob;
+		RCL(result, 1);
+		CH--;
+	} while (!= 0);
+	work->code = code;
+	POP(EBX);
+	POP(ESI);
+	POP(EBX);
+	POP(ESI);
+	TEST(result, result);
+	return;
+shift:
+	PUSH(ESI);
+	EDX = EAX;
+	ESI = [SS:ESP + 24];
+	EAX = code;
+	do {
+		EDX <<= 8;
+		EAX <<= 8;
+		LODSB();
+	} while ((unsigned) EDX < 0x01000000);
+	[SS:ESP + 24] = ESI;
+	code = EAX;
+	work->range = EDX;
+	POP(ESI);
+	EAX = EDX;
+	goto shift1;
+fixprob0:
+	prob = [SS:ESP + 8]; /* aBM.prb0 */
+	if ((signed) EDX < 0)
+		goto fixprob2;
+	prob += [SS:ESP + 12]; /* aBM.prb01 */
+	goto fixprob2;
+slow:
+	POP(EBX);
+	POP(ESI);
+	POP(EBX);
+	POP(ESI);
+	CH |= 0x70;
+	asmout("JMP rdd_probtree");
+}
+
+/*
+	  +0:lensel0
+	  +8:lensel1
+	  +0:low(16*8)
+	+128:mid(16*8)
+	+256:high(256)
+	+512:
+*/
+
+void getlen1()
+/* EBXにprob0, EDX:posState */
+/* EDXに返す */
+{
+	STR_TEK5 *work == SS:EBP;
+	EDX *= 8;
+	EDI = work->ptbm[12];
+	PUSH(EDX);
+	CH = 0x01;
+	EDX = 0;
+	rdd_probtree_f();
+	if (!= 0) {
+		POP(EDX);
+		EDI = work->ptbm[16];
+		CH = 0x03;
+		EBX += EDX;
+		rdd_probtree1_f();
+		EDX -= 8;
+		return;
+	}
+	EDI = work->ptbm[12];
+	EBX -= -128;
+	CH = 0x01;
+	EDX = 0;
+	rdd_probtree_f();
+	POP(EDX);
+	if (!= 0) {
+		EDI = work->ptbm[20];
+		CH = 0x03;
+		EBX += EDX;
+		goto rdd_probtree1_f;
+	}
+	EDI = work->ptbm[24];
+	EBX -= -128;
+	CH = 0x08;
+	rdd_probtree1_f();
+	EDX -= 248 + 256;
+	if ((unsigned) > 0) {
+		if ((unsigned) EDX < 6) {
+			EDI = work->ptbm[28];
+			EBX = 0;
+			CL = DL;
+			EBX++;
+			CH = DL;
+			SHL(EBX, CL);
+			EBX += 320 + 66 - 2; /* lenext */
+			rdd_probtree1_f();
+		} else {
+			ECX = EDX;
+			rdd_direct1b();
+		}
+		LEA(ECX, [EDX - 1]);
+		rdd_direct1b();
+		EDX--;
+	}
+	EDX += 16 + 248;
+	return;
+}
+
+void decodemain1()
+/* EBP */
+{
+	STR_TEK5 *work == SS:EBP;
+	ESI = work->p;
+	EDI = work->ptbm[0];
+	EBX = 320 + 1632; /* mch */
+	CH = 0x01;
+	EDX = 0;
+	rdd_probtree_f(); /* これは1になる */
+	if (== 0)
+		goto err;
+	EDI = 32 + 768; /* bm[24] */
+	EBX = 320 + 2064; /* lit0 */
+	CH = work->lit0cntmsk;
+	rdd_probtree1();
+	EDI = work->outStream;
+	XCHG(EAX, EDX);
+	STOSB();
+	EDX = work->nowPos;
+	work->outStream = EDI;
+	if ((unsigned) EDX >= work->outSize)
+		goto fin;
+mainloop:
+	EBX = work->state;
+	EDI = work->ptbm[4];
+	EDX &= work->posStateMask;
+	EBX *= 16;
+	if (== 0)
+		EDI = work->ptbm[0];
+	PUSH(EDX); /* posState */
+	LEA(EBX, [EBX + EDX + 320 + 1632]); /* mch */
+	CH = 0x01;
+	EDX = 0;
+	rdd_probtree_f();
+	if (!= 0) { /* lit0 */
+		POP(EDX);
+		EBX = work->state;
+		EDX = work->nowPos;
+		EDI = work->outStream;
+	//	BL = [SEG_CS:state_table + EBX];
+		asmout("MOV BL,[CS:.state_table+EBX]");
+		EDX &= work->literalPosMask;
+		(char) work->state = BL;
+		CL = work->lc;
+		EBX = (unsigned char) [SEG_ES:EDI - 1];
+		SHL(EDX, CL);
+		PUSH(EDI);
+		CL = work->lc8;
+		SHR(EBX, CL);
+		EBX += EDX;
+		EDI = 32 + 768; /* bm[24] */
+		EBX *= 256;
+		CH = work->lit0cntmsk;
+		EBX += 320 + 2064; /* lit0 */
+		if (CH == 0x78) {
+			CH = 0x08;
+			rdd_probtree1_f();
+		} else if (CH == 0x38) {
+			CH = 0x04;
+			rdd_probtree1_f();
+			CH = 0x04;
+			EDI = 32 + 800; /* bm[25] */
+			rdd_probtree_f();
+		} else
+			rdd_probtree1();
+lit11:
+		POP(EDI);
+		AL = DL;
+		EDX = work->nowPos;
+		STOSB();
+		EDX++;
+		work->outStream = EDI;
+		work->nowPos = EDX;
+		if ((unsigned) EDX < work->outSize)
+			goto mainloop;
+		goto fin;
+	}
+	/* LZ */
+lzphase:
+	EBX = work->state;
+	EDI = work->ptbm[52];
+	EBX += 320 + 2016; /* rep */
+	EDX = 0;
+	PUSH(EDI);
+	CH = 0x01;
+	rdd_probtree_f();
+	POP(EDI);
+	if (== 0) { /* repなLZ */
+		EBX += 12; /* repg0 */
+	//	EDX = 0;
+		PUSH(EDI);
+		CH = 0x01;
+		rdd_probtree_f();
+		POP(EDI);
+		if (!= 0) { /* rep[0] */
+			EBX = work->state;
+			POP(EDX);
+			EBX *= 16;
+			PUSH(EDX);
+			LEA(EBX, [EBX + EDX + 2144]); /* 320 + 1632 + 12 * 16 */
+			EDX = 0;
+			PUSH(EDI);
+			CH = 0x01;
+			rdd_probtree_f();
+			POP(EDI);
+			ECX = work->repdis[0];
+			if (== 0) { /* rep[0], len = 1; */
+				AL = (char) work->state;
+				POP(EDX);
+				CMP(AL, 7);
+				EDX = work->repdis[0];
+				SBB(AL, AL); /* -1, 0 */
+				AL &= -2;
+				AL += 11; /* 9, 11 */
+				EDX = ECX;
+				(char) work->state = AL;
+				ECX |= -1;
+				goto rep0l1skip;
+			}
+		} else {
+			EBX += 12; /* repg1 */
+			EDX = 0;
+			PUSH(EDI);
+			CH = 0x01;
+			rdd_probtree_f();
+			ECX = work->repdis[4];
+			POP(EDI);
+			if (== 0) { /* rep[1]ではない */
+				EBX += 12; /* regp2 */
+			//	EDX = 0;
+				CH = 0x01;
+				rdd_probtree_f();
+				ECX = work->repdis[8];
+				if (== 0) { /* rep[2]ではない */
+					EDI = 32 + 704; /* bm[22] */
+					EBX = 320 + 65; /* repg3 */
+				//	EDX = 0;
+					CH = 0x01;
+					rdd_probtree_f();
+					EAX = work->repdis[ 8];
+					ECX = work->repdis[12];
+					work->repdis[12] = EAX;
+				}
+				EAX = work->repdis[4];
+				work->repdis[8] = EAX;
+			}
+			EDX = work->repdis[0];
+			work->repdis[0] = ECX;
+			work->repdis[4] = EDX;
+		}
+		AL = (char) work->state;
+		CMP(AL, 7);
+		POP(EDX); /* posState */
+		SBB(AL, AL); /* -1, 0 */
+		AL &= -3;
+		PUSH(ECX);
+		AL += 11; /* 8, 11 */
+		EBX = 320 + 512; /* len0 */
+		(char) work->state = AL;
+		getlen1();
+		ECX = EDX;
+		POP(EDX);
+	} else { /* 非repなLZ */
+		EAX = work->repdis[8];
+		EDX = work->repdis[4];
+		EBX = work->repdis[0];
+		work->repdis[12] = EAX;
+		work->repdis[ 8] = EDX;
+		AL = (char) work->state;
+		work->repdis[ 4] = EBX;
+		CMP(AL, 7);
+		POP(EDX); /* posState */
+		SBB(AL, AL); /* -1, 0 */
+		AL &= -3;
+		AL += 10; /* 7, 10 */
+		EBX = 320 + 1024; /* len1 */
+		(char) work->state = AL;
+		getlen1();
+		EBX = EDX;
+		PUSH(EDX); /* len */
+		EDI = work->ptbm[32];
+		if ((unsigned) EBX >= 3) {
+			EBX = 3;
+			EDI = work->ptbm[36];
+		}
+		EBX *= 64;
+		CH = 0x06;
+		EBX += 320 + 256; /* pslot */
+		rdd_probtree1_f();
+		EDX &= 0x3f;
+		if (EDX >= 4) {
+			ECX = EDX;
+			EBX = EDX;
+			(unsigned int) ECX >>= 1;
+			EDX = 1;
+			ECX--; /* CF不変 */
+			RCL(EDX, 1);
+			if ((unsigned) EBX < 14) {
+				/* リバースでECXビットをEDXに押し込む */
+				PUSH(EDX);
+				SHL(EDX, CL);
+				NOT(EBX);
+				PUSH(ECX);
+				EDI = work->ptbm[40];
+				CH = CL;
+				LEA(EBX, [EBX + EDX + 448]); /* spdis */
+				if (CL >= 4)
+					EDI = work->ptbm[44];
+				rdd_probtree1_f();
+				POP(ECX);
+			} else {
+				ECX -= 6;
+				if ((unsigned) > 0)
+					rdd_direct1();
+				EDI = work->ptbm[48];
+				CH = 0x06;
+				EBX = 320 + 1536; /* align */
+				PUSH(EDX);
+				rdd_probtree1_f();
+				CL = 6;
+			}
+			EBX = EDX;
+			POP(EDX);
+			do {
+				(unsigned int) EBX >>= 1;
+				RCL(EDX, 1);
+				CL--;
+			} while (!= 0);
+		}
+		NOT(EDX);
+		POP(ECX); /* len */
+		work->repdis[0] = EDX;
+	}
+
+rep0l1skip:
+	PUSH(EDI);
+	ECX += 2;
+	PUSH(ESI);
+	EDI = work->outStream;
+	ESI = work->outSize;
+	ESI -= work->nowPos;
+	if ((unsigned) ECX >= ESI)
+		ECX = ESI;
+	LEA(ESI, [EDI + EDX]);
+	work->nowPos += ECX;
+	if ((unsigned) ESI < work->q0)
+		goto err;
+	asmout("REP ES MOVSB");
+	work->outStream = EDI;
+	POP(ESI);
+	EDX = work->nowPos;
+	POP(EDI);
+	if ((unsigned) EDX >= work->outSize)
+		goto fin;
+lzdone:
+	EBX = work->state;
+	EDI = work->ptbm[4];
+	EDX &= work->posStateMask;
+	EBX *= 16;
+	if (== 0)
+		EDI = work->ptbm[0];
+	PUSH(EDX); /* posState */
+	LEA(EBX, [EBX + EDX + 320 + 1632]); /* mch */
+	CH = 0x01;
+	EDX = 0;
+	rdd_probtree_f();
+	if (== 0)
+		goto lzphase;
+
+	POP(EDX);
+	EBX = work->state;
+	EDX = work->nowPos;
+	EDI = work->outStream;
+//	BL = [SEG_CS:state_table + EBX];
+	asmout("MOV BL,[CS:.state_table+EBX]");
+	EDX &= work->literalPosMask;
+	(char) work->state = BL;
+	CL = work->lc;
+	EBX = (unsigned char) [SEG_ES:EDI - 1];
+	SHL(EDX, CL);
+	PUSH(EDI);
+	CL = work->lc8;
+	SHR(EBX, CL);
+	EBX += EDX;
+	EDX = work->repdis[0];
+	EBX *= 256;
+	CL = [SEG_ES:EDI + EDX];
+
+	PUSH(EBX);
+	EDX = 0;
+	EBX *= 2; /* 512 */
+	EDX++; /* EDX = 1 */
+	EBX += work->lit1;
+	AL = work->lit0cntmsk;
+	EDI = 32 + 768; /* bm[24] */
+	do {
+		ECX *= 2;
+		PUSH(EBX);
+		PUSH(ECX);
+		PUSH(EDI);
+		PUSH(EAX);
+		ECX &= 0x100;
+		EDI = work->ptbm[8];
+		EBX += ECX;
+		CH = 0x01;
+		rdd_probtree_f();
+		POP(EAX);
+		POP(EDI);
+		CL = AL;
+		EAX--;
+		(unsigned char) CL >>= 4;
+		TEST(AL, CL);
+		if (== 0)
+			EDI += 32;
+		POP(ECX);
+		AH = DL;
+		POP(EBX);
+		AH ^= CH;
+		if (EDX >= 0x100)
+			goto finlit1;
+		TEST(AH, 1);
+	} while (== 0);
+	CH = AL;
+	POP(EBX);
+	EBX += 320 + 2064; /* lit0 */
+	if (AL > 0x70) {
+		CH &= 0x0f;
+		rdd_probtree_f();
+		goto lit11;
+	}
+	rdd_probtree();
+	goto lit11;
+finlit1:
+	POP(EBX);
+	goto lit11;
+err:
+	EAX = 0;
+	ESP = [SS:EBP - 4];
+	EAX++;
+fin:
+	return;
+state_table:
+	DB(0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 4, 5);
+}
+
+void cmd0004_decode_tek5()
+/* DS:ESI(limit:EDX), ES:EDI, EBP */
+{
+	PUSHFD();
+	CLD();
+	getnum_s7s();
+	TEST(AL, 0x01);
+	if (!= 0)
+		INT(0x03); /* 手抜きエラー */
+	ESI--;
+	if (EBP != 0)
+		lzrestore_tek5();
+	POPFD();
+	return;
+}
+
+void cmd008()
+/* pioneer0ライブラリの終了
+   オプションで、アプリ自体も終了するか、それともアプリは終了しないかを選べる
+   現在は、オプションを確認することもなく、終了 */
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+	(offset) cmd += 8;
+	PUSH((int) 0);
+	PUSH((int) 0x0001); // opt(close all handle)
+	PUSH((int) 0x0040); /* タスク終了 */
+	EBX = ESP;
+	CALL(0x0017,0); /* GUIGUI統合shellcall */
+	AL = [SS:ESP + 6];
+	ESP += 12 - 4;
+	AL += work->ending_count;
+	AL &= 0x7f;
+	work->ending_count = AL;
+	if (!= 0) {
+		/* sleep */
+		LEA(EBX, work->softint_mask_buf[0]); /* add_nest(Llv変更する) */
+	//	work->softint_mask_buf[ 8] = 0x0080;
+		(int) [DS:EBX + 8] = 0x0080;
+		CALL(0x0017,0); // shell-call
+		INT(0x03);
+	}
+//	PUSH((int) 0);
+	PUSH((int) 0x0002); // opt(close task)
+	PUSH((int) 0x0040); /* タスク終了 */
+	EBX = ESP;
+	CALL(0x0017,0); /* GUIGUI統合shellcall */
+	INT(0x03);
+}
+
+void cmd00c()
+/* JMP */
+{
+	int *cmd == DS:ESI;
+	EAX = cmd[4]; /* opt */
+	if (EAX == 0) {
+		/* 相対ジャンプ */
+		(offset) cmd += cmd[8];
+		asmout("JMP nextcmd");
+
+	}
+	if (EAX == 1) {
+		/* 絶対ジャンプ */
+		(offset) cmd = cmd[8];
+		asmout("JMP nextcmd");
+	}
+	SAFE_CUT("DB ..$-$-1,'jump:Invalid option ',0,'@',6,'.'");
+}
+
+void cmd010()
+/* softintベクタ設定 */
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+
+	EAX = cmd[4] /* EIP */;
+	ECX = cmd[8] /* CS */;
+	(offset) cmd += 12;
+	work->softint_EIP = EAX;
+	work->softint_CS = ECX;
+	asmout("JMP nextcmd");
+}
+
+void cmd014()
+/* 各種info取得 : cmd, opt, ptr */
+/* lenなどはoptで決まるので書かなくてよい */
+{
+	int *cmd == DS:ESI;
+	if (cmd[4] != 0x10) {
+		SAFE_CUT("DB ..$-$-1,'getInfo:Invalid option ',0,'@',6,'.'");
+	}
+	PUSH(0x0000);
+	PUSH(cmd[12]);
+	PUSH(cmd[ 8]);
+	PUSH(0);
+	PUSH(2);
+	PUSH(0);
+	PUSH(0x0210);
+	EBX = ESP;
+	CALL(0x0017,0); /* GUIGUI統合shellcall */
+	ESP += 28;
+	PUSH(DS);
+	LDS(EBX, cmd[8]);
+	(int) [DS:EBX + 0] -= 8 + 8;
+	(int) [DS:EBX + 4] -= 29 + 8;
+	POP(DS);
+	(offset) cmd += 16;
+	asmout("JMP nextcmd");
+}
+
+void near cmd018()
+/* wait signal */
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+
+	EAX = cmd[8]; // signaldw
+	EDX = cmd[4]; // opt
+	work->signalbox_write_free += EAX;
+	work->signalbox_read_free -= EAX;
+	if ((unsigned) < 0) {
+		/* 書き込んだ以上に、読み込んだと報告された。
+		   これは許しがたいエラーである。 */
+		SAFE_CUT("DB ..$-$-1,'waitSignal:Signal received more than sent.'");
+	}
+//	ECX = work->signalbox_write_ptr;
+//	TEST(CL, 0x01);
+	TEST((char) work->signalbox_write_ptr, 0x01);
+	PUSH((int) 0x0000); /* eoc */
+	if (!= 0) {
+		if (EAX != 0) {
+			/* シグナルフルだったので、それを解除 */
+			work->signalbox_write_ptr &= 0xfffffffc;
+		//	PUSH((int) 0x0000); // eoc
+			PUSH((int) 0xff02); // nest
+			PUSH((int) 0); // signals
+			PUSH((int) 0x0204); // add nest
+			EBX = ESP;
+			CALL(0x0017,0); /* GUIGUI統合shellcall */
+			ESP += 16 - 4;
+		}
+	}
+	if (EDX == 0x0080) {
+		/* 帰還要求を表すために、スタック内のESP値を1にする。 */
+		(int) [SS:ESP + 12 /* ESP */ + 4] = 1;
+	}
+	EAX = cmd[12]; // nest
+	work->nest += EAX;
+
+	(offset) cmd += 16;
+	TEST(EDX, 0xffffff70);
+	if (!= 0) {
+		// 無効オプション指定
+		SAFE_CUT("DB ..$-$-1,'waitSignal:Invalid option ',2,'.'");
+	}
+
+	int slot == EAX;
+	slot = 0x01c0;
+
+	TEST(DL, 0x08);
+	if (!= 0) {
+		// set now time
+	//	PUSH((int) 0x0000);
+		PUSH((int) /* 0x01c0 */ slot);
+		PUSH((int) 0x0310); /* 現在時刻設定 */
+		EBX = ESP;
+		CALL(0x0017,0); /* shell-call */
+		ESP += 12 - 4;
+	}
+
+	TEST(DL, 0x04);
+	if (!= 0) {
+		/* add time */
+		/* 本来なら最低加算時間のチェックがある */
+	//	PUSH((int) 0x0000);
+		PUSH(cmd[8]);
+		PUSH(cmd[4]);
+		PUSH(cmd[0]);
+		(offset) cmd += 12;
+		PUSH((int) /* 0x01c0 */ slot);
+		PUSH((int) 0x0314); /* 時刻加算 */
+		EBX = ESP;
+		CALL(0x0017,0); // shell-call
+		ESP += 24 - 4;
+	}
+
+	/* 以下はシグナルが溜まっていないときだけ有効 */
+	if (work->signalbox_read_free == 0) {
+		TEST(DL, 0x02);
+		if (!= 0) {
+			// regist timer
+		//	PUSH((int) 0x0000);
+			PUSH((int) /* 0x01c0 */ slot);
+			PUSH((int) 0x0308); /* タイマー登録 */
+			EBX = ESP;
+			CALL(0x0017,0); // shell-call
+			ESP += 12 - 4;
+		}
+		TEST(DL, 0x01);
+		if (!= 0) {
+			/* sleep */
+			LEA(EBX, work->softint_mask_buf[0]); /* add_nest(Llv変更する) */
+			work->softint_mask_buf[ 8] = 0x0080;
+			CALL(0x0017,0); // shell-call
+
+			LEA(EBX, work->softint_mask_buf[0]); /* add_nest(Llv変更しない) */
+			work->softint_mask_buf[ 8] = 0xff80;
+				/* ライブラリルーチン内に再入したので、割り込みマスク */
+			CALL(0x0017,0); // shell-call
+		}
+		TEST(DL, 0x02);
+		if (!= 0) {
+			/* cancel timer */
+		//	PUSH((int) 0x0000);
+			PUSH((int) /* 0x01c0 */ slot);
+			PUSH((int) 0x030c); // タイマー解約
+			EBX = ESP;
+			CALL(0x0017,0); // shell-call
+			ESP += 12 - 4;
+		}
+	}
+	POP(EAX);
+	asmout("JMP nextcmd");
+}
+
+void cmd01c()
+/* NOP */
+{
+	int *cmd == DS:ESI;
+	(offset) cmd += 4;
+	asmout("JMP nextcmd");
+}
+
+void cmd020()
+/* create new window.
+   slotのbit0 : ユーザーシグナルハンドリング
+   slotのbit1 : position offset指定
+   今のところ、シグナル長1のみサポート */
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+
+	/* WINDOW構造体の初期化など */
+	WINDOW *cmd0020_win == DS:EDI;
+	(offset) cmd0020_win = cmd[ 4]; // work_ptr
+	LEA(EAX, cmd0020_win->children_back); 
+	cmd0020_win->children_back = EAX;
+	cmd0020_win->children_next = EAX;
+	LEA(EAX, cmd0020_win->chain_back);
+	ECX = work->children_back;
+	work->children_back = EAX;
+	(int) [DS:ECX + 4] /* back->next */ = EAX;
+	LEA(EAX, work->children_back);
+	cmd0020_win->chain_back = ECX;
+	cmd0020_win->chain_next = EAX;
+	// signatureも初期化
+	asmout("mov dword[ds:edi], 'WIND'");
+	asmout("mov dword[ds:edi+4], 'OW00'");
+
+	EAX = cmd[ 8]; // slot-no
+	ECX = cmd[12]; // x-size
+	EDX = cmd[16]; // y-size
+	(offset) cmd += 20;
+	TEST(AL, 0x01);
+	(int) cmd0020_win->mode0 = 0;
+	cmd0020_win->flags = 0;
+	if (!= 0) {
+		/* シグナルハンドリング */
+		EBX = cmd[0];
+		TEST(BH, 0x01);
+		if (!= 0)
+			BH ^= 0x10;
+		(short) cmd0020_win->siglen = BX;
+		/* シグナル長(bit0-3), ハンドリング範囲(bit8-15)
+		   値0 : ハンドリングしない
+		   bit0 : enable(0)/disable(1)/redraw(2)/redraw2(3)
+		   bit1 : move(4)
+		   bit2 : setmode(5)
+		   bit3 : close(6)
+		   bit4 : opt for bit0
+		   bit5 : closed(7)
+		   bit6 : resize(8)
+		   bit7は加算量scale(0はx1、1はx4)
+		   残りの4bitはリザーブ
+		   最小化はdisableで処理されるので、検知できない
+		   clickやresizeは拡張系(8, 9) */
+		EBX = cmd[4];
+		(offset) cmd += 8;
+		cmd0020_win->signalhead[0] = EBX;
+	}
+	TEST(AL, 0x02);
+	if (== 0) {
+		ECX += 8 + 8; /* 左右に8dotずつ確保 */
+		EDX += 29 + 8; /* 上に29dot、下に8dot確保 */
+		cmd0020_win->x_ofs =  8;
+		cmd0020_win->y_ofs = 29;
+	} else {
+		PUSH(EDX);
+		EDX = cmd[0]; // x-offset
+		EBX = cmd[4]; // y-offset
+		(offset) cmd += 8;
+		cmd0020_win->x_ofs = EDX;
+		cmd0020_win->y_ofs = EBX;
+		POP(EDX);
+		cmd0020_win->flags |= WINFLAG_USERCONTROL;
+	}
+	EAX &= 0xfffffff0;
+	cmd0020_win->x_size = ECX;
+	cmd0020_win->y_size = EDX;
+	cmd0020_win->slot = EAX;
+	PUSH((int) 0 /* EOC */);
+	PUSH((int) 0x0040 /* signal-base */);
+	PUSH((int) 0x0140 /* signalbox(slot番号で指定) */);
+	PUSH(EDX /* y-size */);
+	PUSH(ECX /* x-size */);
+	PUSH((offset) cmd0020_win /* user-no */);
+	PUSH(EAX /* slot-no */);
+	PUSH((int) 0x0100 /* cmd-no */);
+	EBX = ESP;
+	CALL(0x0017,0); // shell-call
+	ESP += 32;
+	asmout("JMP nextcmd");
+}
+
+void cmd024()
+/* windowクローズ */
+/* これにつながっていた全てのコンポーネントも使えなくなる */
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+
+	WINDOW *cmd0024_win == DS:EDI;
+	(offset) cmd0024_win = cmd[ 8]; // work_ptr
+	(offset) cmd += 12;
+	PUSH((int) 0 /* EOC */);
+	PUSH(cmd0024_win->slot);
+	PUSH((int) 0x0104 /* cmd-no */);
+	[DS:EDI] = EDI;
+	[DS:EDI+4] = EDI;	/* signatureつぶし */
+	EBX = ESP;
+	CALL(0x0017,0); // shell-call
+	ESP += 12;
+	work->ending_count++;
+	asmout("JMP nextcmd");
+}
+
+void cmd028()
+// open text box
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+
+	WINDOW *win == DS:EDI;
+	TEXTBOX *textbox == DS:EBX;
+	(offset) textbox = cmd[ 8]; // work_ptr
+	(offset) win = cmd[32]; // window
+	/* 新しいtextboxをchainの一番後ろにつなぐ */
+	(int) textbox->signature[0] = 0x54584554; // 'TEXT'
+	LEA(EAX, textbox->chain_back);
+	ECX = win->children_back;
+	win->children_back = EAX;
+	(int) [DS:ECX + 4] /* back->next */ = EAX;
+	LEA(EAX, win->children_back);
+	textbox->chain_back = ECX;
+	textbox->chain_next = EAX;
+	textbox->flags = 0;
+	EAX = cmd[ 4]; // opt
+	ECX = cmd[12]; // bcolor
+	TEST(AL, 0x01);
+	if (== 0) {
+		ECX = DEFAULT_TBOX_BCOL;
+		// titleの時は、アクティブかどうかによって色が変わるので、初期値を設定しない
+	}
+	textbox->backcolor = ECX;
+	EDX = cmd[24]; // x0
+	ECX = cmd[28]; // y0
+	EDX += win->x_ofs;
+	ECX += win->y_ofs;
+	TEST(AH, 0xf0);
+	if (!= 0) {
+		/* ウィンドウタイトルサイズチェック */
+		ECX = cmd[16]; // x_size(キャラクター数)
+		ECX *= 8;
+		ECX += 80 + 16;
+		#if (defined(SAFEAPI_FLAG))
+			if (win->x_size < ECX) {
+				EAX = textbox->chain_back;
+				LEA(EDI, win->children_back);
+				[DS:EAX+4] = EDI;	/* win->back->back->next=win */
+				[DS:EDI] = EAX;		/* win->back = win->back->back */
+				/* 切らないで不正なまま残しておくと死亡 */
+				SAFE_CUT("DB ..$-$-1,'opentextbox:Too long titlebox(WinW must be >=',1,').'");
+			}
+		#else
+			if (win->x_size < ECX)
+				INT(0x03);
+		#endif
+		EDX = 24;
+		ECX =  4;
+	}
+	textbox->x0 = EDX;
+	textbox->y0 = ECX;
+	textbox->option = EAX;
+	textbox->window = (offset) win;
+	EAX = cmd[16]; // x_size(キャラクター数)
+	ECX = cmd[20]; // y_size(キャラクター数)
+	textbox->x_size = EAX;
+	textbox->y_size = ECX;
+	EDX = cmd[36]; // キャラクターセット(slot-no)
+	ECX = cmd[40]; // space code.
+	(offset) cmd += 44;
+	textbox->blank = ECX;
+
+	// バッファの初期化
+	textbox->charset = EDX;
+	EAX = textbox->x_size;
+	PUSH((offset) textbox);
+	MUL(textbox->y_size);
+	EDX = textbox->backcolor;
+	EDX <<= 16;
+	(offset) textbox += 64;
+	EDX++;
+	do {
+		(int) [textbox    ] = ECX;
+		(int) [textbox + 4] = EDX;
+		(offset) textbox += 8;
+		EAX--;
+	} while (!= 0);
+	POP((offset) textbox);
+
+	EAX = textbox->x_size;
+	ECX = textbox->y_size;
+	EAX *= 8;
+	ECX *= 8;
+	TEST(textbox->option, 0x10);
+	if (== 0)
+		ECX *= 2;
+	EAX -= win->x_size;
+	ECX -= win->y_size;
+	if (EAX >= -16) { /* 8 + 8 */
+		if (ECX >= -37) { /* 29 + 8 */
+			TEST(win->flags, WINFLAG_USERCONTROL);
+			if (== 0)
+				win->flags |= WINFLAG_FRAMEONLY;
+		}
+	}
+	/* x0, y0も調べるべきだが、手抜き */
+
+	if (win->draw_enable != 0) {
+		/* もし、描画フラグが1なら、更新する(フレームを描くとか、背景色をセットするとか)。 */
+		EAX = textbox->option;
+		TEST(AH, 0xf0);
+		if (== 0) {
+			TEST(AL, 0x01);
+			if (!= 0) {
+				EDX = win->slot;
+				PUSH(ESI);
+				ESI = (offset) textbox;
+				// EDX:win_slot, ESI:textbox
+				EAX = 0x0020;
+				textbox_drawback();
+				POP(ESI);
+			}
+		}
+	} else
+		textbox->flags |= WINFLAG_MUSTREDRAW;
+	asmout("JMP nextcmd");
+}
+
+void cmd02c()
+/* close text box */
+/* cmd, opt, textbox */
+{
+	int *cmd == DS:ESI;
+	WINDOW *win == DS:EDI;
+	TEXTBOX *textbox == DS:EBX;
+	(offset) textbox = cmd[8];
+	(offset) cmd += 12;
+
+	int *back == DS:EAX, *next == DS:ECX;
+	(offset) back = textbox->chain_back;
+	(offset) next = textbox->chain_next;
+	(offset) win = textbox->window;
+	back[4 /* next */] = (offset) next;
+	next[0 /* back */] = (offset) back;
+	win->flags &= -1-WINFLAG_FRAMEONLY;
+
+	EAX = 0;
+	if (AL != win->draw_enable) {
+		/* もし描画フラグが1なら、消去する。 */
+		PUSH(EAX);
+		EAX = textbox->x0;
+		ECX = textbox->y0;
+		EDX = textbox->option;
+		PUSH((int) 8);
+		PUSH(EDX);
+		PUSH(EDX);
+		PUSH(ECX);
+		PUSH(EAX);
+		EAX = textbox->x_size;
+		ECX = textbox->y_size;
+		EAX *= 8;
+		ECX *= 8;
+		TEST(DL, 0x10);
+		if (== 0)
+			ECX *= 2;
+		EAX += textbox->x0;
+		ECX += textbox->y0;
+		EAX--;
+		ECX--;
+		TEST(DL, 0x01);
+		(int) [SS:ESP +  8] = EAX;
+		(int) [SS:ESP + 12] = ECX;
+		if (!= 0) {
+			EAX += 3;
+			ECX += 3;
+			(int) [SS:ESP +  8] = EAX;
+			(int) [SS:ESP + 12] = ECX;
+			(int) [SS:ESP     ] -= 3;
+			(int) [SS:ESP +  4] -= 3;
+		}
+		PUSH(win->slot);
+		PUSH((int) 0x0020 /* boxfill */);
+		PUSH((int) 0x0400 /* line cmd */);
+		EBX = ESP;
+		CALL(0x0017,0); // GUIGUI統合shellcall
+		ESP += 36;
+	} else
+		win->flags |= WINFLAG_MUSTREDRAW;
+		/* 塗り潰して消えるだけの特別なコンポーネントを作る手もなくはない */
+	asmout("JMP nextcmd");
+}
+
+void cmd030()
+// open graphic box
+/* cmd, opt(0), graphbox */
+/* cmd, opt(1), graphbox, mode, mode_opt, x_size, y_size, x0, y0, window */
+/* cmd, opt(2), graphbox, mode, mode_opt, x_bsize, y_bsize,
+	x_vsize, y_vsize, x0, y0, window */
+
+/* optのbit15が1ならGAPIへコマンドは送らない */
+/* optのbit12が1なら、バッファの初期化はしない */
+/* 別のコマンドで、グラフィックコマンドの表示位置を設定する(controlgbox) */
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+	WINDOW *win == DS:EDI;
+	GRAPHBOX *graphbox == DS:EBX;
+
+	EAX = cmd[ 4]; // opt
+	(offset) graphbox = cmd[ 8]; // work_ptr
+	graphbox->flags = 0;
+	if (AL == 0x01) {
+		(offset) win = cmd[36]; // window
+		EAX = cmd[12]; // mode
+		ECX = cmd[16]; // mode_opt
+		EDX = cmd[20]; // x_size
+		graphbox->mode = AL;
+		graphbox->mode_opt = ECX;
+		graphbox->x_bsize = EDX;
+		graphbox->x_vsize = EDX;
+		EAX = cmd[24]; // y_size
+		ECX = cmd[28]; // x0
+		EDX = cmd[32]; // y0
+		ECX += win->x_ofs;
+		EDX += win->y_ofs;
+		graphbox->y_bsize = EAX;
+		graphbox->y_vsize = EAX;
+		graphbox->x0 = ECX;
+		graphbox->y0 = EDX;
+		LEA(EAX, graphbox->buffer[0]);
+		ECX = 0;
+		PUSH((int) 40);
+		graphbox->vbuf0 = EAX;
+		graphbox->vx0 = ECX;
+		graphbox->vy0 = ECX;
+		graphbox->window = (offset) win;
+		goto bufclear;
+	} else if (AL == 0x02) {
+		(offset) win = cmd[44]; // window
+		EAX = cmd[12]; // mode
+		ECX = cmd[16]; // mode_opt
+		EDX = cmd[20]; // x_bsize
+		graphbox->mode = AL;
+		graphbox->mode_opt = ECX;
+		graphbox->x_bsize = EDX;
+		EAX = cmd[24]; // y_bsize
+		ECX = cmd[28]; // x_vsize
+		EDX = cmd[32]; // y_vsize
+		graphbox->y_bsize = EAX;
+		graphbox->x_vsize = ECX;
+		graphbox->y_vsize = EDX;
+		EAX = cmd[36]; // x0
+		ECX = cmd[40]; // y0
+		EAX += win->x_ofs;
+		ECX += win->y_ofs;
+		graphbox->x0 = EAX;
+		graphbox->y0 = ECX;
+		ECX = 0;
+		LEA(EAX, graphbox->buffer[0]);
+		PUSH((int) 48);
+		graphbox->vbuf0 = EAX;
+		graphbox->vx0 = ECX;
+		graphbox->vy0 = ECX;
+		graphbox->window = (offset) win;
+bufclear:
+		TEST((char) cmd[5], 0x10);
+		if (== 0) {
+			EAX = graphbox->x_bsize;
+			MUL(graphbox->y_bsize);
+			EDX = graphbox->vbuf0;
+			ECX = graphbox->mode_opt;
+			if (graphbox->mode == 0x22)
+				goto clr_mode2;
+			if (graphbox->mode == 0x24)
+				goto clr_mode4;
+			if (graphbox->mode == 1) {
+				do {
+					[DS:EDX] = CL;
+					EDX++;
+					EAX--;
+				} while (!= 0);
+			}
+			if (graphbox->mode == 2) {
+	clr_mode2:
+				do {
+					[DS:EDX] = CX;
+					EDX += 2;
+					EAX--;
+				} while (!= 0);
+			}
+			if (graphbox->mode == 4) {
+	clr_mode4:
+				do {
+					[DS:EDX] = ECX;
+					EDX += 4;
+					EAX--;
+				} while (!= 0);
+			}
+		}
+	} else {
+		PUSH((int) 12);
+		(offset) win = graphbox->window;
+	}
+	(offset) win = graphbox->window; // window
+	(int) graphbox->signature[0] = 0x50415247; // 'GRAP'
+	LEA(EAX, graphbox->chain_back);
+	ECX = win->children_back;
+	win->children_back = EAX;
+	(int) [DS:ECX + 4] /* back->next */ = EAX;
+	LEA(EAX, win->children_back);
+	graphbox->chain_back = ECX;
+	graphbox->chain_next = EAX;
+
+	EAX = win->x_size;
+	ECX = win->y_size;
+	EAX -= graphbox->x_vsize;
+	ECX -= graphbox->y_vsize;
+	if (EAX <= 8 + 8) {
+		if (ECX <= 29 + 8) {
+			TEST(win->flags, WINFLAG_USERCONTROL);
+			if (== 0)
+				win->flags |= WINFLAG_FRAMEONLY;
+		}
+	}
+	/* x0, y0も調べるべきだが、手抜き */
+
+	/* 必要ならフレームを描く */
+	TEST((char) cmd[ 5], 0x80);
+	if (== 0) {
+		if (win->draw_enable != 0) {
+			EAX = graphbox->x_bsize;
+			ECX = graphbox->mode;
+			PUSH((int) 0);
+			EAX -= graphbox->x_vsize;
+			ECX &= 0x0f;
+			PUSH(DS);
+			IMUL(EAX, ECX);
+			PUSH(graphbox->vbuf0);
+			PUSH(EAX);
+			PUSH(graphbox->y_vsize);
+			PUSH(graphbox->x_vsize);
+			PUSH(graphbox->y0);
+			PUSH(graphbox->x0);
+			PUSH(win->slot);
+			EBX = graphbox->mode;
+			PUSH(EBX);
+			PUSH((int) 0x0414);
+			EBX = ESP;
+			CALL(0x0017,0); // GUIGUI統合shellcall
+			ESP += 44;
+		} else
+			graphbox->flags |= WINFLAG_MUSTREDRAW;
+	}
+	POP(EAX);
+	(offset) cmd += EAX;
+	asmout("JMP nextcmd");
+}
+
+void cmd034()
+/* close graphic box */
+/* cmd, opt, graphicbox */
+{
+	SAFE_CUT("DB ..$-$-1,'closeGraphicbox:Not implemented.'");
+}
+
+void cmd040()
+// put string
+/* bit0 : bcolor */
+/* bit1 : color-font */
+/* bit8-9 : 0,1,2,3(4) */
+/* bit10 : col無効化 */
+/* bit11 : bcol無効化 */
+/* bit12-13 : dw|by|wd|dw */
+/* bit14 : far-ptr */
+{
+	int *cmd == DS:ESI;
+	WINDOW *win == DS:EDI;
+	TEXTBOX *textbox == DS:EBX;
+	TEXTBOX *textbox2 == DS:ECX;
+
+	PUSH(ES);
+	PUSH(DS);
+	(offset) textbox = cmd[16];
+	EAX = cmd[12]; // y_pos
+	POP(ES);
+	EDI = cmd[ 8]; // x_pos
+	MUL(textbox->x_size);
+	PUSH(EBP);
+	ESP -= 52;
+	EAX += EDI; // x_pos
+	EBP = ESP;
+	EDX = cmd[12]; // y_pos
+	ECX = textbox->option;
+	EDX *= 8;
+	EDI *= 8;
+	TEST(CL, 0x10); // option
+	if (== 0)
+		EDX *= 2;
+	EDI += textbox->x0;
+	EDX += textbox->y0;
+	(int) [SS:EBP + 12] = EDI; /* x0 */
+	(int) [SS:EBP + 16] = EDX; /* y0 */
+	EDI = textbox->charset;
+	(int) [SS:EBP +  4] = 0x3000; /* option */
+	(int) [SS:EBP + 28] = EDI; /* charset */
+	(offset) win = textbox->window;
+	EDX = textbox->backcolor;
+	PUSH((offset) textbox);
+	LEA(EBX, [(offset) textbox + EAX * 8 + 64]); /* これ以降textboxは使えない */
+	EAX = cmd[ 4]; /* option */
+	TEST(AL, 0x01);
+	if (!= 0)
+		EDX = cmd[24]; // back_color
+	TEST(CL, 0x10); /* half height */
+	if (!= 0)
+		(char) [SS:EBP +  4] = 0x01; /* option */
+	TEST(CH, 0xf0);
+	ECX = cmd[20]; /* color */
+	if (!= 0) {
+		/* to wintitle */
+		PUSH(EAX);
+		EAX = win->mode0;
+	//	(int) [SS:EBP + 12] = 24; /* x0 */
+	//	(int) [SS:EBP + 16] =  4; /* y0 */
+		asmout("MOVZX ECX,WORD PTR CS:[EAX*2+wintitle_colortable]");
+		POP(EAX);
+		EDX = ECX;
+		ECX &= 0x7f;
+		EDX /= 256;
+	}
+	(int) [SS:EBP + 20] = ECX; /* color */
+	(int) [SS:EBP + 24] = EDX; /* backcolor */
+	EDX <<= 16;
+	(int) [SS:EBP +  0] = 0x0404;
+	EDX |= ECX;
+	ECX = win->slot;
+	(int) [SS:EBP + 40] = EBX;
+	(int) [SS:EBP +  8] = ECX; /* slot */
+	ECX = 0;
+	(short) [SS:EBP + 44] = DS;
+	(int) [SS:EBP + 32] = ECX; // 0; /* base */
+	(int) [SS:EBP + 48] = ECX; // 0; /* eoc */
+	PUSH(EDI);
+	(offset) cmd += 32;
+	TEST(AL, 0x02);
+	if (!= 0) {
+		/* color font */
+		(char) [SS:EBP +  4] |= 0x02; /* option */
+	}
+	PUSH(EBP);
+	TEST(AH, 0x30);
+	PUSH(EAX);
+	if (!= 0) {
+		ECX = cmd[-4];
+		(offset) cmd += 4;
+	}
+	TEST(AH, 0x40);
+	EBP = cmd[-4]; // length
+	EDI = (offset) cmd;
+	(int) [SS:ESP + 16 + 36] = EBP; // length
+	if (!= 0) {
+		asmout("LES EDI,[ESI]");
+		(offset) cmd += 8;
+	}
+	TEST(AL, 0x02);
+	if (!= 0)
+		goto skip;
+	if (EDX == 0)
+		goto blank;
+skip:
+	AH &= 0x30;
+	if (== 0)
+		goto opt00;
+	if (AH == 0x10) {
+		do {
+			EAX = (unsigned char) [ES:EDI];
+			EDI++;
+			EAX += ECX;
+			[DS:EBX + 4] = EDX;
+			[DS:EBX + 0] = EAX;
+			EBX += 8;
+			EBP--;
+		} while (!= 0);
+	} else if (AH == 0x20) {
+		do {
+			EAX = (unsigned short) [ES:EDI];
+			EDI += 2;
+			EAX += ECX;
+			[DS:EBX + 4] = EDX;
+			[DS:EBX + 0] = EAX;
+			EBX += 8;
+			EBP--;
+		} while (!= 0);
+	} else {
+opt00:
+		do {
+			EAX = (unsigned int) [ES:EDI];
+			EDI += 4;
+			EAX += ECX;
+			[DS:EBX + 4] = EDX;
+			[DS:EBX + 0] = EAX;
+			EBX += 8;
+			EBP--;
+		} while (!= 0);
+	}
+	
+skip2:
+	EDI += 3;
+	POP(EAX);
+	EDI &= 0xfffffffc;
+	TEST(AH, 0x40);
+	POP(EBX); /* == EBP */
+	if (== 0)
+		ESI = EDI;
+	POP(EDI);
+	if (win->draw_enable != 0) {
+		CALL(0x0017,0); // GUIGUI統合shellcall
+		POP(EBX); /* textbox */
+	} else {
+		POP(EBX); /* textbox */
+		textbox->flags |= WINFLAG_MUSTREDRAW;
+	}
+	ESP += 52;
+	POP(EBP);
+	POP(ES);
+	asmout("JMP nextcmd");
+
+blank:
+	(offset) textbox2 = [SS:ESP + 12];
+	EDX++;
+	AH &= 0x30;
+	ECX = textbox2->blank;
+	if (== 0)
+		goto blank_d;
+	if (AH == 0x10)
+		goto blank_b;
+	if (AH == 0x30) {
+blank_d:
+		EBP *= 2;
+	}
+	EBP *= 2;
+blank_b:
+	EDI += EBP;
+	do {
+		[DS:EBX + 0] = ECX;
+		[DS:EBX + 4] = EDX;
+		EBX += 8;
+		EBP--;
+	} while (!= 0);
+	goto skip2;
+
+	ALIGN(2);
+	asmout("wintitle_colortable: equ $");
+	#if (defined(WIN9X))
+		DW(0x0008, 0x0708, 0, 0x040f);
+	#elif (defined(TMENU))
+		DW(0x0f07, 0x0800, 0, 0x000f);
+	#elif (defined(CHO_OSASK))
+		DW(0x0800, 0x0807, 0, 0x070f);
+	#elif (defined(NEWSTYLE))
+		DW(0x0008, 0x0708, 0, 0x040f);
+	#elif (defined(WIN31))
+		DW(0x0800, 0x0f00, 0, 0x040f);
+	#endif
+}
+
+void cmd044()
+// line & box (without graphicbox)
+// windowを指定した場合、enableのチェックはしないので要注意
+
+//  +00 : cmd
+//  +04 : opt
+//  +08 : 0(window)
+//  +0c : color
+//  +10 : x0
+//  +14 : y0
+//  +18 : x1
+//  +1c : y1
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+	WINDOW *win == DS:EBX;
+
+	PUSH(EBP);
+	EDI = 0;
+	PUSH(EDI); /* eoc */
+	ESP -= 36 - 4;
+	EAX = cmd[ 4]; // opt
+	EBP = ESP;
+	(offset) win = cmd[ 8]; // window
+	ECX = cmd[12]; // color
+	EDX = EDI;
+	if ((unsigned) (offset) win != 0xffffffff) {
+		#if (defined(SAFEAPI_FLAG))
+			asmout("CMP DWORD [DS:EBX],'WIND'");
+			if (!=) {
+				SAFE_CUT("DB ..$-$-1,'drawLine:invalid window: ',6");
+			}
+		#endif
+		EDX = win->slot;
+	}
+	(int) [SS:EBP +  0] = 0x0400; // cmd
+	(int) [SS:EBP +  4] = EAX; // opt
+	(int) [SS:EBP +  8] = EDX; // slot
+	(int) [SS:EBP + 28] = ECX; // color
+	EDX = EDI;
+	if ((unsigned) (offset) win != 0xffffffff) {
+		EDX = win->x_ofs;
+		EDI = win->y_ofs;
+	}
+	EAX = cmd[16]; // x0
+	ECX = cmd[20]; // y0
+	EAX += EDX;
+	ECX += EDI;
+	(int) [SS:EBP + 12] = EAX; // x0
+	(int) [SS:EBP + 16] = ECX; // y0
+	EAX = cmd[24]; // x1
+	ECX = cmd[28]; // y1
+	EAX += EDX;
+	ECX += EDI;
+	(offset) cmd += 32;
+	(int) [SS:EBP + 20] = EAX; // x1
+	(int) [SS:EBP + 24] = ECX; // y1
+//	(int) [SS:EBP + 32] = 0; // eoc
+	EBX = EBP;
+	CALL(0x0017,0); // GUIGUI統合shellcall
+	ESP += 36;
+	POP(EBP);
+	asmout("JMP nextcmd");
+}
+
+void cmd048()
+// put string(without textbox)
+// windowを指定した場合、enableのチェックはしないので要注意
+
+// +00 : cmd
+// +04 : opt(bit0:backcolor-enableは無視、常にenable)
+// +08 : -1/window
+// +12 : charset
+// +16 : x_pos(dot)
+// +20 : y_pos(dot)
+// +24 : color
+// +28 : backcolor
+// +32 : length
+
+// optのbit0は調べていない。1だという前提。
+/* int-base0以外は未対応 */
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+	WINDOW *win == DS:EBX;
+
+	PUSH(EBP);
+	EAX = 0;
+	ESP -= 52;
+	(offset) win = cmd[ 8];
+	EBP = ESP;
+	ECX = EAX;
+	EDX = EAX;
+	if ((unsigned) (offset) win != 0xffffffff) {
+		EAX = win->slot;
+		ECX = win->x_ofs;
+		EDX = win->y_ofs;
+	}
+	ECX += cmd[16]; // x_pos(dot)
+	EDX += cmd[20]; // y_pos(dot)
+	(int) [SS:EBP     ] = 0x0404; /* put text */
+	(int) [SS:EBP +  4] = 0x0000; /* option */
+	(int) [SS:EBP +  8] = EAX;
+	(int) [SS:EBP + 12] = ECX; /* x0 */
+	(int) [SS:EBP + 16] = EDX; /* y0 */
+	EAX = cmd[24]; // color
+	ECX = cmd[28]; // backcolor
+	EDX = cmd[12]; // charset
+	(int) [SS:EBP + 20] = EAX; // color
+	(int) [SS:EBP + 24] = ECX; /* backcolor */
+	(int) [SS:EBP + 28] = EDX; // charset
+	ECX = cmd[32]; // length
+	(offset) cmd += 36;
+	EAX = 0;
+	(int) [SS:EBP + 32] = EAX; /* base */
+	(int) [SS:EBP + 36] = ECX; // length
+	(int) [SS:EBP + 40] = (offset) cmd;
+	[SS:ESP + 44] = DS;
+	(int) [SS:EBP + 48] = EAX; /* eoc */
+	LEA(ESI, [ESI + ECX * 4]);
+	EBX = ESP;
+	CALL(0x0017,0); // GUIGUI統合shellcall
+	ESP += 52;
+	POP(EBP);
+	asmout("JMP nextcmd");
+}
+
+void cmd04c()
+/* ブロック転送 */
+/* cmd, opt(1), window, x0, y0, xsize, ysize, yskip, ofs, sel */
+/* windowを指定した場合、enableのチェックはしないので要注意 */
+/* optのbit15を1にすると、enableのチェックをするようになる */
+/* グラフィックボックスフラッシュ(やめた) */
+/* cmd, opt(0x1000), gbox, x0, y0, xsize, ysize */
+/* 1000のときはbit15を1にできない(=つねに画面に描画する) */
+{
+	int *cmd == DS:ESI;
+	WINDOW *win == DS:ECX, *win1000 == DS:EDX;
+	GRAPHBOX *gbox == DS:ECX;
+
+	EAX = cmd[ 4];
+	(offset) win = cmd[ 8];
+//	if (AH == 0x10)
+//		goto opt1000;
+	EDX = 0;
+	EBX = cmd[12];
+	EDI = cmd[16];
+	if ((unsigned) (offset) win == 0xffffffff) /* 常にイネーブルとみなす */
+		goto draw;
+	EBX += win->x_ofs;
+	EDI += win->y_ofs;
+	CMP(win->draw_enable, 0);
+	EDX = win->slot;
+	if (!= 0)
+		goto draw;
+	win->flags |= WINFLAG_DIRTYGBOX; /* 抑制フラグをウィンドウに付ける */
+	TEST(AH, 0x80);
+	if (== 0) {			/* これって許可もないのに描画するってことだよね(そうです) */
+draw:
+		AH &= 0x0f;
+		PUSH((int) 0);
+		PUSH(cmd[36]);
+		PUSH(cmd[32]);
+		PUSH(cmd[28]);
+		PUSH(cmd[24]);
+		PUSH(cmd[20]);
+		PUSH(EDI);
+		PUSH(EBX);
+		PUSH(EDX);
+		PUSH(EAX);
+		PUSH((int) 0x0414);
+		EBX = ESP;
+		CALL(0x0017,0); // GUIGUI統合shellcall
+		ESP += 44;
+	}
+	(offset) cmd += 40;
+	asmout("JMP nextcmd");
+#if 0
+opt1000:
+	(offset) win1000 = gbox->window;
+	if (win1000->draw_enable != 0) {
+		PUSH((int) 0);
+		PUSH(DS);
+		EAX = cmd[16];
+		EBX = gbox->mode;
+		EDI = EAX;
+		IMUL(EAX, gbox->x_bsize);
+		EBX &= 0x0f;
+		EAX += cmd[12];
+		IMUL(EAX, EBX);
+		EAX += graphbox->vbuf0;
+		PUSH(EAX);
+		EAX = gbox->x_bsize;
+		EAX -= cmd[20];
+		IMUL(EAX, EBX);
+		PUSH(EAX);
+		EAX = gbox->mode;
+		PUSH(cmd[24]);
+		PUSH(cmd[20]);
+	//	EDI = cmd[16];
+		EBX = cmd[12];
+		EDI += gbox->y0;
+		EBX += gbox->x0;
+		PUSH(EDI);
+		PUSH(EBX);
+		PUSH(win1000->slot);
+		PUSH(EAX);
+		PUSH((int) 0x0414);
+		EBX = ESP;
+		CALL(0x0017,0); // GUIGUI統合shellcall
+		ESP += 44;
+	} else
+		gbox->flags |= WINFLAG_DIRTYGBOX;
+	(offset) cmd += 28;
+	asmout("JMP nextcmd");
+#endif
+}
+
+void cmd050()
+// points (window)
+/* cmd, opt, window, x0, y0, xsize, ysize, points, ofs, sel */
+/* optのbit15を1にすると、windowがアクティブの時しか書き込まない */
+
+// lines (window)
+/* cmd, opt, window, x0, y0, xsize, ysize, lines, ofs, sel */
+/* 変換処理はcmd10cで行う */
+/* optのbit15を1にすると、ウィンドウライトディゼーブルのときは書き込まない */
+{
+	int *cmd == DS:ESI;
+	WINDOW *win == DS:ECX;
+
+	EBX = 0x0418; /* lines */
+	if (EAX == 0x050)
+		EBX += 4; /* EBX = 0x041c; */ /* points */
+
+	EAX = cmd[ 4];
+	PUSH(EBP);
+	(offset) win = cmd[ 8];
+	EDX = 0;
+	EBP = cmd[12];
+	EDI = cmd[16];
+	if ((unsigned) (offset) win == 0xffffffff) /* 常にイネーブルとみなす */
+		goto draw;
+	EBP += win->x_ofs;
+	EDI += win->y_ofs;
+	CMP(win->draw_enable, 0);
+	EDX = win->slot;
+	if (!= 0)
+		goto draw;
+	TEST(AH, 0x80);
+	if (== 0) {
+draw:
+		AH &= 0x7f;
+		PUSH((int) 0x0000);
+		PUSH(cmd[36]);
+		PUSH(cmd[32]);
+		PUSH(cmd[28]); /* points */
+		PUSH(cmd[24]); /* ysize */
+		PUSH(cmd[20]); /* xsize */
+		PUSH(EDI);
+		PUSH(EBP);
+		PUSH(EDX);
+		PUSH(EAX); /* opt */
+		PUSH(EBX); /* cmd */
+		EBX = ESP;
+		CALL(0x0017,0); // GUIGUI統合shellcall
+		ESP += 44;
+	}
+	POP(EBP);
+	(offset) cmd += 40;
+	asmout("JMP nextcmd");
+}
+
+void cmd108_sub();
+
+void cmd054()
+// line & box (graphicbox)
+
+//  +00 : cmd
+//  +04 : opt
+//  +08 : 0(window)
+//  +0c : color
+//  +10 : x0
+//  +14 : y0
+//  +18 : x1
+//  +1c : y1
+/* optのbit15を1にすると、グラフィックボックスバッファにしか書き込まない */
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+	WINDOW *win == SS:EBP;
+	GRAPHBOX *gbox == DS:EDI;
+
+	EAX = cmd[ 4];
+	EAX &= 0x0030;
+	if (== 0) {
+		/* line */
+		PUSH(EBP);
+		EDX = cmd[16];
+		EBX = cmd[20];
+		EAX = cmd[24];
+		ECX = cmd[28];
+		lineconv();
+		EBP++;
+		PUSH(cmd[12]);
+		PUSH(EBP);
+		PUSH(ECX);
+		PUSH(EAX);
+		PUSH(EBX);
+		EAX = cmd[ 4];
+		PUSH(EDX);
+		ECX = 0;
+		EDI = ESP; /* ES == SSを仮定 */
+		PUSH((offset) cmd);
+		ECX++;
+		ESI = cmd[ 8];
+		EDX = 0;
+		EBX = 0;
+		cmd108_sub();
+		POP((offset) cmd);
+		(offset) gbox = cmd[ 8];
+		(offset) win = gbox->window;
+		TEST(AH, 0x80);
+		if (== 0) {
+			if (win->draw_enable != 0) {
+				EAX = ESP;
+				PUSH((int) 0x0000);
+				PUSH(SS);
+				PUSH(EAX);
+				PUSH(ECX); /* lines(1) */
+				EAX = cmd[16];
+				ECX = cmd[20];
+				EDX = cmd[24];
+				EBX = cmd[28];
+				if (EAX > EDX)
+					XCHG(EAX, EDX);
+				if (ECX > EBX)
+					XCHG(ECX, EBX);
+				EDX++;
+				EBX++;
+				EDX -= EAX;
+				EBX -= ECX;
+				EAX -= gbox->vx0;
+				ECX -= gbox->vy0;
+				(short) [SS:ESP + 18] -= AX;
+				(short) [SS:ESP + 22] -= CX;
+				EAX += gbox->x0;
+				ECX += gbox->y0;
+				PUSH(EBX);
+				PUSH(EDX);
+				PUSH(ECX);
+				PUSH(EAX);
+				PUSH(win->slot);
+				PUSH(cmd[ 4]); /* opt */
+				PUSH((int) 0x0418); /* linear dots */
+				EBX = ESP;
+				CALL(0x0017,0); // GUIGUI統合shellcall
+				ESP += 44;
+			} else
+				gbox->flags |= WINFLAG_MUSTREDRAW;
+		}
+		ESP += 24;
+		POP(EBP);
+		(offset) cmd += 32;
+		asmout("JMP nextcmd");
+	}
+	SAFE_CUT("DB ..$-$-1,'drawLine(GB):Invalid option ',0,'.'");
+}
+
+void cmd058()
+/* putblock (gbox)
+	cmd, opt, gbox, x0, y0, x_size, y_size, buf, buf_skip, (tbuf, tbuf_skip, tcol0)
+  optはグラフィックボックス、バッファのタイプを示す。共通でなければならない。
+  optのbit4が1なら、bufは透明色を有する(bcol0がある)。
+  optのbit12が1なら、差分を生成(tbuf以下の3dwが存在する)。
+  optのbit13が1なら、グラフィックボックスへの転送を抑制(x0～y_size, xsz_bufはない)。
+		代わりに、vx0, vy0がある。
+  optのbit15を1にすれば、GAPIは呼ばない。
+  0x00?? : 普通のgboxへのputblock
+  0x10?? : 差分生成付きのputblock(必要なければ差分は作らない)
+  0x20?? : グラフィックボックスの内容は更新しないで、スクロール扱い。GAPIヘフラッシュ。
+  0x30?? : 差分生成して、差分だけGAPIへ、スクロール扱い(必要なければ差分は作らない)。
+  0x40?? : 転送しないで単なるflush。
+  0x80?? : GAPIへの転送無し
+  0x90?? : GAPIへの転送無し(差分)
+  0xa0?? : 何もしない、単なるスクロール
+  0xb0?? : 差分を生成。GAPIやグラフィックボックスへの更新はない、スクロールはしない(注意!)。
+  とりあえず、0x2001と0x3001だけを作る。
+  0x40??を追加。
+
+	0x0058, 0x3001, gbox, buf, vx0, vy0, tbuf, tbuf_skip, tcol0 (gboxとbufはオーバーラップしてもいい)
+	0x0058, 0x2001, gbox, buf, vx0, vy0
+	0x0058, 0x40??, gbox, x0, y0, x_size, y_size
+
+*/
+{
+	int *cmd == DS:ESI;
+	GRAPHBOX *gbox == DS:EDI;
+	WINDOW *win == SS:EBP;
+
+	EAX = cmd[ 4];
+	if (AH == 0x40)
+		goto opt4000;
+	if (EAX == 0x3001) {
+		PUSH(EBP);
+		(offset) gbox = cmd[ 8];
+		EBX = cmd[12]; /* buf */
+		EDX = gbox->vbuf0;
+		EAX = cmd[16]; /* vx0 */
+		ECX = cmd[20]; /* vy0 */
+		(offset) win = gbox->window;
+		gbox->vbuf0 = EBX;
+		gbox->vx0 = EAX;
+		gbox->vy0 = ECX;
+		if (win->draw_enable != 0) {
+			ECX = gbox->x_bsize;
+			PUSH((offset) cmd);
+			ECX -= gbox->x_vsize;
+			AH = cmd[32]; /* tcol0 */
+			PUSH(cmd[28] /* tbuf_skip */);
+			ESI = cmd[24]; /* tbuf */
+			PUSH(ECX);
+
+			/* EDXとEBXを比較して、ESIへ */
+
+			EBP = gbox->y_vsize;
+			do {
+				unsigned char *old == DS:EDX, *new == DS:EBX, *delta == DS:ESI;
+				ECX = gbox->x_vsize;
+				do {
+					AL = *new;
+					(offset) new++;
+					if (AL == *old)
+						AL = AH; /* ここはCMOVEが使える */
+					(offset) old++;
+					*delta = AL;
+					(offset) delta++;
+					ECX--;
+				} while (!= 0);
+				(offset) new   += [SS:ESP + 0];
+				(offset) old   += [SS:ESP + 0];
+				(offset) delta += [SS:ESP + 4];
+				EBP--;
+			} while (!= 0);
+
+			POP(ECX);
+			POP(EAX);
+			(offset) win = gbox->window;
+			POP((offset) cmd);
+
+			/* 差分転送コマンドを発行 */
+
+			PUSH((int) 0);
+			PUSH(cmd[32]); /* 透明色 */
+			PUSH(DS);
+			PUSH(cmd[24]); /* tbuf */
+			PUSH(cmd[28]); /* skip */
+			PUSH(gbox->y_vsize);
+			PUSH(gbox->x_vsize);
+			PUSH(gbox->y0);
+			PUSH(gbox->x0);
+			PUSH(win->slot);
+			PUSH((int) 0x0011);
+			PUSH((int) 0x0414);
+			EBX = ESP;
+			CALL(0x0017,0); // GUIGUI統合shellcall
+			ESP += 48;
+		} else
+			gbox->flags |= WINFLAG_MUSTREDRAW;
+		(offset) cmd += 36;
+		POP(EBP);
+		asmout("JMP nextcmd");
+	} else if (EAX == 0x2001) {
+		WINDOW *winEDX == DS:EDX;
+		(offset) gbox = cmd[ 8];
+		EBX = cmd[12]; /* buf */
+		EAX = cmd[16]; /* vx0 */
+		ECX = cmd[20]; /* vy0 */
+		(offset) winEDX = gbox->window;
+		gbox->vbuf0 = EBX;
+		gbox->vx0 = EAX;
+		gbox->vy0 = ECX;
+		if (winEDX->draw_enable != 0) {
+			EAX = gbox->x_bsize;
+			ECX = gbox->x_vsize;
+			PUSH((int) 0);
+			EAX -= ECX;
+			PUSH(DS);
+			PUSH(EBX); /* buf */
+			PUSH(EAX); /* skip */
+			PUSH(gbox->y_vsize);
+			PUSH(gbox->x_vsize);
+			PUSH(gbox->y0);
+			PUSH(gbox->x0);
+			PUSH(winEDX->slot);
+			PUSH((int) 0x0001);
+			PUSH((int) 0x0414);
+			EBX = ESP;
+			CALL(0x0017,0); // GUIGUI統合shellcall
+			ESP += 44;
+		} else
+			gbox->flags |= WINFLAG_MUSTREDRAW;
+		(offset) cmd += 24;
+		asmout("JMP nextcmd");
+	}
+	SAFE_CUT("DB ..$-$-1,'putBlock:Invalid option ',0,'.'");
+
+opt4000:
+	(offset) gbox = cmd[8];
+	WINDOW *win4000 == DS:EDX;
+
+	(offset) win4000 = gbox->window;
+	if (win4000->draw_enable != 0) {
+		PUSH((int) 0);
+		PUSH(DS);
+		EAX = cmd[16];
+		EBX = cmd[4];
+		ECX = EAX;
+		IMUL(EAX, gbox->x_bsize);
+		EBX &= 0x0f;
+		EAX += cmd[12];
+		IMUL(EAX, EBX);
+		EAX += gbox->vbuf0;
+		PUSH(EAX);
+		EAX = gbox->x_bsize;
+		EAX -= cmd[20];
+		IMUL(EAX, EBX);
+		PUSH(EAX);
+		EAX = cmd[4];
+		PUSH(cmd[24]);
+		PUSH(cmd[20]);
+		EAX &= 0x7f;	/* bit14を殺す */
+	//	ECX = cmd[16];
+		EBX = cmd[12];
+		ECX += gbox->y0;
+		EBX += gbox->x0;
+		PUSH(ECX);
+		PUSH(EBX);
+		PUSH(win4000->slot);
+		PUSH(EAX);
+		PUSH((int) 0x0414);
+		EBX = ESP;
+		CALL(0x0017,0); // GUIGUI統合shellcall
+		ESP += 44;
+	} else
+		gbox->flags |= WINFLAG_DIRTYGBOX;
+	(offset) cmd += 28;
+	asmout("JMP nextcmd");
+}
+
+void cmd05c_sub()
+/* EAX == opt, points == ECX, dat == ES:EDI, gbox == DS:ESI */
+/* EDX == x0, EBX == y0 */
+{
+	GRAPHBOX *gbox == DS:ESI;
+
+	PUSHAD();
+	EAX >>= 6;
+	EAX &= 0x03;
+	if (== 0) { /* pset */
+		do {
+			EBX = [SS:ESP + 16]; /* y0 */
+			EDX = [SS:ESP + 20]; /* x0 */
+			AL = [ES:EDI + 8]; /* color */
+			EBX += [ES:EDI + 4];
+			EDX += [ES:EDI + 0];
+			IMUL(EBX, gbox->x_bsize);
+			EDI += 12;
+			EDX += EBX;
+			(char) [DS:ESI + EDX + 64] = AL;
+			ECX--;
+		} while (!= 0);
+		POPAD();
+		return;
+	}
+	if (EAX == 1) { /* and */
+		do {
+			EBX = [SS:ESP + 16]; /* y0 */
+			EDX = [SS:ESP + 20]; /* x0 */
+			AL = [ES:EDI + 8]; /* color */
+			EBX += [ES:EDI + 4];
+			EDX += [ES:EDI + 0];
+			IMUL(EBX, gbox->x_bsize);
+			EDI += 12;
+			EDX += EBX;
+			(char) [DS:ESI + EDX + 64] &= AL;
+			ECX--;
+		} while (!= 0);
+		POPAD();
+		return;
+	}
+	if (EAX == 2) { /* or */
+		do {
+			EBX = [SS:ESP + 16]; /* y0 */
+			EDX = [SS:ESP + 20]; /* x0 */
+			AL = [ES:EDI + 8]; /* color */
+			EBX += [ES:EDI + 4];
+			EDX += [ES:EDI + 0];
+			IMUL(EBX, gbox->x_bsize);
+			EDI += 12;
+			EDX += EBX;
+			(char) [DS:ESI + EDX + 64] |= AL;
+			ECX--;
+		} while (!= 0);
+		POPAD();
+		return;
+	}
+//	if (EAX == 3) { /* xor */
+		do {
+			EBX = [SS:ESP + 16]; /* y0 */
+			EDX = [SS:ESP + 20]; /* x0 */
+			AL = [ES:EDI + 8]; /* color */
+			EBX += [ES:EDI + 4];
+			EDX += [ES:EDI + 0];
+			IMUL(EBX, gbox->x_bsize);
+			EDI += 12;
+			EDX += EBX;
+			(char) [DS:ESI + EDX + 64] ^= AL;
+			ECX--;
+		} while (!= 0);
+		POPAD();
+		return;
+//	}
+}
+
+void near cmd05c()
+// points (graphicbox)
+/* cmd, opt, graphicbox, x0, y0, xsize, ysize, points, ofs, sel */
+/* optのbit15を1にすると、グラフィックボックスバッファにしか書き込まない */
+{
+	int *cmd == DS:ESI;
+	WINDOW *win == SS:EBP;
+	GRAPHBOX *gbox == DS:EDI;
+
+	PUSH(ES);
+	PUSH(EBP);
+	PUSH((offset) cmd);
+	EAX = cmd[ 4];
+	EDX = cmd[12];
+	EBX = cmd[16];
+	ECX = cmd[28];
+	asmout("LES EDI,DS:[ESI + 32]");
+	ESI = cmd[ 8];
+	cmd05c_sub();
+	POP((offset) cmd);
+	(offset) gbox = cmd[ 8];
+	(offset) win = gbox->window;
+	TEST(AH, 0x80);
+	if (== 0) {
+		if (win->draw_enable != 0) {
+			PUSH((int) 0x0000);
+			PUSH(ES);
+			PUSH(cmd[32]);
+			PUSH(ECX); /* points */
+			PUSH(cmd[24]); /* ysize */
+			PUSH(cmd[20]); /* xsize */
+			EBX -= gbox->vy0;
+			EDX -= gbox->vx0;
+			EBX += gbox->y0;
+			EDX += gbox->x0;
+			PUSH(EBX);
+			PUSH(EDX);
+			PUSH(win->slot);
+			PUSH(EAX); /* opt */
+			PUSH((int) 0x041c); /* points */
+			EBX = ESP;
+			CALL(0x0017,0); // GUIGUI統合shellcall
+			ESP += 44;
+		} else
+			gbox->flags |= WINFLAG_MUSTREDRAW;
+	}
+	(offset) cmd += 40;
+	POP(EBP);
+	POP(ES);
+	asmout("JMP nextcmd");
+}
+
+void cmd060()
+// define signalbox
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+
+	EAX = work->signalbox_write_ptr;
+	TEST(AL, 0x01);
+	if (!= 0) {
+		// シグナルフルだったので、それを解除
+		PUSH((int) 0x0000); // eoc
+		PUSH((int) 0xff02); // nest
+		PUSH((int) 0); // signals
+		PUSH((int) 0x0204); // add nest
+		EBX = ESP;
+		CALL(0x0017,0); // GUIGUI統合shellcall
+		ESP += 16;
+	}
+
+	ECX = cmd[4]; // bytes /* bit0, 1はreserve */
+	EAX = cmd[8]; // work_ptr
+	ECX -= 4;
+	LEA(EDX, [EAX + ECX]);
+	ECX /= 4;
+	work->signalbox_write_ptr = EAX;
+	work->signalbox_write_ptr0 = EAX;
+	work->signalbox_write_ptr1 = EDX;
+	work->signalbox_write_free = ECX;
+	work->signalbox_read_free = 0;
+	ECX = cmd[12]; // eos
+	EDX = cmd[16]; // rewind
+	work->signalbox_eos = ECX;
+	work->signalbox_rewind = EDX;
+	(offset) cmd += 20;
+	(int) [DS:EAX] = ECX; // eos
+	asmout("JMP nextcmd");
+}
+
+void near cmd068()
+// define signal
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+
+	EAX = cmd[4]; // opt
+	TEST(AH, 0x30);
+	if (!= 0) {
+		// リザーブビット
+		SAFE_CUT("DB ..$-$-1,'defineSignal:Invalid option ',0,'.'");
+	}
+	ECX = cmd[20]; // signal_length
+	if ((unsigned) ECX >= 2) {
+		// 1dwより長いシグナルには未対応
+		SAFE_CUT("DB ..$-$-1,'defineSignal:Too long signal defined.'");
+	}
+	if (ECX != 0) {
+		// シェルに設定を送信：0x7f000001 signal
+		EAX = cmd[8]; // device
+		if (EAX == 0x0010 /* timer */) {
+			PUSH((int) 0x0000);
+			PUSH(cmd[24]); // signal
+			PUSH((int) 0x7f000001);
+			PUSH((int) 2 /* length */);
+			PUSH((int) 0x0140);
+			PUSH(cmd[12]); // timer slot-no
+			PUSH((int) 0x0318);
+			EBX = ESP;
+			CALL(0x0017,0); // shell-call
+			ESP += 28;
+		} else if (EAX == 0x0100) {
+back:
+			WINDOW *cmd0068_win == DS:EDX;
+			(offset) cmd0068_win = cmd[16]; // window
+		//	if (EAX != 0x0100 /* decoded keycode */) {
+		//		INT(0x03);
+		//	}
+			PUSH((int) 0);
+			PUSH((int) 0);
+			PUSH((int) 0); // for purpose
+			PUSH(cmd[24]); // signal
+			PUSH((int) 0x7f000001);
+			PUSH((int) 2);
+			PUSH((int) 0x0140 /* system signalbox(slot番号で指定) */);
+			// ここにウィンドウ番号を入れた方がいいのでは？
+			// もちろん、これもデフォルトの要請であって、受理されるとは限らない。
+			PUSH(cmd0068_win->slot);
+			PUSH(cmd[12]); // keycode
+			PUSH(cmd[ 8]); // device
+			PUSH(cmd[ 4]); // opt
+			PUSH((int) 0x0510); // signal設定
+			EBX = ESP;
+			CALL(0x0017,0); // shell-call
+			ESP += 48;
+		} else {
+			if (EAX == 0x0200) /* マウス */
+				goto back;
+		}
+		(offset) cmd += 28;
+		EAX = cmd[0];
+		LEA((offset) cmd, [cmd + EAX * 4 + 4]);
+		asmout("JMP nextcmd");
+	} else {
+		(offset) cmd += 24;
+		EAX = cmd[0];
+		LEA((offset) cmd, [cmd + EAX * 4 + 4]);
+		asmout("JMP nextcmd");
+	}
+}
+
+void cmd06c()
+/* send signal self */
+/* cmd, opt, sig0, sig1, sig2, ... */
+/* cmd, opt, ofs, sel */
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+	ECX = cmd[4];
+	TEST(CL, 0x02);
+	if (!= 0) {
+		SAFE_CUT("DB ..$-$-1,'sendSignal:Invalid option ',1,'.'");
+	}
+	(offset) cmd += 8;
+	TEST(CL, 0x01);
+	PUSH(ES);
+	if (== 0) {
+		/* 即値 */
+		EDI = (offset) cmd;
+		(offset) cmd += ECX; /* bit1も0であることを想定している */
+		PUSH(DS); POP(ES); /* 必要ないかも */
+	} else {
+		/* 間接 */
+		LES(EDI, cmd[0]);
+		(offset) cmd += 8;
+	}
+	ECX /= 4;
+	sendusersignal();
+	POP(ES);
+	if (ZF == 0 /* error */) {
+		SAFE_CUT("DB ..$-$-1,'sendSignal:Signalbox full.'");
+	}
+	asmout("JMP nextcmd");
+}
+
+void cmd070()
+// タイマーノードオープン
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+
+	EDX = cmd[4];
+	(offset) cmd += 8;
+	if (EDX == 0x01c0) {
+		// ユーザーモードに変更
+		// 初期化する
+cmd074_intervaloff:
+		EAX = 0;
+		PUSH(EAX);
+		PUSH(EAX);
+		PUSH(EAX);
+		PUSH(EAX);
+		PUSH(EDX);
+		PUSH((int) 0x031c); // インターバル指定
+		EBX = ESP;
+		CALL(0x0017,0); // shell-call
+		ESP += 24;
+		asmout("JMP nextcmd");
+	}
+	PUSH((int) 0x0000);
+	PUSH(EDX);
+	PUSH((int) 0x0310); /* 現在時刻設定 */
+	PUSH(EDX);
+	PUSH((int) 0x0300); // タイマーノード取得
+	EBX = ESP;
+	CALL(0x0017,0); // shell-call
+	ESP += 20;
+	asmout("JMP nextcmd");
+asmout("cmd074_intervaloff EQU #cmd074_intervaloff");
+}
+
+void cmd074()
+// タイマーノードクローズ
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+
+	EDX = cmd[4];
+	(offset) cmd += 8;
+	if (EDX == 0x01c0) {
+		// システムモードに変更
+		// 初期化する
+
+		AX = CS;
+		PUSH(FS);
+		FS = AX;
+		asmout("MOV EBX,cmd004_cmd2");
+		CALL(0x0017,0); // shell-call
+		POP(FS);
+		asmout("JMP cmd074_intervaloff");
+	}
+	PUSH((int) 0x0000);
+	PUSH(EDX);
+	PUSH((int) 0x0304); // タイマーノード返却
+	EBX = ESP;
+	CALL(0x0017,0); // shell-call
+	ESP += 12;
+	asmout("JMP nextcmd");
+}
+
+void cmd078()
+// タイマー設定
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+
+	// signalはここで設定しない
+	// 時刻やインターバルを設定
+	// シグナル定義時のdeviceは0x0010
+
+	EAX = cmd[4]; // optionフィールド
+	EDX = cmd[8]; // slot
+	EBX = cmd[12]; /* slot1 */
+	(offset) cmd += 12;
+
+	ECX = 0;
+	CMP(AL, 0x81);
+	PUSH(ECX);
+	if (==) {
+		/* 時刻指定(含：時刻コピー) */
+		PUSH(cmd[12]); /* cmd[24] */
+		PUSH(cmd[ 8]); /* cmd[20] */
+		PUSH(cmd[ 4]); /* cmd[16] */
+		PUSH(EBX);
+		PUSH(EDX);
+		PUSH((int) 0x0320);
+		EBX = ESP;
+		CALL(0x0017,0); // shell-call
+		ESP += 28;
+		(offset) cmd += 16;
+		asmout("JMP nextcmd");
+	}
+	if (AL == 0x82) {
+		/* 時間差分算出 */
+		PUSH(ECX);
+		PUSH(ECX);
+		PUSH(ECX);
+		PUSH(EBX);
+		PUSH(EDX);
+		PUSH((int) 0x0324); // 現在時刻設定
+		EBX = ESP;
+		CALL(0x0017,0); // shell-call
+		ESP += 12;
+		POP(cmd[ 4]); /* cmd[16] */
+		POP(cmd[ 8]); /* cmd[20] */
+		POP(cmd[12]); /* cmd[24] */
+		(offset) cmd += 16;
+		POP(ECX);
+		asmout("JMP nextcmd");
+	}
+	TEST(AL, 0x20); // bit5 : 現在時刻ロード
+	if (!= 0) {
+	//	PUSH((int) 0x0000);
+		PUSH(EDX);
+		PUSH((int) 0x0310); // 現在時刻設定
+		EBX = ESP;
+		CALL(0x0017,0); // shell-call
+		ESP += 12 - 4;
+	}
+	TEST(AL, 0x10); // bit4 : 時刻加算(時刻フィールドを伴う)
+	if (!= 0) {
+	//	PUSH((int) 0);
+		PUSH(cmd[8]);
+		PUSH(cmd[4]);
+		PUSH(cmd[0]);
+		(offset) cmd += 12;
+		PUSH(EDX);
+		PUSH((int) 0x0314); // 時刻加算
+		EBX = ESP;
+		CALL(0x0017,0); // shell-call
+		ESP += 24 - 4;
+	}
+	TEST(AL, 0x08); // bit3 : インターバル指定(インターバルフィールドを伴う)
+	if (!= 0) {
+	//	PUSH((int) 0);
+		PUSH(cmd[8]);
+		PUSH(cmd[4]);
+		PUSH(cmd[0]);
+		(offset) cmd += 12;
+		PUSH(EDX);
+		PUSH((int) 0x031c); // インターバル指定
+		EBX = ESP;
+		CALL(0x0017,0); // shell-call
+		ESP += 24 - 4;
+	}
+	TEST(AL, 0x04); // bit2 : インターバル解除(単発モード)
+	if (!= 0) {
+	//	PUSH(ECX);
+		PUSH(ECX);
+		PUSH(ECX);
+		PUSH(ECX);
+		PUSH(EDX);
+		PUSH((int) 0x031c); // インターバル指定
+		EBX = ESP;
+		CALL(0x0017,0); // shell-call
+		ESP += 24 - 4;
+	}
+	TEST(AL, 0x02); // bit1 : タイマー始動
+	if (!= 0) {
+	//	PUSH((int) 0x0000);
+		PUSH(EDX);
+		PUSH((int) 0x0308); // タイマー登録
+		EBX = ESP;
+		CALL(0x0017,0); // shell-call
+		ESP += 12 - 4;
+	}
+	TEST(AL, 0x01); // bit0 : タイマー停止
+	if (!= 0) {
+	//	PUSH((int) 0x0000);
+		PUSH(EDX);
+		PUSH((int) 0x030c); // タイマー解除
+		EBX = ESP;
+		CALL(0x0017,0); // shell-call
+		ESP += 12 - 4;
+	}
+	POP(EAX);
+	asmout("JMP nextcmd");
+}
+
+void cmd07c()
+/* 圧縮展開コマンド(cmd004の通常版) */
+/* 通常コマンドに戻るためには、サブコマンド終了(0)をやる必要がある */
+/* EDIは読み込まれるが、更新されない */
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+
+	(offset) cmd += 4;
+	EDI = [SS:ESP];
+	EDX |= -1;
+subcmd:
+	EAX = cmd[0] /* opt */;
+	if (EAX == 0) { /* サブコマンド終了 */
+		(offset) cmd += 4;
+		asmout("JMP nextcmd");
+	}
+	/* f9-fb:EDI読み込み系 */
+	/* fd-fe:EDI書き込み系 */
+	if (EAX == 0xfffffff9) { /* EDI読み込みコマンド */
+		EDI = cmd[4];
+		(offset) cmd += 8;
+		goto subcmd;
+	}
+	if (EAX == 0xfffffff7) {
+		/* 読み込みリミット設定プリフィクス */
+		EDX = cmd[4];
+		(offset) cmd += 8;
+		goto subcmd;
+	}
+	if (EAX == 0xffffff81) {
+		/* opt == 0xffffff81 : l2d3圧縮データー展開 */
+		/* subcmd, bytes, source(48bit), subcmd, ... */
+		/* 展開先はES:EDI */
+		PUSH(DS);
+		PUSH(ESI);
+		PUSH(EBP);
+		EBP = cmd[4];
+		LDS(ESI, cmd[8]);
+		cmd0004_decode();
+		POP(EBP);
+		POP(ESI);
+		POP(DS);
+		(offset) cmd += 16;
+		goto subcmd;
+	}
+	if (EAX == 0xffffff82) {
+		/* opt == 0xffffff82 : tek0圧縮データー展開 */
+		/* subcmd, bytes, source(48bit), subcmd, ... */
+		/* 展開先はES:EDI */
+		PUSH(DS);
+		PUSH(ESI);
+		PUSH(EBP);
+		EBP = cmd[4];
+		LDS(ESI, cmd[8]);
+		cmd0004_decode2();
+		POP(EBP);
+		POP(ESI);
+		POP(DS);
+		(offset) cmd += 16;
+		goto subcmd;
+	}
+	if (EAX == 0xffffff83) {
+		/* opt == 0xffffff83 : tek1圧縮データー展開 */
+		/* subcmd, bytes, source(48bit), subcmd, ... */
+		/* 展開先はES:EDI */
+		PUSH(DS);
+		PUSH(ESI);
+		PUSH(EBP);
+		EBP = cmd[4];
+		LDS(ESI, cmd[8]);
+		cmd0004_decode_tek1();
+		POP(EBP);
+		POP(ESI);
+		POP(DS);
+		(offset) cmd += 16;
+		goto subcmd;
+	}
+	if (EAX == 0xffffff85) {
+		/* opt == 0xffffff85 : tek2圧縮データー展開 */
+		/* subcmd, bytes, source(48bit), subcmd, ... */
+		/* 展開先はES:EDI */
+		PUSH(DS);
+		PUSH(ESI);
+		PUSH(EBP);
+		EBP = cmd[4];
+		LDS(ESI, cmd[8]);
+		cmd0004_decode_tek2();
+		POP(EBP);
+		POP(ESI);
+		POP(DS);
+		(offset) cmd += 16;
+		goto subcmd;
+	}
+	if (EAX == 0xffffff89) {
+		/* opt == 0xffffff89 : tek5圧縮データー展開 */
+		/* subcmd, bytes, source(48bit), subcmd, ... */
+		/* 展開先はES:EDI */
+		PUSH(DS);
+		PUSH(ESI);
+		PUSH(EBP);
+		EBP = cmd[4];
+		LDS(ESI, cmd[8]);
+		MOV(EAX, DS);
+		EAX &= 0xfffc;
+		if (EAX == 0x0004) { /* コードセグメント */
+			LSL(EAX, AX);
+			EAX++;
+			if ((unsigned) EDX > EAX)
+				EDX = EAX; 
+		}
+		cmd0004_decode_tek5();
+		POP(EBP);
+		POP(ESI);
+		POP(DS);
+		(offset) cmd += 16;
+		goto subcmd;
+	}
+
+	INT(0x03);
+}
+
+
+void cmd080()
+// サウンドトラックオープン
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+	PUSH((int) 0);
+	PUSH(cmd[8] /* reserve */);
+	PUSH(cmd[4] /* opt & slot */);
+	PUSH((int) 0x0600);
+	(offset) cmd += 12;
+	EBX = ESP;
+	CALL(0x0017,0); // shell-call
+	ESP += 16;
+
+	// sleep
+	LEA(EBX, work->softint_mask_buf[0]); // add_nest(Llv変更する)
+//	work->softint_mask_buf[ 8] = 0x0080;
+	(int) [DS:EBX + 8] = 0x0080;
+	CALL(0x0017,0); // shell-call
+
+	LEA(EBX, work->softint_mask_buf[0]); // add_nest(Llv変更しない)
+//	work->softint_mask_buf[ 8] = 0xff80;
+	(int) [DS:EBX + 8] = 0xff80;
+		// ライブラリルーチン内に再入したので、割り込みマスク
+	CALL(0x0017,0); // shell-call
+
+	asmout("JMP nextcmd");
+}
+
+void near cmd084()
+// サウンドトラッククローズ
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+	PUSH((int) 0);
+	PUSH(cmd[4] /* opt & slot */);
+	PUSH((int) 0x0604);
+	(offset) cmd += 8;
+	EBX = ESP;
+	CALL(0x0017,0); // shell-call
+	ESP += 12;
+	work->ending_count++;
+	asmout("JMP nextcmd");
+}
+
+void near cmd08c()
+// 周波数指定によるサウンドオン／オフ
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+	PUSH((int) 0);
+	PUSH(cmd[8]);
+	PUSH(cmd[4] /* opt & slot */);
+	PUSH((int) 0x060c);
+	(offset) cmd += 12;
+	EBX = ESP;
+	CALL(0x0017,0); // shell-call
+	ESP += 16;
+	asmout("JMP nextcmd");
+}
+
+void cmd03c()
+/* bit0:drawwindow_back(or drawwindow_frame) + drawwindow() */
+/* bit1:drawcomponent() */
+/* bit2:option for bit0 */
+/* bit3:option diff-mode */
+/* bit8:	*/
+/* bit9:	*/
+{
+	WINDOW *win == DS:EDI;
+	int *cmd == DS:ESI;
+
+	EAX = cmd[4];
+	(offset) win = cmd[8];
+	#if (defined(SAFEAPI_FLAG))
+		TEST(EAX, 0xfffffcf0);
+		if (!= 0) {
+			SAFE_CUT("DB ..$-$-1,'windowControl:invalid option: ',0");
+		}
+	#endif
+	TEST(AL, 0x01);
+	if (!= 0) {
+		// EBP, ESI, EDI以外は全て破壊
+		TEST(AL, 0x08);
+		if (== 0) {
+			TEST(AL, 0x04);
+			if (== 0) {
+			//	TEST(win->flags, WINFLAG_FRAMEONLY);
+			//	if (== 0)
+					drawwindow_back();
+			//	else
+			//		drawwindow_frame();
+			/* コンポーネントがウィンドウいっぱいにあるからといって、それでbackを描かないでよいということにはならない。
+				アプリはそれを望んでいないかもしれないのだから。だから、bit2をみるべき */
+			/* 自分で再描画をやるということは、何でもできるということである */
+			} else
+				drawwindow_frame();
+			drawwindow();
+			EAX = cmd[4];
+		} else {
+			// EBP, ESI, EDI以外は全て破壊
+			TEST(win->flags, WINFLAG_TITLE);
+			if (!= 0) {
+				drawwindow();	/* ウィンドウ影付け,titlebar塗り潰し */
+				titlebox_redraw();
+				EAX = cmd[4];
+			}
+		}
+	}
+	TEST(AL, 0x02);
+	if (!= 0) {
+		// EBP, ESI, EDI以外は全て破壊
+		TEST(AL, 0x08);
+		EDX = 3;	/* 強制描画 */
+		if (!= 0)
+			EDX = 0;	/* 差分描画 */
+		drawcomponent();
+		EAX = cmd[4];
+	}
+	TEST(AH, 0x01);
+	if (!= 0) {
+		PUSH((int) 0);
+		PUSH(win->slot);
+		PUSH((int) 0x0140);
+		EBX = ESP;
+		CALL(0x0017,0); // GUIGUI統合shellcall
+		ESP += 12;
+	}
+	TEST(AH, 0x02);
+	if (!= 0) {
+		PUSH((int) 0);
+		PUSH(win->slot);
+		PUSH((int) 0x0144);
+		EBX = ESP;
+		CALL(0x0017,0); // GUIGUI統合shellcall
+		ESP += 12;
+	}
+	(offset) cmd += 12;
+	asmout("JMP nextcmd");
+}
+
+void cmd0a0()
+/* ファイルハンドル初期化 */
+{
+	int *cmd == DS:ESI;
+	EAX = cmd[ 4];
+	PUSH((int) 0);
+	if ((unsigned) EAX < 0xe0) {
+		PUSH(cmd[ 8] /* slot */);
+		PUSH(EAX /* opt */);
+		PUSH((int) 0x0700);
+		(offset) cmd += 12;
+		EBX = ESP;
+		CALL(0x0017,0); // shell-call
+		ESP += 16;
+		asmout("JMP nextcmd");
+	}
+	/* サブコマンド付き */
+	/* cmd[12]はサブコマンド総バイト数 */
+	PUSH(cmd[20] /* sel */);
+	PUSH(cmd[16] /* ofs */);
+	PUSH(cmd[12] /* bytes */);
+	PUSH(cmd[ 8] /* slot */);
+	PUSH((int) EAX);
+	PUSH((int) 0x0700);
+	(offset) cmd += 24;
+	EBX = ESP;
+	CALL(0x0017,0); // shell-call
+	ESP += 28;
+	asmout("JMP nextcmd");
+}
+
+void near cmd0a8()
+/* コピーハンドル */
+/* cmd, opt, slot(dest), slot(src) */
+{
+	int *cmd == DS:ESI;
+	PUSH((int) 0);
+	PUSH(cmd[12] /* slot(src) */);
+	PUSH(cmd[ 8] /* slot(dest) */);
+	PUSH(cmd[ 4] /* opt */);
+	PUSH((int) 0x0708);
+	(offset) cmd += 16;
+	EBX = ESP;
+	CALL(0x0017,0); // shell-call
+	ESP += 20;
+	asmout("JMP nextcmd");
+}
+
+void near cmd0ac()
+/* ディレクトリ移動 */
+/* cmd, opt, slot, bytes, ofs, sel */
+{
+	int *cmd == DS:ESI;
+	PUSH((int) 0);
+	PUSH(cmd[20] /* sel */);
+	PUSH(cmd[16] /* ofs */);
+	PUSH(cmd[12] /* bytes */);
+	PUSH(cmd[ 8] /* slot */);
+	PUSH(cmd[ 4] /* opt */);
+	(offset) cmd += 24;
+	PUSH((int) 0x070c);
+	EBX = ESP;
+	CALL(0x0017,0); // shell-call
+	ESP += 28;
+	asmout("JMP nextcmd");
+}
+
+void near cmd0b0()
+/* create new module */
+/* cmd, opt, slot(dir), slot(module), tag-dir alloc-size, tag0, tag1, ..., -1 */
+{
+	int *cmd == DS:ESI;
+	ESP -= 512;
+	EAX = cmd[ 4];
+	ECX = cmd[ 8];
+	[SS:ESP + 508] = EBP;
+	EBP = ESP;
+	EDX = cmd[12];
+	EBX = cmd[16];
+	(offset) cmd += 20;
+	(int) [SS:EBP +  0] = 0x0710;
+	[SS:EBP +  4] = EAX;
+	[SS:EBP +  8] = ECX;
+	[SS:EBP + 12] = EDX;
+	[SS:EBP + 16] = EBX;
+	EBP += 20;
+	EAX = cmd[0];
+	do {
+		ECX = cmd[4];
+		(offset) cmd += 8;
+		[SS:EBP    ] = EAX;
+		[SS:EBP + 4] = ECX;
+		EBP += 8;
+		ECX -= 8;
+		if (!= 0) {
+			do {
+				EAX = *cmd;
+				(offset) cmd += 4;
+				[SS:EBP] = EAX;
+				EBP += 4;
+				ECX -= 4;
+			} while (!= 0);
+		}
+		EAX = cmd[0];
+	} while (EAX != 0xffffffff);
+	(offset) cmd += 4;
+	(int) [SS:EBP    ] = EAX;
+	(int) [SS:EBP + 4] = 0;
+	EBX = ESP;
+	CALL(0x0017,0); // shell-call
+	EBP = [SS:ESP + 508];
+	ESP += 512;
+	asmout("JMP nextcmd");
+}
+
+void near cmd0c0()
+/* モジュールのメモリマッピング */
+{
+	int *cmd == DS:ESI;
+	PUSH((int) 0);
+	PUSH(cmd[24] /* ofs & attr */);
+	PUSH(cmd[20] /* sel */);
+	PUSH(cmd[16] /* addr */);
+	PUSH(cmd[12] /* size */);
+	PUSH(cmd[ 8] /* slot */);
+	PUSH(cmd[ 4] /* opt */);
+	PUSH((int) 0x0720);
+	(offset) cmd += 28;
+	EBX = ESP;
+	CALL(0x0017,0); // shell-call
+	ESP += 32;
+	asmout("JMP nextcmd");
+}
+
+void near cmd0c4()
+/* モジュールのアンマッピング */
+{
+	int *cmd == DS:ESI;
+//	PUSH((int) 0);
+//	PUSH(cmd[16] /* sel */);
+//	PUSH(cmd[12] /* addr */);
+//	PUSH(cmd[ 8] /* size */);
+//	PUSH(cmd[ 4] /* opt */);
+//	PUSH((int) 0x0720);
+	(offset) cmd += 20;
+//	EBX = ESP;
+//	CALL(0x0017,0); // shell-call
+//	ESP += 28;
+	asmout("JMP nextcmd");
+}
+
+void near cmd0c8()
+/* tag read */
+/* cmd, opt, slot, bufsize, bufptr(near) */
+/* opt == 0xffffff02 : module type code(8bytes) */
+/* opt == 0xffffff03 : module size(16bytes) */
+/* directoryに対してモジュールサイズを要求することはできない */
+{
+	int *cmd == DS:ESI;
+	PUSH((int) 0);
+	PUSH(cmd[20] /* bufptr(sel) */);
+	PUSH(cmd[16] /* bufptr(ofs) */);
+	PUSH(cmd[12] /* bufsize */);
+	PUSH(cmd[ 8] /* slot */);
+	PUSH(cmd[ 4] /* opt */);
+	PUSH((int) 0x0728);
+	(offset) cmd += 24;
+	EBX = ESP;
+	CALL(0x0017,0); // shell-call
+	ESP += 28;
+	asmout("JMP nextcmd");
+}
+
+void near cmd0d0()
+/* tag listing */
+/* opt == 0xffffff00 : module name */
+{
+	int *cmd == DS:ESI;
+	PUSH((int) 0);
+	PUSH(DS /* bufptr(sel) */);
+	PUSH(cmd[16] /* bufptr(ofs) */);
+	PUSH(cmd[12] /* bufsize */);
+	PUSH(cmd[ 8] /* slot */);
+	PUSH(cmd[ 4] /* opt */);
+	PUSH((int) 0x0730);
+	(offset) cmd += 20;
+	EBX = ESP;
+	CALL(0x0017,0); // shell-call
+	ESP += 28;
+	asmout("JMP nextcmd");
+}
+
+void near cmd0e0()
+/* load font */
+/* cmd, opt, slot, len, from(far) */
+{
+	int *cmd == DS:ESI;
+	WORK *work == SS:EBP;
+	EAX = cmd[ 4];
+	PUSH((int) 0);
+	if ((signed) EAX > 0) {
+		PUSH(cmd[20]);
+		PUSH(cmd[16]);
+		PUSH(cmd[12]);
+		PUSH(cmd[ 8]);
+		PUSH(EAX);
+		PUSH((int) 0x0408);
+		(offset) cmd += 24;
+		EBX = ESP;
+		CALL(0x0017,0); // shell-call
+		ESP += 28;
+		asmout("JMP nextcmd");
+	}
+	if ((unsigned) EAX >= 0xc0000001) {
+		/* カスタムモード(完了シグナル付き) */
+		PUSH(cmd[16]); /* sig(0x7f000001は付かない) */
+		PUSH(cmd[12]); /* len */
+		PUSH(cmd[ 8]);
+		PUSH(EAX);
+		PUSH((int) 0x0408);
+		(offset) cmd += 20;
+		EBX = ESP;
+		if (EAX == 0xc0ffffff)
+			work->ending_count++;
+		CALL(0x0017,0); // shell-call
+		ESP += 24;
+		asmout("JMP nextcmd");
+	}
+	if ((unsigned) EAX >= 0x80000001) {
+		/* カスタムモード(完了シグナルなし) */
+		PUSH(cmd[ 8]);
+		PUSH(EAX);
+		PUSH((int) 0x0408);
+		(offset) cmd += 12;
+		EBX = ESP;
+		CALL(0x0017,0); // shell-call
+		ESP += 16;
+		asmout("JMP nextcmd");
+	}
+	SAFE_CUT("DB ..$-$-1,'loadFont:Invalid option ',0");
+}
+
+void cmd0e4()
+/* free font */
+/* cmd, opt, slot */
+{
+	int *cmd == DS:ESI;
+	PUSH((int) 0);
+	PUSH(cmd[ 8]);
+	PUSH(cmd[ 4]);
+	PUSH((int) 0x040c);
+	(offset) cmd += 12;
+	EBX = ESP;
+	CALL(0x0017,0); // shell-call
+	ESP += 16;
+	asmout("JMP nextcmd");
+}
+
+void near cmd0e8()
+/* make charset */
+/* cmd, opt, slot(charset), slot(font), range, from, to */
+{
+	int *cmd == DS:ESI;
+	PUSH((int) 0);
+	PUSH(cmd[24]);
+	PUSH(cmd[20]);
+	PUSH(cmd[16]);
+	PUSH(cmd[12]);
+	PUSH(cmd[ 8]);
+	PUSH(cmd[ 4]);
+	PUSH((int) 0x0410);
+	(offset) cmd += 28;
+	EBX = ESP;
+	CALL(0x0017,0); // shell-call
+	ESP += 32;
+	asmout("JMP nextcmd");
+}
+
+void near cmd0ec()
+/* code convert */
+/* cmd, opt, len, src, dest, base0, base1,... */
+/* opt 0x0001 : SJIS to GUIGUI00-JPN(1) */
+/* opt 0x0002 : シンプルEUC */
+/*   written by I.Tak. [OSASK 2945] */
+{
+	unsigned int EOSp == EBX, G0base == ECX, G1base == EBP;
+	unsigned char *src == DS:ESI;
+	unsigned int *dst == ES:EDI, *cmd == SS:EBP;
+
+	PUSH(ES);
+	PUSH(DS);
+	PUSH(EBP);
+	(offset) cmd = ESI;
+	EOSp = cmd[ 8];					/* length of generated GUIGUI-code */
+	EAX  = cmd[ 4];					/* opt */
+	asmout("LES EDI,SS:[EBP+20]");	/* dst */
+	asmout("LDS ESI,SS:[EBP+12]");	/* src */
+//	LEA(EOSp, (int) dst[EOSp * 4]);	/* points end of dst string */
+	LEA(EBX, [EDI + EBX * 4]);
+
+	if (AL == 0x03)
+		goto mode0003;				/* Fundamental EUC */
+
+	PUSH((offset) cmd);
+	G0base = cmd[28];
+	G1base = cmd[32];
+	EAX--;
+	if (== 0)
+		goto mode0001;				/* 日本語WindowsのシフトJIS */
+	EAX--;
+	if (== 0)
+		goto mode0002;				/* とっても簡単にしちゃったEUC */
+	#if (defined(SAFEAPI_FLAG))
+		EAX += 2;
+		SAFE_CUT("DB ..$-$-1,'codeConvert:Invalid option ',0,'.'");
+	#else
+		INT(0x03);
+	#endif
+
+mode0001:
+/******* Shifted-JIS with MS extension conveter V0.2 */
+	do {
+		EAX = *src;
+		(offset) src++;
+		EDX = EAX;
+		AL ^= 0xa0;
+		AL -= 0x21;
+		if ((unsigned) AL < 47) {
+			/* 0x81-0x9f, 0xe0-0xef: X0213-1 */
+			DL = *src;					/* second byte */
+			(offset) src++;
+			DL -= 0x80;
+			ADC(DL, 63);				/* AL -= (AL < 0x80) ? 64:65 */
+DoubleWidth2:
+			IMUL(EAX, 94 * 2 * 2);
+			LEA(EDX, [EAX + EDX * 2]);
+			EDX += G1base;
+			dst[0] = EDX;
+			EDX++;
+			dst[4] = EDX;
+			(offset) dst += 8;
+		} else {
+			AL -= 47 + 10;
+			if((unsigned) AL < 3) {
+				/* 0xfa-0xfc:MS&NEC extension */
+				AL += 94 / 2;
+				DL = *src;
+				(offset) src++;
+			//	EDX += 0 - 0x80;			/* shorter */
+				EDX -= 0x80;				/* bug fixed. */
+				ADC(EDX, 63 - 28);
+				asmout("JNS #DoubleWidth2");	/* if( SF==0 ) */
+				if (AL != 94 / 2)			/* 95区か96区 */
+					goto DoubleWidth2;
+				AL = 100 / 2;				/* MS28文字を101区へ */
+				EDX += 28;
+				goto DoubleWidth2;
+			}
+			/* X0201 */
+			EDX += G0base;
+			*dst = EDX;
+			(offset) dst += 4;
+		}
+	} while ((unsigned) (offset) dst < EOSp);
+
+endconv:
+	POP(ESI);
+	POP(EBP);
+	POP(DS);
+	POP(ES);
+	ESI += 36;	/* points next command */
+	asmout("JMP nextcmd");
+
+mode0002:
+/****** Easy EUC convertor V0.1.1 */
+	do {
+		EAX = *src;
+		(offset) src++;
+		EDX = EAX;
+		AL -= 0xa1;
+		if ((unsigned) >= 0) {
+			/* GR or 0xff */
+			IMUL(EDX, EAX, 94 * 2);
+			AL = *src;
+			(offset) src++;
+			AL -= 0x21;
+			AL &= 0x7f;			/* easy triming */
+			LEA(EDX, [EAX * 2 + EDX]);
+			EDX += G1base;
+			dst[0] = EDX;
+			EDX++;
+			dst[4] = EDX;
+			(offset) dst += 8;
+		} else {
+			/* C0,0x20,GL,0x7f,C1,0x80 */
+			EDX += G0base;
+			*dst = EDX;
+			(offset) dst += 4;
+		}
+	} while ((unsigned) (offset) dst < EOSp);
+	goto endconv;
+
+mode0003:
+/******* Fundamental EUC converter V0.1.1 */
+	do {
+		/* First Phase */
+		AL = *src;
+		(offset) src++;
+		ECX = 0;				/* 中間バッファ番号 */
+		TEST(AL, AL);
+		DL = 3;					/* mask */
+		if ((signed) < 0) {		/* C1 or GR */
+			ECX++;
+			if ((unsigned) AL <= 0x8f) {	/* SS2 手抜き */
+				SBB(CL, 0 - 2);	/* cl+=(CF)?1:2 */
+				AL = *src;
+				(offset) src++;
+			}
+			ECX *= 2;
+		}
+		EAX &= 0x7f;
+
+		/* Second Phase */
+		(unsigned char) DL <<= CL;	/* mask */
+		ECX = cmd[ECX * 2 + 28];	/* base */
+		DL &= (char) cmd[4 + 2];
+		if (== 0) {				/* 1byte set */
+			EAX += ECX;
+			*dst = EAX;
+			(offset) dst += 4;
+		} else {				/* 94^2 set */
+			AL -= 0x21;
+			CMP(AL, 94);		/* triming */
+			SBB(DL, DL);		/* triming */
+			AL &= DL;			/* triming */
+			IMUL(EDX, EAX, 94 * 2);
+			AL = *src;			/* second byte */
+			EDX += ECX;			/* base */
+			AL -= 0x21;
+			(offset) src++;
+			EAX &= 0x7f;		/* easy triming */
+			LEA(EDX, [EDX + EAX * 2]);
+			dst[0] = EDX;
+			EDX++;
+			dst[4] = EDX;
+			(offset) dst += 8;
+		}
+	} while ((unsigned) (offset) dst < EOSp);
+
+	ESI = (offset)cmd;
+	POP(EBP);
+	POP(DS);
+	POP(ES);
+	ESI += 44;
+	asmout("JMP nextcmd");
+}
+
+void near cmd0f0()
+/* set segment */
+/* cmd, opt, selector, ar, limit, offset, base_selector */
+/* selectorとbase_selectorは0xfff8でマスクしておくこと */
+{
+	int *cmd == DS:ESI;
+	PUSH((int) 0);
+	PUSH(cmd[24]);
+	PUSH(cmd[20]);
+	PUSH(cmd[16]);
+	PUSH(cmd[12]);
+	PUSH(cmd[ 8]);
+	PUSH(cmd[ 4]);
+	PUSH((int) 0x0240);
+	(offset) cmd += 28;
+	EBX = ESP;
+	CALL(0x0017,0); // shell-call
+	ESP += 32;
+	asmout("JMP nextcmd");
+}
+
+void cmd108_sub_pset()
+/*
+	ESI : 初期x
+	EDI : 初期y
+	EDX : 増分値x
+	EBX : 増分値y
+	EBP : ループ回数
+	EAX : カラー
+	ECX : gbox
+*/
+{
+	GRAPHBOX *gbox == DS:ECX;
+
+	PUSH(ECX);
+	PUSH(gbox->x_bsize);
+	PUSH(EBP);
+	PUSH(EAX);
+	LEA(EBP, [ECX + 64]);
+	ECX = EDI;
+	EAX = ESI;
+	(unsigned int) ECX >>= 16;
+	(unsigned int) EAX >>= 16;
+	IMUL(ECX, (int) [SS:ESP + 8]);
+	EBP += EAX;
+	EAX = 0x00010000;
+	EBP += ECX;
+	ECX = 0xffff0000;
+	if (EBX == EAX) {
+		if (EDX == EAX)
+			goto line_xp1_yp1;
+		if ((signed) > )
+			goto general;
+		if (EDX >= 0)
+			goto line_xpd_yp1;
+		if (EDX == ECX)
+			goto line_xm1_yp1;
+		if ((signed) < )
+			goto line_xmd_yp1;
+	} else if (EBX == ECX) {
+		if (EDX == EAX)
+			goto line_xp1_ym1;
+		if ((signed) > )
+			goto general;
+		if (EDX >= 0)
+			goto line_xpd_ym1;
+		if (EDX == ECX)
+			goto line_xm1_ym1;
+		if ((signed) < )
+			goto line_xmd_ym1;
+	} else if (EDX == EAX) {
+	//	if (EBX == EAX)
+	//		goto line_xp1_yp1;
+		if ((signed) EBX > EAX)
+			goto general;
+		if (EBX >= 0)
+			goto line_xp1_ypd;
+	//	if (EBX == ECX)
+	//		goto line_xp1_ym1;
+		if ((signed) EBX < ECX)
+			goto line_xp1_ymd;
+	} else if (EDX == ECX) {
+	//	if (EBX == EAX)
+	//		goto line_xm1_yp1;
+		if ((signed) EBX > EAX)
+			goto general;
+		if (EBX >= 0)
+			goto line_xm1_ypd;
+	//	if (EBX == ECX)
+	//		goto line_xm1_ym1;
+		if ((signed) EBX < ECX)
+			goto line_xm1_ymd;
+	}
+
+general:
+	POP(EAX);
+	POP(EBP);
+	PUSH(EDX);
+	do {
+		EDX = EDI;
+		ECX = ESI;
+		(unsigned int) EDX >>= 16;
+		(unsigned int) ECX >>= 16;
+		IMUL(EDX, (int) [SS:ESP + 4]);
+		ECX += (int) [SS:ESP + 8];
+		ESI += [SS:ESP];
+		EDI += EBX;
+		(char) [DS:EDX + ECX + 64] = AL;
+		EBP--;
+	} while (!= 0);
+	POP(EDX);
+	POP(EAX);
+	POP(ECX);
+	return;
+
+line_xpd_yp1:
+	EDI = EBP;
+	EBP = [SS:ESP + 8];
+line_xpmd_yp1:
+	POP(EAX);
+	ESI <<= 16;
+	POP(ECX);
+	EDX <<= 16;
+	do {
+		(char) [DS:EDI] = AL;
+		ESI += EDX;
+		ADC(EDI, EBP);
+		ECX--;
+	} while (!= 0);
+	POP(EAX);
+	POP(ECX);
+	return;
+
+line_xmd_yp1:
+	EDI = EBP;
+	EBP = [SS:ESP + 8];
+	EBP--;
+	goto line_xpmd_yp1;
+
+line_xpd_ym1:
+	EDI = EBP;
+	EBP = [SS:ESP + 8];
+	EBP =- EBP;
+	goto line_xpmd_yp1;
+
+line_xmd_ym1:
+	EDI = EBP;
+	EBP = [SS:ESP + 8];
+	EBP =- EBP;
+	EBP--;
+	goto line_xpmd_yp1;
+
+line_xp1_ypd:
+	ESI = EBP;
+	POP(EAX);
+	EDI <<= 16;
+	POP(ECX);
+	EBX <<= 16;
+	do {
+		EDI += EBX;
+		SBB(EDX, EDX); /* CF == 0ならEDX = 0, CF == 1ならEDX = -1 */
+		(char) [DS:ESI] = AL;
+		EDX &= [SS:ESP + 0];
+		ECX--;
+		LEA(ESI, [ESI + EDX + 1]);
+	} while (!= 0);
+	POP(EAX);
+	POP(ECX);
+	return;
+
+line_xp1_ymd:
+	ESI = EBP;
+	POP(EAX);
+	EDI <<= 16;
+	POP(ECX);
+	EBX <<= 16;
+	NEG((int) [SS:ESP + 0]);
+	do {
+		EDX = 0;
+		EDI += EBX;
+		ADC(EDX, 0xffffffff); /* CF == 0ならEDX = -1, CF == 1ならEDX = 0 */
+		(char) [DS:ESI] = AL;
+		EDX &= [SS:ESP + 0];
+		ECX--;
+		LEA(ESI, [ESI + EDX + 1]);
+	} while (!= 0);
+	POP(EAX);
+	POP(ECX);
+	return;
+
+line_xm1_ypd:
+	ESI = EBP;
+	POP(EAX);
+	EDI <<= 16;
+	POP(ECX);
+	EBX <<= 16;
+	do {
+		EDI += EBX;
+		SBB(EDX, EDX); /* CF == 0ならEDX = 0, CF == 1ならEDX = -1 */
+		(char) [DS:ESI] = AL;
+		EDX &= [SS:ESP + 0];
+		ECX--;
+		LEA(ESI, [ESI + EDX - 1]);
+	} while (!= 0);
+	POP(EAX);
+	POP(ECX);
+	return;
+
+line_xm1_ymd:
+	ESI = EBP;
+	POP(EAX);
+	EDI <<= 16;
+	POP(ECX);
+	EBX <<= 16;
+	NEG((int) [SS:ESP + 0]);
+	do {
+		EDX = 0;
+		EDI += EBX;
+		ADC(EDX, 0xffffffff); /* CF == 0ならEDX = -1, CF == 1ならEDX = 0 */
+		(char) [DS:ESI] = AL;
+		EDX &= [SS:ESP + 0];
+		ECX--;
+		LEA(ESI, [ESI + EDX - 1]);
+	} while (!= 0);
+	POP(EAX);
+	POP(ECX);
+	return;
+
+line_xp1_yp1:
+	EDX = [SS:ESP + 8];
+	EDX++;
+line_x1_y1:
+	POP(EAX);
+	ESI = EBP;
+	POP(ECX);
+	do {
+		(char) [DS:ESI] = AL;
+		ESI += EDX;
+		ECX--;
+	} while (!= 0);
+	POP(EAX);
+	POP(ECX);
+	return;
+
+line_xp1_ym1:
+	EDX = 1;
+	EDX -= [SS:ESP + 8];
+	goto line_x1_y1;
+
+line_xm1_yp1:
+	EDX = [SS:ESP + 8];
+	EDX--;
+	goto line_x1_y1;
+
+line_xm1_ym1:
+	EDX = 0xffffffff;
+	EDX -= [SS:ESP + 8];
+	goto line_x1_y1;
+}
+
+void cmd108_sub()
+/* EAX == opt, lines == ECX, dat == ES:EDI, gbox == DS:ESI */
+/* EDX == x0, EBX == y0 */
+{
+	GRAPHBOX *gbox == DS:ESI;
+
+	EDX <<= 16;
+	EBX <<= 16;
+	PUSHAD();
+	EAX >>= 6;
+	EAX &= 0x03;
+	if (== 0) { /* pset */
+		do {
+			PUSH(ESI);
+			EDX = [ES:EDI +  8];
+			PUSH(ECX);
+			EBX = [ES:EDI + 12];
+			EBP = [ES:EDI + 16];
+			EAX = [ES:EDI + 20];
+			PUSH(EDI);
+			ECX = (offset) gbox;
+			ESI = [ES:EDI +  0];
+			EDI = [ES:EDI +  4];
+			ESI += [SS:ESP + 32]; /* x0 */
+			EDI += [SS:ESP + 28]; /* y0 */
+			cmd108_sub_pset();
+			POP(EDI);
+			POP(ECX);
+			EDI += 24;
+			POP(ESI);
+			ECX--;
+		} while (!= 0);
+		POPAD();
+		(unsigned int) EDX >>= 16;
+		(unsigned int) EBX >>= 16;
+		return;
+	}
+	if (EAX == 1) { /* and */
+		do {
+			EBX = [SS:ESP + 16]; /* y0 */
+			EDX = [SS:ESP + 20]; /* x0 */
+			PUSH(ECX);
+			AL = [ES:EDI + 20]; /* color */
+			PUSH(EDI);
+			EBX += [ES:EDI +  4];
+			PUSH((int) [ES:EDI + 12]);
+			EDX += [ES:EDI +  0];
+			PUSH((int) [ES:EDI +  8]);
+			EBP = [ES:EDI + 16];
+			do {
+				ECX = EBX;
+				EDI = EDX;
+				(unsigned int) ECX >>= 16;
+				(unsigned int) EDI >>= 16;
+				IMUL(ECX, gbox->x_bsize);
+				EDX += [SS:ESP + 0];
+				EDI += ECX;
+				EBX += [SS:ESP + 4];
+				(char) [DS:ESI + EDI + 64] &= AL;
+				EBP--;
+			} while (!= 0);
+			POP(EAX);
+			POP(EDX);
+			POP(EDI);
+			POP(ECX);
+			EDI += 24;
+			ECX--;
+		} while (!= 0);
+		POPAD();
+		(unsigned int) EDX >>= 16;
+		(unsigned int) EBX >>= 16;
+		return;
+	}
+	if (EAX == 2) { /* or */
+		do {
+			EBX = [SS:ESP + 16]; /* y0 */
+			EDX = [SS:ESP + 20]; /* x0 */
+			PUSH(ECX);
+			AL = [ES:EDI + 20]; /* color */
+			PUSH(EDI);
+			EBX += [ES:EDI +  4];
+			PUSH((int) [ES:EDI + 12]);
+			EDX += [ES:EDI +  0];
+			PUSH((int) [ES:EDI +  8]);
+			EBP = [ES:EDI + 16];
+			do {
+				ECX = EBX;
+				EDI = EDX;
+				(unsigned int) ECX >>= 16;
+				(unsigned int) EDI >>= 16;
+				IMUL(ECX, gbox->x_bsize);
+				EDX += [SS:ESP + 0];
+				EDI += ECX;
+				EBX += [SS:ESP + 4];
+				(char) [DS:ESI + EDI + 64] |= AL;
+				EBP--;
+			} while (!= 0);
+			POP(EAX);
+			POP(EDX);
+			POP(EDI);
+			POP(ECX);
+			EDI += 24;
+			ECX--;
+		} while (!= 0);
+		POPAD();
+		(unsigned int) EDX >>= 16;
+		(unsigned int) EBX >>= 16;
+		return;
+	}
+//	if (EAX == 3) { /* xor */
+		do {
+			EBX = [SS:ESP + 16]; /* y0 */
+			EDX = [SS:ESP + 20]; /* x0 */
+			PUSH(ECX);
+			AL = [ES:EDI + 20]; /* color */
+			PUSH(EDI);
+			EBX += [ES:EDI +  4];
+			PUSH((int) [ES:EDI + 12]);
+			EDX += [ES:EDI +  0];
+			PUSH((int) [ES:EDI +  8]);
+			EBP = [ES:EDI + 16];
+			do {
+				ECX = EBX;
+				EDI = EDX;
+				(unsigned int) ECX >>= 16;
+				(unsigned int) EDI >>= 16;
+				IMUL(ECX, gbox->x_bsize);
+				EDX += [SS:ESP + 0];
+				EDI += ECX;
+				EBX += [SS:ESP + 4];
+				(char) [DS:ESI + EDI + 64] ^= AL;
+				EBP--;
+			} while (!= 0);
+			POP(EAX);
+			POP(EDX);
+			POP(EDI);
+			POP(ECX);
+			EDI += 24;
+			ECX--;
+		} while (!= 0);
+		POPAD();
+		(unsigned int) EDX >>= 16;
+		(unsigned int) EBX >>= 16;
+		return;
+//	}
+}
+
+void near cmd108()
+// lines (graphicbox)
+/* cmd, opt, graphicbox, x0, y0, xsize, ysize, lines, ofs, sel */
+/* 変換処理はcmd10cで行う */
+/* optのbit15を1にすると、グラフィックボックスバッファにしか書き込まない */
+{
+	int *cmd == DS:ESI;
+	WINDOW *win == SS:EBP;
+	GRAPHBOX *gbox == DS:EDI;
+
+	PUSH(ES);
+	PUSH(EBP);
+	PUSH((offset) cmd);
+	EAX = cmd[ 4];
+	EDX = cmd[12];
+	EBX = cmd[16];
+	ECX = cmd[28];
+	asmout("LES EDI,DS:[ESI + 32]");
+	ESI = cmd[ 8];
+	cmd108_sub();
+	POP((offset) cmd);
+	(offset) gbox = cmd[ 8];
+	(offset) win = gbox->window;
+	TEST(AH, 0x80);
+	if (== 0) {
+		if (win->draw_enable != 0) {
+			PUSH((int) 0x0000);
+			PUSH(ES);
+			PUSH(cmd[32]);
+			PUSH(ECX); /* lines */
+			PUSH(cmd[24]); /* ysize */
+			PUSH(cmd[20]); /* xsize */
+			EBX -= gbox->vy0;
+			EDX -= gbox->vx0;
+			EBX += gbox->y0;
+			EDX += gbox->x0;
+			PUSH(EBX);
+			PUSH(EDX);
+			PUSH(win->slot);
+			PUSH(EAX); /* opt */
+			PUSH((int) 0x0418); /* linear dots */
+			EBX = ESP;
+			CALL(0x0017,0); // GUIGUI統合shellcall
+			ESP += 44;
+		} else
+			gbox->flags |= WINFLAG_MUSTREDRAW;
+	}
+	(offset) cmd += 40;
+	POP(EBP);
+	POP(ES);
+	asmout("JMP nextcmd");
+}
+
+void cmd10c()
+// lines convert
+/* cmd, opt, lines, src_ofs, src_sel, dest_ofs, dest_sel */
+	/* x0, y0, x1, y1, dummy, color (line-compatible) */
+	/* x0, y0, dx, dy, dots, color */
+{
+	int *cmd == DS:ESI;
+	PUSH(ES);
+	PUSH(DS);
+	PUSH(ESI);
+	PUSH(EBP);
+	ECX = cmd[ 8]; /* lines */
+	asmout("LES EDI,DS:[ESI + 20]");
+	asmout("LDS ESI,DS:[ESI + 12]");
+	do {
+		PUSH(ECX);
+		EDX = [DS:ESI +  0];
+		EBX = [DS:ESI +  4];
+		EAX = [DS:ESI +  8];
+		ECX = [DS:ESI + 12];
+		lineconv();
+		EBP++;
+		[ES:EDI +  0] = EDX;
+		[ES:EDI +  4] = EBX;
+		EDX = [DS:ESI + 20];
+		ESI += 24;
+		[ES:EDI +  8] = EAX;
+		[ES:EDI + 12] = ECX;
+		POP(ECX);
+		[ES:EDI + 16] = EBP;
+		[ES:EDI + 20] = EDX;
+		EDI += 24;
+		ECX--;
+	} while (!= 0);
+	POP(EBP);
+	POP(ESI);
+	POP(DS);
+	(offset) cmd += 28;
+	POP(ES);
+	asmout("JMP nextcmd");
+}
+
+
+
+#if 0
+
+void near cmd110()
+// lines (window)
+/* cmd, opt, window, x0, y0, xsize, ysize, lines, ofs, sel */
+/* 変換処理はcmd10cで行う */
+/* optのbit15を1にすると、ウィンドウライトディゼーブルのときは書き込まない */
+{
+	int *cmd == DS:ESI;
+	WINDOW *win == DS:ECX;
+
+	EAX = cmd[ 4];
+	PUSH(EBP);
+	(offset) win = cmd[ 8];
+	EDX = 0;
+	EBP = cmd[12];
+	EDI = cmd[16];
+	if ((unsigned) (offset) win == 0xffffffff) /* 常にイネーブルとみなす */
+		goto draw;
+	EBP += win->x_ofs;
+	EDI += win->y_ofs;
+	CMP(win->draw_enable, 0);
+	EDX = win->slot;
+	if (!= 0)
+		goto draw;
+	TEST(AH, 0x80);
+	if (== 0) {
+draw:
+		AH &= 0x7f;
+		PUSH((int) 0x0000);
+		PUSH(cmd[36]);
+		PUSH(cmd[32]);
+		PUSH(cmd[28]); /* lines */
+		PUSH(cmd[24]); /* ysize */
+		PUSH(cmd[20]); /* xsize */
+		PUSH(EDI);
+		PUSH(EBP);
+		PUSH(EDX);
+		PUSH(EAX); /* opt */
+		PUSH((int) 0x0418); /* linear dots */
+		EBX = ESP;
+		CALL(0x0017,0); // GUIGUI統合shellcall
+		ESP += 44;
+	}
+	(offset) cmd += 40;
+	POP(EBP);
+	asmout("JMP nextcmd");
+}
+#endif
+
+void near cmd114()
+// put string (to gbox)
+/* cmd(0x0114), opt, x0, y0, gbox, col, bcol, charset, base, len, ofs, sel */
+/* bit0 : half */
+/* bit1 : color-font */
+/* bit6-7 : pset, and, or, xor */
+/* bit8-9 : 0,1,2,3(4) */
+/* bit10 : col無効化 */
+/* bit11 : bcol無効化 */
+/* bit12-13 : dw|by|wd|dw */
+/* bit14 : far-ptr */
+/* opt:bit14 far-ptr, gboxの下位8bitが-1の場合、x0, y0はofs, selになる。skipはgbox>>8 */
+/* opt:bit15 flash抑制 */
+/* opt:bit6-7はbit14-15へ移植される */
+{
+	int *cmd == DS:ESI;
+	WINDOW *win == DS:EDX;
+	GRAPHBOX *gbox == DS:EDI;
+
+	EAX = cmd[ 4]; /* opt */
+	TEST(EAX, 0x4300); /* b14, b9, b8 */
+	if (== 0) {
+		SAFE_CUT("DB ..$-$-1,'putString(GB):Invalid option ',0,'.'");
+	}
+	if ((unsigned) (char) cmd[16] == 0xff)
+		goto nogbox;
+
+	PUSH(0x0000);
+	(offset) gbox = cmd[16]; /* gbox/linebytes */
+	PUSH(cmd[44]); /* sel */
+	PUSH(cmd[40]); /* ofs */
+	if (gbox->mode != 0x01) {
+		#if (defined(SAFEAPI_FLAG))
+			EAX = gbox->mode;
+			SAFE_CUT("DB ..$-$-1,'putString(GB):Invalid gbox mode ',0,'.'");
+		#else
+			INT(0x03);
+		#endif
+	}
+	EDX = gbox->x_bsize;
+	ECX = cmd[12]; /* y0/sel */
+	PUSH(cmd[36]); /* len */
+	PUSH(cmd[32]); /* base */
+	IMUL(ECX, EDX);
+	PUSH(cmd[28]); /* charset */
+	PUSH(cmd[24]); /* bcol */
+	ECX += cmd[ 8]; /* x0/ofs */
+	PUSH(cmd[20]); /* col */
+	PUSH(EDX);
+	LEA(ECX, [ECX + EDI + 64]);
+	PUSH(DS);
+	PUSH(ECX);
+	ECX = EAX;
+	AH &= 0x3f;
+	CL &= 0xc0;
+	AH |= CL;
+	PUSH(EAX);
+	PUSH(0x0420);
+	EBX = ESP;
+	CALL(0x0017,0); // GUIGUI統合shellcall
+	POP(EAX);
+	POP(ECX);
+	POP(EAX); /* bufアドレス */
+	ECX = cmd[36]; /* len */
+	ESP += 4 * 9;
+	ECX *= 8;
+	PUSH(DS);
+	EDX -= ECX;
+	PUSH(EAX);
+	PUSH(EDX); /* yskip */
+	EAX = 8;
+	TEST((char) cmd[ 4], 0x01);
+	if (== 0)
+		EAX *= 2;
+	PUSH(EAX); /* ysize */
+	PUSH(ECX); /* xsize */
+	EAX = cmd[12]; /* y0 */
+	ECX = cmd[ 8]; /* x0 */
+	EAX -= gbox->vy0;
+	ECX -= gbox->vx0;
+	EAX += gbox->y0;
+	ECX += gbox->x0;
+	(offset) win = gbox->window;
+	PUSH(EAX);
+	PUSH(ECX);
+	PUSH(win->slot);
+	PUSH(1);
+	PUSH(0x0414); /* putblock */
+	EBX = ESP;
+	TEST((char) cmd[ 5], 0x80);
+	if (== 0) {
+		if (win->draw_enable != 0) {
+			CALL(0x0017,0); // GUIGUI統合shellcall
+		} else
+			gbox->flags |= WINFLAG_MUSTREDRAW;
+	}
+	ESP += 44;
+	(offset) cmd += 48;
+	asmout("JMP nextcmd");
+
+nogbox:
+	PUSH(0x0000);
+	ECX = cmd[16]; /* gbox/linebytes */
+	PUSH(cmd[44]); /* sel */
+	(signed int) ECX >>= 8; /* さかさまに対応するため */
+	PUSH(cmd[40]); /* ofs */
+	PUSH(cmd[36]); /* len */
+	PUSH(cmd[32]); /* base */
+	PUSH(cmd[28]); /* charset */
+	PUSH(cmd[24]); /* bcol */
+	PUSH(cmd[20]); /* col */
+	PUSH(ECX);
+	PUSH(cmd[12]); /* y0/sel */
+	PUSH(cmd[ 8]); /* x0/ofs */
+	ECX = EAX;
+	AH &= 0x3f;
+	CL &= 0xc0;
+	AH |= CL;
+	PUSH(EAX);
+	PUSH(0x0420);
+	EBX = ESP;
+	CALL(0x0017,0); // GUIGUI統合shellcall
+	ESP += 4 * 13;
+	(offset) cmd += 48;
+	asmout("JMP nextcmd");
+}
+
+void near cmd118()
+/* get randseed */
+/* cmd, opt, (seed) */
+{
+	int *cmd == DS:ESI;
+
+	PUSH((int) 0x0000);
+	PUSH(EAX);
+	PUSH((int) 0x0328);
+	EBX = ESP;
+	CALL(0x0017,0); // GUIGUI統合shellcall
+	POP(EAX);
+	POP(cmd[8]);
+	POP(EAX);
+	(offset) cmd += 12;
+	asmout("JMP nextcmd");
+}
+
+void near cmd120()
+/* file resize */
+/* cmd, opt(0:absolute), slot, new-size, siglen, sig */
+{
+	int *cmd == DS:ESI;
+
+	PUSH((int) 0x0000);
+	PUSH(cmd[20]); /* sig */
+	PUSH(cmd[16]); /* siglen */
+	PUSH(cmd[12]); /* new-size */
+	PUSH(cmd[ 8]); /* slot */
+	PUSH(cmd[ 4]); /* opt */
+	PUSH((int) 0x0740);
+	EBX = ESP;
+	CALL(0x0017,0); // GUIGUI統合shellcall
+	ESP += 28;
+	(offset) cmd += 24;
+	asmout("JMP nextcmd");
+}
+
+void near sendusersignal()
+// ES:EDIからのECX[dw]を送信
+// ESI, EBP以外のレジスタは破壊される
+// 送信に失敗したら、フラグで伝達(ZF == 0はエラー)
+{
+	WORK *work == SS:EBP;
+	EDX = work->signalbox_write_ptr;
+	TEST(DL, 0x03);
+	if (== 0) {
+		LEA(EAX, [EDX + ECX * 4]);
+		if ((unsigned) EAX >= work->signalbox_write_ptr1 /* 書き込み上限アドレス */) {
+			/* 先頭に戻す */
+			/* 捨てるdw数を計算 */
+			EAX = work->signalbox_write_ptr1;
+			EAX -= EDX;
+			EAX /= 4; // EAX == 先頭に戻すことによって消費するサイズ(dw単位)
+			work->signalbox_read_free += EAX;
+			work->signalbox_write_free -= EAX;
+			if ((unsigned) <= 0) {
+				work->signalbox_read_free -= EAX;
+				work->signalbox_write_free += EAX;
+				TEST(ESP, ESP); // ZF = 0
+				return;
+			} else {
+				EBX = work->signalbox_rewind;
+				[DS:EDX + 4] = EAX;
+				[DS:EDX] = EBX;
+				EDX = work->signalbox_write_ptr0;
+			}
+		}
+		work->signalbox_read_free += ECX;
+		work->signalbox_write_free -= ECX;
+		if ((unsigned) <= 0) {
+			// ユーザー用のsignalboxがあふれた
+			work->signalbox_read_free -= ECX;
+			work->signalbox_write_free += ECX;
+			TEST(ESP, ESP); // ZF = 0
+			EAX = work->signalbox_eos;
+			work->signalbox_write_ptr = EDX;
+			(int) [DS:EDX] = EAX;
+			return;
+		}
+		do {
+			EAX = [ES:EDI];
+			EDI += 4;
+			(int) [DS:EDX] = EAX;
+			EDX += 4;
+			ECX--;
+		} while (!= 0); // ZF == 1
+		EAX = work->signalbox_eos;
+		work->signalbox_write_ptr = EDX;
+		(int) [DS:EDX] = EAX;
+		// nestによらず、目を覚まさせる
+	//	(char) [SS:ESP + 12 /* GS, DS */ + 16] = 0x02; // リターン時にLlv2へ。
+	}
+	return;
+}
+
+// ユーザーシグナルボックスがないうちに、ユーザーシグナルが来たら、シグナルをマスク
+
+void far pioneer_softint()
+{
+	WORK *work == SS:EBP;
+	int *signal == GS:ESI;
+
+	PUSH(DS);
+	PUSH(ES);
+	PUSH(GS);
+	MOV(EAX, SS);
+	PUSH(0x0027); // system signalbox selector
+	DS = AX;
+	FS = AX;
+	POP(GS);
+
+	EBX = 0xffffffff;
+	EAX = 0x0004; // リードユーザースロットコマンド
+	ECX = 0x01f0;
+	CALL(0x0017,0); // shell-call
+	(offset) work = EDX;
+
+	(offset) signal = work->read_ptr;
+	work->signaldw = 0;
+	do {
+		EAX = signal[0];
+		if (EAX == 0) {
+			// terminate
+			break;
+		}
+		if ((signed) <)
+			goto usersignal;
+		if ((unsigned) EAX >  0x7f0000ff)
+			goto undefined;
+		if ((unsigned) EAX >= 0x7f000000)
+			goto headercut;
+		if (EAX == 0x0080)
+			goto sig0080; // system-timer time out
+		if (EAX == 1)
+			goto sig0001; // rewind
+		if (EAX == 0x20)
+			goto sig0020;	/* kill myslef immediately (0x20, 0) */
+		if (EAX == 0x40)
+			goto sig0040; // set window position
+		if (EAX == 0x41)
+			goto sig0041; // change window title-bar color
+		if (EAX == 0x42)
+			goto sig0042; // VRAM access enable(window)
+		if (EAX == 0x43)
+			goto sig0043; // close window
+		if (EAX == 0x44)
+			goto sig0044; // VRAM access disable(window)
+		if (EAX == 0x45)
+			goto sig0045; // closed window
+		if (EAX == 0x48)
+			goto sig0048; // redraw window
+		if (EAX == 0x49)
+			goto sig0049; // redraw-dif window
+		if (EAX == 0xc0)
+			goto sig00c0; // open sound track
+		if (EAX == 0xc4)
+			goto sig00c4; // closed sound track
+		if (EAX == 0xc8)
+			goto sig00c8; // enable sound track
+		if (EAX == 0xcc)
+			goto sig00cc; /* loaded font (2dw) */
+		INT(0x03);
+
+usersignal:
+	// ユーザーシグナル：未対応
+	INT(0x03);
+
+undefined:
+	// 未定義のシグナル
+	INT(0x03);
+
+headercut:
+	// ユーザーシグナル(ヘッダーカット)
+	EAX &= 0xff;
+	EDX = 0x0027; // system signalbox selector
+	ECX = EAX;
+	EAX++;
+	ES = EDX;
+//	EDI = (offset) signal + 4;
+	LEA(EDI, [ESI + 4]);
+	#if (defined(SAFEAPI_FLAG))
+		TEST(work->signalbox_status, SAFEAPI_FLAG);
+		if (!= 0)
+			goto ignore;
+	#endif
+	PUSH(EAX);
+	sendusersignal();
+	POP(EAX);
+	if (ZF == 1 /* succeeded */) {
+		(char) [SS:ESP + 12 /* GS, ES, DS */ + 16] = 0x02; // リターン時にLlv2へ。
+	ignore:
+		work->signaldw += EAX;
+		LEA(ESI, [ESI + EAX * 4]);
+		goto nextsignal;
+	}
+//	goto usersigboxfull;
+
+usersigboxfull:
+	// nestを0x02だけ減らす。
+	// work->signalbox_status |= 0x01 /* 誰も見てくれないbuffer-full */;
+	work->signalbox_write_ptr |= 0x01 /* 専らこちらが見られるbuffer-full */;
+	EAX = work->signaldw; // それまでに処理できたシグナル
+	POP(GS);
+	POP(ES);
+	POP(DS);
+	LEA(EBX, work->softint_ret_buf[0]);
+	work->softint_ret_buf[ 4] /* (int) [DS:EBX + 4] */ = EAX;
+	work->softint_ret_buf[ 8] /* (int) [DS:EBX + 8] */ = 0x00ff; // さらに1引く
+	CALL(0x0017,0); // GUIGUI統合shellcall
+	// 割り込みから復帰してしまう
+
+sig0080:
+	// システムタイマータイムアウト
+	(offset) signal += 4;
+	work->signaldw++;
+	#if (defined(SAFEAPI_FLAG))
+		TEST(work->signalbox_status, SAFEAPI_FLAG);
+		if (!= 0)
+			goto nextsignal;
+	#endif
+	(char) [SS:ESP + 12 /* GS, ES, DS */ + 16 /* ESP */] = 0x02; // リターン時にLlv2へ。
+	goto nextsignal;
+
+sig00c0:
+	// open sound track
+	EDX = signal[4]; // slot
+	EAX = signal[8]; // system-id
+	(offset) signal += 12;
+	work->signaldw += 3;
+	EDX |= 0x01; // system-id defined
+	PUSH((int) 0);
+	PUSH(EAX);
+	PUSH(EDX);
+	PUSH((int) 0x0600);
+	EBX = ESP;
+	CALL(0x0017,0); // GUIGUI統合shellcall
+	ESP += 16;
+	#if (defined(SAFEAPI_FLAG))
+		TEST(work->signalbox_status, SAFEAPI_FLAG);
+		if (== 0)
+			(char) [SS:ESP + 12 /* GS, ES, DS */ + 16 /* ESP */] = 0x02; // リターン時にLlv2へ。
+	#else
+		(char) [SS:ESP + 12 /* GS, ES, DS */ + 16 /* ESP */] = 0x02; // リターン時にLlv2へ。
+	#endif
+	goto nextsignal;
+
+sig00c8:
+	// enable sound track
+	EDX = signal[4]; // slot
+	(offset) signal += 8;
+	work->signaldw += 2;
+	EDX |= 0x01; // enable
+	PUSH((int) 0);
+	PUSH(EDX);
+	PUSH((int) 0x0608);
+	EBX = ESP;
+	CALL(0x0017,0); // GUIGUI統合shellcall
+	ESP += 12;
+	goto nextsignal;
+
+sig0001:
+	// rewind
+	EAX = signal[4];
+	(offset) signal = 0;
+	work->signaldw += EAX;
+	goto nextsignal;
+
+sig0040:
+	// window位置変更
+	// 描画は全てwindow相対モードを使うので、このシグナルに応じる必要が無い
+	WINDOW *sig0040_win == DS:EBX;
+	(offset) sig0040_win = signal[4];
+//	EAX = signal[ 8];
+//	ECX = signal[12];
+//	*win_x0 = EAX; // win_x0
+//	*win_y0 = ECX; // win_y0
+	AL = sig0040_win->sigflag;
+#if defined(SAFEAPI_FLAG)
+	TEST(work->signalbox_status, SAFEAPI_FLAG);
+	if (== 0) {
+#endif
+	TEST(AL, 0x02);
+	if (!= 0) {
+		EDI = 4;
+		TEST(AL, 0x80);
+		EDX = sig0040_win->signalhead[0];
+		if (!= 0)
+			EDI *= 4;
+		PUSH(SS);
+		EDX += EDI;
+		POP(ES);
+		PUSH(signal[12]);
+		PUSH(signal[ 8]);
+		PUSH(EDX);
+		ECX = 3;
+		EDI = ESP;
+		sendusersignal();
+		LEA(ESP, [SS:ESP + 12]);
+		if (ZF == 0 /* error */)
+			goto usersigboxfull;
+		(char) [SS:ESP + 12 /* GS, ES, DS */ + 16] = 0x02; // リターン時にLlv2へ。
+	}
+#if defined(SAFEAPI_FLAG)
+	}
+#endif
+	(offset) signal += 16;
+	work->signaldw += 4;
+	goto nextsignal;
+
+sig0041:
+	// タイトルバーカラー変更
+	// bit0 : 0 = 長期にわたり、自由表示disable, 1 = enable
+	// bit1 : 0 = 入力アクティブではない, 1 = 入力アクティブ
+	// ぐいぐいでは、10の組み合わせをしないことを保証している。重なっていると入力アクティブにならない。
+	// 入力アクティブになると、カーソルを表示する。
+
+	WINDOW *sig0041_win == DS:EBX;
+	(offset) sig0041_win = signal[4];
+	AL = (char) signal[8];
+	sig0041_win->mode0 = AL;
+	AL = sig0041_win->sigflag;
+	sig0041_win->flags |= WINFLAG_TITLE;
+#if defined(SAFEAPI_FLAG)
+	TEST(work->signalbox_status, SAFEAPI_FLAG);
+	if (==0){
+#endif
+	TEST(AL, 0x04);
+	if (!= 0) {
+		EDI = 5;
+		TEST(AL, 0x80);
+		EDX = sig0041_win->signalhead[0];
+		if (!= 0)
+			EDI *= 4;
+		PUSH(SS);
+		EDX += EDI;
+		POP(ES);
+		PUSH(signal[8]);
+		PUSH(EDX);
+		ECX = 2;
+		EDI = ESP;
+		sendusersignal();
+		POP(EAX);
+		POP(EDI);
+		if (ZF == 0 /* error */)
+			goto usersigboxfull;
+		(char) [SS:ESP + 12 /* GS, ES, DS */ + 16] = 0x02; // リターン時にLlv2へ。
+	}
+#if defined(SAFEAPI_FLAG)
+	}
+#endif
+	(offset) signal += 12;
+	work->signaldw += 3;
+	goto nextsignal;
+
+sig0042:
+	// VRAMアクセスの自由化
+	WINDOW *sig0042_win == DS:EBX;
+	(offset) sig0042_win = signal[4];
+	AL = sig0042_win->sigflag;
+	sig0042_win->draw_enable = 1; // 自由表示enable（随時更新）
+#if defined(SAFEAPI_FLAG)
+	  TEST(work->signalbox_status, SAFEAPI_FLAG);
+	  if (==0){
+#endif
+	TEST(AL, 0x10);
+	if (!= 0) {
+		PUSH(sig0042_win->signalhead[0]);
+		PUSH(SS);
+		ECX = 1;
+		POP(ES);
+		EDI = ESP;
+		sendusersignal();
+		POP(EAX);
+		if (ZF == 0 /* error */)
+			goto usersigboxfull;
+		(char) [SS:ESP + 12 /* GS, ES, DS */ + 16] = 0x02; // リターン時にLlv2へ。
+	}
+#if defined(SAFEAPI_FLAG)
+	}
+#endif
+	(offset) signal += 8;
+	work->signaldw += 2;
+	goto nextsignal;
+
+sig0043:
+	// ウィンドウクローズ要求
+	WINDOW *sig0043_win == DS:EBX;
+	(offset) sig0043_win = signal[4];
+	AL = sig0043_win->sigflag;
+#if defined(SAFEAPI_FLAG)
+	  TEST(work->signalbox_status, SAFEAPI_FLAG);
+	  if (==0){
+#endif
+	TEST(AL, 0x08);
+	if (!= 0) {
+		EDI = 6;
+		TEST(AL, 0x80);
+		EDX = sig0043_win->signalhead[0];
+		if (!= 0)
+			EDI *= 4;
+		PUSH(SS);
+		EDX += EDI;
+		POP(ES);
+		PUSH(EDX);
+		ECX = 1;
+		EDI = ESP;
+		sendusersignal();
+		POP(EAX);
+		if (ZF == 0 /* error */)
+			goto usersigboxfull;
+		(char) [SS:ESP + 12 /* GS, ES, DS */ + 16] = 0x02; // リターン時にLlv2へ。
+		(offset) signal += 8;
+		work->signaldw += 2;
+		goto nextsignal;
+	}
+#if defined(SAFEAPI_FLAG)
+	}
+#endif
+sig0020:
+	PUSH((int) 0);
+	PUSH((int) 0x0001); // opt(close all handle)
+	PUSH((int) 0x0040); /* タスク終了 */
+	EBX = ESP;
+	CALL(0x0017,0); /* GUIGUI統合shellcall */
+	AL = [SS:ESP + 6];
+	ESP += 12;
+	AL += work->ending_count;
+	(offset) signal += 8;
+	work->signaldw += 2;
+	AL &= 0x7f;	
+	work->ending_count = AL;
+	if (!= 0)
+		goto nextsignal;
+	PUSH((int) 0);
+	PUSH((int) 0x0002); // opt(close task)
+	PUSH((int) 0x0040); /* タスク終了 */
+	EBX = ESP;
+	CALL(0x0017,0); /* GUIGUI統合shellcall */
+	INT(0x03);
+
+sig0044:
+	// VRAMアクセスの凍結
+	WINDOW *sig0044_win == DS:EBX;
+	(offset) sig0044_win = signal[4];
+	AL = sig0044_win->sigflag;
+	sig0044_win->draw_enable = 0; // 自由表示disable（更新抑制）
+	TEST(AL, 0x10);
+	if (!= 0) {
+#if defined(SAFEAPI_FLAG)
+	  TEST(work->signalbox_status, SAFEAPI_FLAG);
+	  if (!=0)
+		goto recieve;
+#endif
+		EDI = 1;
+		TEST(AL, 0x80);
+		EDX = sig0044_win->signalhead[0];
+		if (!= 0)
+			EDI *= 4;
+		PUSH(SS);
+		EDX += EDI;
+		POP(ES);
+		PUSH(EDX);
+		ECX = 1;
+		EDI = ESP;
+		sendusersignal();
+		POP(EAX);
+		if (ZF == 0 /* error */)
+			goto usersigboxfull;
+		(char) [SS:ESP + 12 /* GS, ES, DS */ + 16] = 0x02; // リターン時にLlv2へ。
+	} else {
+	recieve:
+		// 受理したことをシェルにシステムコールで伝える
+		PUSH((int) 0);
+		PUSH(sig0044_win->slot);
+		PUSH((int) 0x0140);
+		EBX = ESP;
+		CALL(0x0017,0); // GUIGUI統合shellcall
+		ESP += 12;
+	}
+	(offset) signal += 8;
+	work->signaldw += 2;
+	goto nextsignal;
+
+sig0045:
+	/* ウィンドウクローズ完了報告 */
+	WINDOW *sig0045_win == DS:EBX;
+	(offset) sig0045_win = signal[4];
+	AL = sig0045_win->sigflag;
+#if defined(SAFEAPI_FLAG)
+	  TEST(work->signalbox_status, SAFEAPI_FLAG);
+	  if (==0){
+#endif
+	TEST(AL, 0x20);
+	if (!= 0) {
+		EDI = 7;
+		TEST(AL, 0x80);
+		EDX = sig0045_win->signalhead[0];
+		if (!= 0)
+			EDI *= 4;
+		PUSH(SS);
+		EDX += EDI;
+		POP(ES);
+		ECX = 1;
+		PUSH(EDX);
+		EDI = ESP;
+		sendusersignal();
+		POP(EAX);
+		if (ZF == 0 /* error */)
+			goto usersigboxfull;
+		(char) [SS:ESP + 12 /* GS, ES, DS */ + 16] = 0x02; // リターン時にLlv2へ。
+	}
+#if defined(SAFEAPI_FLAG)
+	}
+#endif
+sig00c4:
+sig00cc:
+	(offset) signal += 8;
+	work->signaldw += 2;
+	/* カウンタを減少させる */
+	/* 0になったら、終了 */
+	TEST(work->ending_count, 0x7f);
+	if (== 0)
+		INT(0x03);
+
+	work->ending_count--;
+	if (!= 0)
+		goto nextsignal;
+
+	PUSH((int) 0);
+	PUSH((int) 0x0002); // opt(close task)
+	PUSH((int) 0x0040); // タスク終了
+	EBX = ESP;
+	CALL(0x0017,0); // GUIGUI統合shellcall
+	INT(0x03);
+
+sig0048:
+	// 再描画(他のタスクによって、持ち場が荒らされた)
+	WINDOW *sig0048_win == DS:EBX, *sig0048_win2 == DS:EDI;
+	(offset) sig0048_win = signal[4];
+	AL = sig0048_win->sigflag;
+	TEST(AL, 0x01);
+	if (!= 0) {
+		#if (defined(SAFEAPI_FLAG))
+			TEST(work->signalbox_status, SAFEAPI_FLAG);
+			if (!= 0)
+				goto call_draw_window;
+		#endif
+		EDI = 2;
+		TEST(AL, 0x80);
+		EDX = sig0048_win->signalhead[0];
+		if (!= 0)
+			EDI *= 4;
+		PUSH(SS);
+		EDX += EDI;
+		POP(ES);
+		ECX = 1;
+		PUSH(EDX);
+		EDI = ESP;
+		sendusersignal();
+		POP(EAX);
+		if (ZF == 0 /* error */)
+			goto usersigboxfull;
+		(char) [SS:ESP + 12 /* GS, ES, DS */ + 16] = 0x02; // リターン時にLlv2へ。
+	} else {
+	call_draw_window:
+		EDI = (offset) sig0048_win;
+		// EBP, ESI, EDI以外は全て破壊
+		AL = sig0048_win->flags;
+		AL &= -1-WINFLAG_DIRTYGBOX-WINFLAG_MUSTREDRAW-WINFLAG_TITLE;
+		TEST(AL, WINFLAG_FRAMEONLY);
+		sig0048_win->flags = AL;
+		if (== 0)
+			drawwindow_back();
+		else
+			drawwindow_frame();
+		drawwindow();
+		EDX = 3;	/* 再描画フラグを強制的に立てさせる */
+		drawcomponent();
+		// 描画完了通知シグナル
+		PUSH((int) 0);
+		PUSH(sig0048_win2->slot);
+		PUSH((int) 0x0144);
+		EBX = ESP;
+		CALL(0x0017,0); // GUIGUI統合shellcall
+		ESP += 12;
+	}
+	(offset) signal += 8;
+	work->signaldw += 2;
+	goto nextsignal;
+
+sig0049:
+	// 差分描画 (我慢した物のみ描画)
+	WINDOW *sig0049_win == DS:EBX, *sig0049_win2 == DS:EDI;
+	(offset) sig0049_win = signal[4];
+	AL = sig0049_win->sigflag;
+	TEST(AL, 0x01);
+	if (!= 0) {
+		#if (defined(SAFEAPI_FLAG))
+			TEST(work->signalbox_status, SAFEAPI_FLAG);
+			if (!= 0)
+				goto call_draw_window0049;
+		#endif
+		EDI = 3;
+		TEST(AL, 0x80);
+		EDX = sig0049_win->signalhead[0];
+		if (!= 0)
+			EDI *= 4;
+		PUSH(SS);
+		EDX += EDI;
+		POP(ES);
+		ECX = 1;
+		PUSH(EDX);
+		EDI = ESP;
+		sendusersignal();
+		POP(EAX);
+		if (ZF == 0 /* error */)
+			goto usersigboxfull;
+		(char) [SS:ESP + 12 /* GS, ES, DS */ + 16] = 0x02; // リターン時にLlv2へ。
+	} else {
+	call_draw_window0049:
+		EDI = (offset) sig0049_win;
+		DL = sig0049_win->flags;
+		TEST(DL, WINFLAG_TITLE | WINFLAG_MUSTREDRAW);
+		if (!= 0) {
+			PUSH(EDX);
+			PUSH(EBX);
+			TEST(DL, WINFLAG_MUSTREDRAW);
+			if (!= 0) {
+				// EBP, ESI, EDI以外は全て破壊
+				TEST(DL, WINFLAG_FRAMEONLY);
+				if (== 0)
+					drawwindow_back();	/* 塗り潰し */
+				else
+					drawwindow_frame();	/* 枠のみ塗り潰し */
+			}
+			// EBP, ESI, EDI以外は全て破壊
+			drawwindow();	/* 影付け,ボタン,タイトル塗り潰し */
+			POP(EBX);
+			POP(EDX);
+			titlebox_redraw(); /* EDI = window, EAX 破壊 */
+		}
+		/* フラグをおろす */
+		sig0049_win->flags &= -1-WINFLAG_TITLE-WINFLAG_DIRTYGBOX-WINFLAG_MUSTREDRAW;
+		EDX &= 0x03;
+		drawcomponent();
+		// 描画完了通知シグナル
+		PUSH((int) 0);
+		PUSH(sig0049_win2->slot);
+		PUSH((int) 0x0144);
+		EBX = ESP;
+		CALL(0x0017,0); // GUIGUI統合shellcall
+		ESP += 12;
+	}
+	(offset) signal += 8;
+	work->signaldw += 2;
+//	goto nextsignal;
+
+nextsignal:
+		// モードチェンジ、window位置変更、VRAMアクセスの自由化の後には、再描画が来るのをあてにしてよい。
+	} while (work->signaldw < 8);
+
+	POP(GS);
+	POP(ES);
+	POP(DS);
+
+	work->read_ptr = (offset) signal;
+
+	// スタックを乱してリターンしてはいけない
+	EAX = work->signaldw;
+	LEA(EBX, work->softint_ret_buf[0]);
+	work->softint_ret_buf[ 4] = EAX;
+	work->softint_ret_buf[ 8] = 0x0001;
+	if (work->nest == 0) {
+		if (work->signalbox_read_free != 0) {
+			if ((unsigned) (short) [SS:ESP + 40 /* CS */] != 0x00c7) {
+				// 新規割り込み
+				POP(EAX); // FS
+				PUSH(GS);
+				PUSH(EAX);
+				PUSH(DS);
+				PUSH(ES);
+				ESP -= 44;
+				PUSH(EAX);
+				EAX = work->softint_EIP;
+				ECX = work->softint_CS;
+				EDX = (int) [SS:ESP + 104 /* EFLAGS */];
+				(int) [SS:ESP + 16] = 0x02; // リターン時にLlv2へ。
+				(int) [SS:ESP + 36 /* EIP */   ] = EAX;
+				(int) [SS:ESP + 40 /* CS */    ] = ECX;
+				(int) [SS:ESP + 44 /* EFLAGS */] = EDX;
+				work->nest--;
+			}
+		}
+	}
+	CALL(0x0017,0); // GUIGUI統合shellcall
+	// エラーがない限り、ここには来ない
+	INT(0x03);
+//	ALIGN(4);
+//wintitle_colortable:
+//	asmout("wintitle_colortable DD 0008H, 0708H, 0, 040FH");
+}
+
+#define PushDrawBlock(slot,x,y,w,h,skip,ofs,sel) \
+	PUSH(sel); PUSH(ofs); PUSH(skip); PUSH(h); PUSH(w); \
+	PUSH(y); PUSH(x); PUSH(slot); PUSH(1); PUSH(0x00000414)
+
+void drawwindow()
+{
+	signed int t == EAX, width == EDX, height == EBX;
+	unsigned int wslot == EBP;
+	unsigned char winmode == CL;
+	WINDOW *win == DS:EDI;
+
+	PUSH(ESI);
+	PUSH(EBP);
+
+//	winmode = win->mode0;
+	width = win->x_size;
+//	height = win->y_size;
+//	winmode *= 8;
+	wslot = win->slot;
+
+	PUSH(0);
+#if (defined(WIN9X))
+	asmout("MOV EAX,.closebutton");
+	width -= 21;
+	PushDrawBlock(wslot, EDX,5, 16,14, 0, EAX,CS);
+	width += 21;
+#elif (defined(TMENU))
+	asmout("MOV EAX,.closebutton");
+	PushDrawBlock(wslot, 4,4, 15,15, 1, EAX,CS);
+#elif (defined(CHO_OSASK))
+	asmout("MOV EAX,.picsmap");
+	PushDrawBlock(wslot, 4,4, 16,16, 0, EAX,CS);
+#elif (defined(NEWSTYLE))
+	/* nothing */
+#elif (defined(WIN31))
+	asmout("MOV EAX,.closebutton");
+	PushDrawBlock(wslot, 3,3, 18,18, 2, EAX,CS);
+#endif
+	asmout("MOV EAX,.windatarray");
+	asmout("JMP drawwindow_sub");
+
+/*	タイトル用テキストボックスの色とウィンドウの色は本来無関係
+ *	なので別に管理したほうがよい，と思えてきたので，そうしてみた。
+ *	それに，Active/Inactiveで変わるのがタイトルバーの色だけとは
+ *	限らない。たとえばFVWMではFocusしたウィンドウとStickyな
+ *	ウィンドウとその他のウィンドウとをウィンドウ枠全体の色で
+ *	区別する。
+ */
+
+	ALIGN(4);
+windatarray:
+	#if (defined(WIN9X))
+		DB( 0, 0, 0, 0,  0,-1,  -1,-1);	/* frame downside line 0 */
+		DB( 7, 7, 0, 7,  1,-2,  -2,-2);	/* frame downside line 1 */
+		DB( 0, 7, 0, 4,  3, 3,  -4,20);	/* title bar */
+//		DB( 8, 8, 0, 8,  2, 2,  -3,-3);	/* window */
+		DB( 0, 0, 0, 0, -1, 0,  -1,-1);	/* frame rightside line 0 */
+		DB( 7, 7, 0, 7, -2, 1,  -2,-2);	/* frame rightside line 1 */
+		DB(15,15, 0,15,  1, 1,   1,-2);	/* frame leftside line 1 */
+		DB( 8, 8, 0, 8,  0, 0,   0,-1);	/* frame leftside line 0 */
+		DB(15,15, 0,15,  1, 1,  -2, 1);	/* frame upside line 1 */
+		DB( 8, 8, 0, 8,  0, 0,  -1, 0);	/* frame upside line 0 */
+	/*	DB( 0, 0,-1, 0);	*/			/* End of data */
+	closebutton:
+		DD(0x0f0f0f0f, 0x0f0f0f0f, 0x0f0f0f0f, 0x000f0f0f);	/* ×箱(^^; */
+		DD(0x0808080f, 0x08080808, 0x08080808, 0x00070808);
+		DD(0x0808080f, 0x08080808, 0x08080808, 0x00070808);
+		DD(0x0808080f, 0x08080000, 0x00000808, 0x00070808);
+		DD(0x0808080f, 0x08000008, 0x08000008, 0x00070808);
+		DD(0x0808080f, 0x00000808, 0x08080000, 0x00070808);
+		DD(0x0808080f, 0x00080808, 0x08080800, 0x00070808);
+		DD(0x0808080f, 0x00000808, 0x08080000, 0x00070808);
+		DD(0x0808080f, 0x08000008, 0x08000008, 0x00070808);
+		DD(0x0808080f, 0x08080000, 0x00000808, 0x00070808);
+		DD(0x0808080f, 0x08080808, 0x08080808, 0x00070808);
+		DD(0x0808080f, 0x08080808, 0x08080808, 0x00070808);
+		DD(0x0707070f, 0x07070707, 0x07070707, 0x00070707);
+		DD(0x00000000, 0x00000000, 0x00000000, 0x00000000);
+	#elif (defined(TMENU))
+		DB( 0, 0, 0, 0,  0,-3,   -1,-1);	/* frame downside line */
+//		DB(15,15, 0,15,  1,22,   -4,-4);	/* window */
+		DB( 0, 0, 0, 0,  1,21,   -4,21);	/* titlebar downside line */
+		DB(15, 8, 0,12, -71, 1,  -4,20);	/* titlebar right half*/
+		DB( 0, 0, 0, 0, -72, 1, -72,20);	/* titlebar mid line */
+		DB(15, 8, 0,15,  3, 4,    3,19);	/* close button leftside line */
+		DB(15, 8, 0,15,  3, 3,   19, 3);	/* close button upside line */
+		DB(15, 8, 0, 0,  1, 1,  -73,20);	/* titlebar left half */
+		DB( 0, 0, 0, 0, -3, 1,   -1,-4);	/* frame rightside line */
+		DB( 0, 0, 0, 0,  0, 1,    0,-4);	/* frame leftside line */
+		DB( 0, 0, 0, 0,  0, 0,   -1, 0);	/* frame upside line */
+		DB( 0, 0,-1, 0);					/* End of data */
+	closebutton:
+		DD(0x00000000, 0x00000000, 0x00000000, 0x0000);
+		DD(0x0f000f00, 0x0f000f00, 0x0f000f00, 0x0f00);
+		DD(0x00000000, 0x00000000, 0x00000000, 0x0000);
+		DD(0x0f000f00, 0x0f000f00, 0x0f000f00, 0x0f00);
+		DD(0x00000000, 0x00000000, 0x00000000, 0x0000);
+		DD(0x0f000f00, 0x0f000f00, 0x0f000f00, 0x0f00);
+		DD(0x00000000, 0x00000000, 0x00000000, 0x0000);
+		DD(0x0f000f00, 0x0f000f00, 0x0f000f00, 0x0f00);
+		DD(0x00000000, 0x00000000, 0x00000000, 0x0000);
+		DD(0x0f000f00, 0x0f000f00, 0x0f000f00, 0x0f00);
+		DD(0x00000000, 0x00000000, 0x00000000, 0x0000);
+		DD(0x0f000f00, 0x0f000f00, 0x0f000f00, 0x0f00);
+		DD(0x00000000, 0x00000000, 0x00000000, 0x0000);
+		DD(0x0f000f00, 0x0f000f00, 0x0f000f00, 0x0f00);
+		DD(0x00000000, 0x00000000, 0x00000000, 0x0000);
+	#elif (defined(CHO_OSASK))
+		DB( 0, 0, 0, 0,  0, -2,  -1,-1);	/* frame downside line */
+		DB( 8, 8, 0, 7,  2, -6,  -3,-2);	/* frame downside fill */
+		DB(15,15, 0,15,  6, -7,  -7,-7);	/* frame inner downside line */
+		DB( 0, 0, 0, 0,  8, -8,  -8,-8);	/* frame inner downside line */
+		DB( 8, 8, 0, 7, -6, 27,  -3,-7);	/* frame rightside fill */
+		DB(15,15, 0,15, -7, 27,  -7,-8);	/* frame inner rightside line */
+		DB( 0, 0, 0, 0, -8, 29,  -8,-7);	/* frame inner rightside line */
+//		DB( 8, 8, 0, 8,  8, 29,  -9,-9);	/* window fill */
+		DB( 0, 0, 0, 0,  6, 29,   7,-8);	/* frame inner leftside line */
+		DB( 8, 8, 0, 7,  2, 27,   5,-7);	/* frame leftside fill */
+		DB( 0, 0, 0, 0,  6, 27,  -8,28);	/* frame inner upside line */
+		DB( 8, 8, 0, 7,  2,  2,  -3,26);	/* frame upside fill */
+		DB( 0, 0, 0, 0, -2,  1,  -1,-3);	/* frame rightside line */
+		DB(15,15, 0,15,  1,  2,   1,-3);	/* frame leftside line */
+		DB( 0, 0, 0, 0,  0,  1,   0,-3);	/* frame leftside line */
+		DB(15,15, 0,15,  1,  1,  -3, 1);	/* frame upside line */
+		DB( 0, 0, 0, 0,  0,  0,  -1, 0);	/* frame upside line */
+	/*	DB( 0, 0,-1, 0);	*/			/* End of data */
+	picsmap:
+		DD(0x0e070707, 0x0e07070e, 0x0e0e0e0e, 0x0e0e0e0e);	/* 超 */
+		DD(0x0e070707, 0x0707070e, 0x0e0e0707, 0x0e0e0707);
+		DD(0x0e070707, 0x0707070e, 0x0e0e0707, 0x0e0e0707);
+		DD(0x0e0e0e07, 0x070e0e0e, 0x070e0e07, 0x0e0e0707);
+		DD(0x0e070707, 0x0707070e, 0x0e0e0e07, 0x0e0e0e07);
+		DD(0x0e070707, 0x0707070e, 0x07070e0e, 0x070e0e0e);
+		DD(0x0e0e0e0e, 0x0e0e0e0e, 0x0707070e, 0x070e0e07);
+		DD(0x0e070707, 0x0707070e, 0x0e0e0e0e, 0x0e0e0e0e);
+		DD(0x0e070707, 0x0707070e, 0x07070e0e, 0x0e0e0707);
+		DD(0x0e070e07, 0x0e0e0e0e, 0x07070e0e, 0x0e0e0707);
+		DD(0x0e070e07, 0x0707070e, 0x07070e0e, 0x0e0e0707);
+		DD(0x0e070e0e, 0x0707070e, 0x0e0e0e0e, 0x0e0e0e0e);
+		DD(0x0e070e0e, 0x0707070e, 0x07070e0e, 0x0e0e0707);
+		DD(0x0e0e0e0e, 0x0e0e0e0e, 0x0707070e, 0x07070707);
+		DD(0x07070e0e, 0x0e0e0e07, 0x0e0e0e0e, 0x0e0e0e0e);
+		DD(0x07070e0e, 0x07070707, 0x0e0e0e0e, 0x070e0e0e);
+	#elif (defined(NEWSTYLE))
+		DB( 0, 0, 0, 0,  0,-1,  -1,-1);	/* frame downside line */
+//		DB( 8, 8, 0, 8,  1,22,  -2,-2);	/* window */
+		DB( 0, 0, 0, 0,  1,21,  -2,21);	/* titlebar downside line */
+		DB( 0, 7, 0, 4,  1, 1,  -2,20);	/* titlebar */
+		DB( 0, 0, 0, 0, -1, 1,  -1,-2);	/* frame rightside line */
+		DB( 0, 0, 0, 0,  0, 1,   0,-2);	/* frame leftside line */
+		DB( 0, 0, 0, 0,  0, 0,  -1, 0);	/* frame upside line */
+		DB( 0, 0,-1, 0);				/* End of data */
+	#elif (defined(WIN31))
+		DB( 0, 0, 0, 4,  0,-1,  -1,-1);	/* frame downside line 0 */
+		DB(15,15, 0, 4,  1,-2,  -2,-2);	/* frame downside line 1 */
+		DB( 8,15, 0, 4,  3, 3,  -4,19);	/* title bar */
+		DB( 8, 0, 0, 4,  3,20,  -4,20);	/* title bar downside line */
+//		DB(15,15, 0,15,  2, 2,  -3,-3);	/* window */
+		DB( 0, 0, 0, 4, -1, 0,  -1,-1);	/* frame rightside line 0 */
+		DB(15,15, 0, 4, -2, 1,  -2,-2);	/* frame rightside line 1 */
+		DB( 0, 0, 0, 4,  0, 0,   0,-1);	/* frame leftside line 0 */
+		DB(15,15, 0, 4,  1, 1,   1,-2);	/* frame leftside line 1 */
+		DB( 0, 0, 0, 4,  0, 0,  -1, 0);	/* frame upside line 0 */
+		DB(15,15, 0, 4,  1, 1,  -2, 1);	/* frame upside line 1 */
+	/*	DB( 0, 0,-1, 0);	*/			/* End of data */
+	closebutton:
+		DD(0x08080808, 0x08080808, 0x08080808, 0x08080808, 0x08080008); 	/* ControlBox */
+		DD(0x08080808, 0x08080808, 0x08080808, 0x08080808, 0x08080008);
+		DD(0x08080808, 0x08080808, 0x08080808, 0x08080808, 0x08080008);
+		DD(0x08080808, 0x08080808, 0x08080808, 0x08080808, 0x08080008);
+		DD(0x08080808, 0x08080808, 0x08080808, 0x08080808, 0x08080008);
+		DD(0x08080808, 0x08080808, 0x08080808, 0x08080808, 0x08080008);
+		DD(0x08080808, 0x08080808, 0x08080808, 0x08080808, 0x08080008);
+		DD(0x00000808, 0x00000000, 0x00000000, 0x08080000, 0x08080008);
+		DD(0x0f000808, 0x0f0f0f0f, 0x0f0f0f0f, 0x0807000f, 0x08000008);
+		DD(0x00000808, 0x00000000, 0x00000000, 0x08070000, 0x08080008);
+		DD(0x07080808, 0x07070707, 0x07070707, 0x08070707, 0x08080008);
+		DD(0x08080808, 0x08080808, 0x08080808, 0x08080808, 0x08080008);
+		DD(0x08080808, 0x08080808, 0x08080808, 0x08080808, 0x08080008);
+		DD(0x08080808, 0x08080808, 0x08080808, 0x08080808, 0x08080008);
+		DD(0x08080808, 0x08080808, 0x08080808, 0x08080808, 0x08080008);
+		DD(0x08080808, 0x08080808, 0x08080808, 0x08080808, 0x08080008);
+		DD(0x08080808, 0x08080808, 0x08080808, 0x08080808, 0x08080008);
+		DD(0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000);
+	#endif
+}
+
+void drawwindow_back()
+{
+	PUSH(ESI);
+	PUSH(EBP);
+	PUSH(0);
+	asmout("MOV EAX,.windatarray");
+	asmout("JMP drawwindow_sub");
+	ALIGN(4);
+windatarray:
+	#if (defined(WIN9X))
+		DB( 8, 8, 0, 8,  2, 2,  -3,-3);	/* window */
+	#elif (defined(TMENU))
+		DB(15,15, 0,15,  1,22,  -4,-4);	/* window */
+	#elif (defined(CHO_OSASK))
+		DB( 8, 8, 0, 8,  8, 29, -9,-9);	/* window fill */
+	#elif (defined(NEWSTYLE))
+		DB( 8, 8, 0, 8,  1,22,  -2,-2);	/* window */
+	#elif (defined(WIN31))
+		DB(15,15, 0,15,  2, 2,  -3,-3);	/* window */
+	#endif
+	DB( 0, 0,-1, 0);					/* End of data */
+}
+
+void drawwindow_frame()
+{
+	PUSH(ESI);
+	PUSH(EBP);
+	PUSH(0);
+	asmout("MOV EAX,.windatarray");
+	asmout("JMP drawwindow_sub");
+	ALIGN(4);
+windatarray:
+	#if (defined(WIN9X))
+		DB( 8, 8, 0, 8,  2, -8,  -3, -3);	/* down */
+		DB( 8, 8, 0, 8, -8, 29,  -3, -9);	/* right */
+		DB( 8, 8, 0, 8,  2, 29,   7, -9);	/* left */
+		DB( 8, 8, 0, 8,  2,  2,  -3, 28);	/* up */
+	#elif (defined(TMENU))
+		DB(15,15, 0,15,  1, -8,  -4, -4);	/* down */
+		DB(15,15, 0,15, -8, 29,  -4, -9);	/* right */
+		DB(15,15, 0,15,  1, 29,   7, -9);	/* left */
+		DB(15,15, 0,15,  1, 22,  -4, 28);	/* up */
+	#elif (defined(CHO_OSASK))
+		/* nothing */
+	#elif (defined(NEWSTYLE))
+		DB( 8, 8, 0, 8,  1, -8,  -2, -2);	/* down */
+		DB( 8, 8, 0, 8, -8, 29,  -2, -9);	/* right */
+		DB( 8, 8, 0, 8,  1, 29,   7, -9);	/* left */
+		DB( 8, 8, 0, 8,  1, 22,  -2, 28);	/* up */
+	#elif (defined(WIN31))
+		DB(15,15, 0,15,  2, -8,  -3, -3);	/* down */
+		DB(15,15, 0,15, -8, 29,  -3, -9);	/* right */
+		DB(15,15, 0,15,  2, 29,   7, -9);	/* left */
+		DB(15,15, 0,15,  2,  2,  -3, 28);	/* up */
+	#endif
+	DB( 0, 0,-1, 0);					/* End of data */
+}
+
+void drawwindow_sub()
+/* PUSH(ESI);PUSH(EBP);をやって、EAXにwindatarrayを */
+{
+	struct WINDAT {
+		unsigned char col_disabled, col_inactive, resv, col_active;
+		signed char x0, y0, x1, y1;
+	};
+	signed int t == EAX, width == EDX, height == EBX;
+	unsigned int wslot == EBP;
+	unsigned char winmode == CL;
+	WINDAT *windat == DS:ESI;
+	WINDOW *win == DS:EDI;
+
+//	PUSH(ESI);
+//	PUSH(EBP);
+
+	(offset) windat = EAX;
+	winmode = win->mode0;
+	width = win->x_size;
+	height = win->y_size;
+	winmode *= 8;
+	wslot = win->slot;
+
+	PUSH(CS);
+	POP(DS);
+
+	t = (int) windat->col_disabled; /* t = *(int *) &windat->col_disabled; */
+	do {
+		SHR(t, winmode);
+		t &= 0x0f;
+		PUSH(t);
+
+		t = windat->y1;
+		if (t < 0)
+			t += height;
+		PUSH(t);
+
+		t = windat->x1;
+		if (t < 0)
+			t += width;
+		PUSH(t);
+
+		t = windat->y0;
+		if (t < 0)
+			t += height;
+		PUSH(t);
+
+		t = windat->x0;
+		if (t < 0)
+			t += width;
+		PUSH(t);
+
+		windat += 8;
+		PUSH(wslot);
+		PUSH(0x20);
+		PUSH(0x0400);
+
+		t = (int) windat->col_disabled; /* t = *(int *) &windat->col_disabled; */
+		TEST(t, 0x00ff0000);
+	} while (== 0);
+
+	PUSH(SS);
+	POP(DS);
+	EBX = ESP;
+	CALL(0x0017,0); /* GUIGUI統合shell-call */
+	LEA(ESP, [EBX + 4]);
+
+	POP(EBP);
+	POP(ESI);
+	return;
+}
+
+void titlebox_redraw()
+{
+	WINDOW *win == DS:EDI;
+	/* このウィンドウについているタイトルテキストボックスを
+	   サーチして全てredrawする */
+	LEA(EAX, win->children_back); /* 末端 */
+	PUSH(ESI);
+	PUSH(ECX);
+	PUSH(EBX);
+	ESI = win->children_next;
+	if (EAX != ESI) {	/* while を if do while で代用 */
+		do {
+			ESI -= 8;
+			if ((unsigned) (int) [DS:ESI] == 0x54584554 /* TEXT */) {
+				TEXTBOX *textbox == DS:ESI;
+				EAX = textbox->option;
+				TEST(AH, 0xf0);
+				if (!= 0) {
+					// wintitle
+					// バッファを参照して書き込む
+					LEA(EAX, [ESI + 64]);
+					ECX = 0;
+					PUSH(ECX);	/* EOC */
+					PUSH(DS);	/* selector */
+					PUSH(EAX);	/* offset */
+					EAX = textbox->x_size;
+					PUSH(EAX);
+					EAX = win->mode0;
+					PUSH(ECX);	/* base */
+					ECX = textbox->charset;
+					asmout("MOVZX EAX,WORD CS:[EAX*2+wintitle_colortable]");
+					PUSH(ECX);
+					ECX = EAX;
+					EAX >>= 8;
+					ECX &= 0x0f;
+					PUSH(EAX);	/* backcolor */
+					AL = 4;
+					PUSH(ECX);	/* color */
+					CL = 24;
+					PUSH(EAX);	/* y0 */
+					PUSH(ECX);	/* x0 */
+					PUSH(win->slot);
+					PUSH(0x3000);	/* option */
+					PUSH(0x0404);	/* put text */
+					EBX = ESP;
+					CALL(0x0017, 0);/* GUIGUI統合shellcall */
+					ESP += 13 * 4;
+				}
+			}
+			LEA(EAX, win->children_back);
+			ESI = (int) [DS:ESI + 12 /* chain_next */];
+		} while (EAX != ESI);
+	}
+	POP(EBX);
+	POP(ECX);
+	POP(ESI);
+	return;
+}
+
+void drawcomponent()
+{
+	WINDOW *win == DS:EDI;
+
+	PUSH(ESI);
+	PUSH(EBP);
+	PUSH(EDX);
+	EDX = win->slot;
+	ESP -= 56;
+
+	// このウィンドウについているコンポーネントをサーチして、全て描画する
+	LEA(EAX, win->children_back);
+	ESI = win->children_next;
+	if (EAX != ESI) {
+		do {
+			EBX = ESP;
+			ESI -= 8;
+			EAX = (int) [DS:ESI    ];
+			ECX = (int) [DS:ESI + 4];
+			if (EAX == 0x54584554 /* TEXT */) {
+				// textbox
+				TEXTBOX *textbox == DS:ESI;
+				AL = [SS:ESP + 56];
+				AL |= textbox->flags; 
+				TEST(AL, WINFLAG_MUSTREDRAW);
+				if (!= 0) {
+					textbox->flags &= -4;
+					EAX = textbox->charset;
+					(int) [DS:EBX + 28] = EAX; /* charset */
+					EAX = 0;
+					(short) [DS:EBX + 44] = DS;
+					(int) [DS:EBX + 32] = EAX; /* base */
+					(int) [DS:EBX + 48] = EAX; /* eoc */
+					EAX = textbox->option;
+					(int) [DS:EBX     ] = 0x0404; /* put text */
+					(int) [DS:EBX +  8] = EDX;
+					TEST(AH, 0xf0);
+					if (== 0) {
+						// 普通のテキストボックス
+						int *textbox_ycnt    == DS:EBX + 52;
+						PUSH(EDI);
+						EBP = 0x3000; /* qword */
+						TEST(AL, 0x10);
+						if (!= 0)
+							EBP++; /* half height */
+						TEST(AL, 0x01);
+						if (!= 0) {
+							// EDX:win_slot, ESI:textbox
+							PUSH(EBX);
+							EAX = 0x0010;
+							textbox_drawback();
+							POP(EBX);
+						}
+						// バッファを参照して書き込む
+					//	(int) [DS:EBX     ] = 0x0404; /* put text */
+						(int) [DS:EBX +  4] = EBP; /* option */
+					//	(int) [DS:EBX +  8] = EDX;
+						EAX = textbox->y_size;
+						EBP = textbox->x_size;
+						*textbox_ycnt = EAX;
+						EDX = textbox->x0;
+						EAX = textbox->y0;
+						LEA(EDI, (int) [textbox->buffer]);
+						do {
+							PUSH(ESI);
+							(int) [DS:EBX + 16] = EAX; /* y0 */
+							do {
+								// EDX, (EAX)から書き込むルーチン
+								(int) [DS:EBX + 40] = EDI;
+								(int) [DS:EBX + 12] = EDX; /* x0 */
+								ECX = (int) [DS:EDI + 4];
+								EDI += 8;
+								EAX = ECX;
+								ECX >>= 16;
+								EAX &= 0xffff;
+								(int) [DS:EBX + 24] = ECX; /* backcolor */
+								(int) [DS:EBX + 20] = EAX; /* color */
+								EDX += 8; /* x */
+								EBP--; /* xcnt */
+								ECX = (int) [DS:EDI - 4];
+								if (!= 0) {
+									do {
+										if (ECX != (int) [DS:EDI + 4])
+											break;
+										EDI += 8;
+										EDX += 8; /* x */
+										EBP--; /* xcnt */
+									} while (!= 0);
+								}
+								ESI = EDX;
+								ESI -= (int) [DS:EBX + 12];
+								PUSH(EBX);
+								ESI /= 8;
+								EAX |= [DS:EBX + 24]; /* backcolor */
+								(int) [DS:EBX + 36] = ESI; /* length */
+								if (== 0)
+									(char) [DS:EBX + 4] /* opt */ |= 0x02;
+								CALL(0x0017,0); // GUIGUI統合shellcall
+								POP(EBX);
+								(char) [DS:EBX + 4] /* opt */ &= 0xfd;
+							} while (EBP != 0);
+							POP(ESI);
+							EAX = (int) [DS:EBX + 16] /* y0 */;
+							EBP = textbox->x_size;
+							CL = (char) textbox->option;
+							EAX += 8;
+							TEST(CL, 0x10);
+							if (== 0)
+								EAX += 8;
+							EDX = textbox->x0;
+							*textbox_ycnt--;
+						} while (!= 0);
+						EDX = (int) [DS:EBX +  8];
+						POP(EDI);
+					} else {
+						// wintitle
+						// バッファを参照して書き込む
+						ECX = 0;
+					//	(int) [DS:EBX     ] = 0x0404; /* put text */
+						(int) [DS:EBX +  4] = 0x3000; /* option */
+					//	(int) [DS:EBX +  8] = EDX;
+						CL = 24;
+						EAX = win->mode0;
+						(int) [DS:EBX + 12] = /* 24 */ ECX; /* x0 */
+						CL = 4;
+						asmout("MOVZX EAX,WORD CS:[EAX*2+wintitle_colortable]");
+						(int) [DS:EBX + 16] = /*  4 */ ECX; /* y0 */
+						ECX = EAX;
+						EAX &= 0x0f;
+						ECX /= 256;
+						(int) [DS:EBX + 20] = EAX; /* color */
+						(int) [DS:EBX + 24] = ECX; /* backcolor */
+						ECX = textbox->x_size;
+						LEA(EAX, [ESI + 64]);
+						(int) [DS:EBX + 36] = ECX; /* length */
+						(int) [DS:EBX + 40] = EAX; /* ptr */
+						CALL(0x0017,0); // GUIGUI統合shellcall
+					}
+				}
+			} else if (EAX == 0x50415247 /* GRAP */) {
+				/* 本当は、モードでさらに分類する */
+				GRAPHBOX *graphbox == DS:ESI;
+				AL = [SS:ESP + 56];
+			  	AL |= graphbox->flags;
+				/* GBOXはredrawが必要か正確に分からないので特別扱い */
+				TEST(AL, WINFLAG_MUSTREDRAW | WINFLAG_DIRTYGBOX);
+				if (!= 0) {
+					graphbox->flags &= -4;
+					EAX = graphbox->x_bsize;
+					ECX = graphbox->x_vsize;
+					EBP = graphbox->mode;
+					PUSH((int) 0);
+					EAX -= ECX;
+					EBP &= 0x0f;
+					PUSH(DS);
+					IMUL(EAX, EBP);
+					PUSH(graphbox->vbuf0);
+					PUSH(EAX /* yskip */);
+					PUSH(graphbox->y_vsize);
+					PUSH(ECX);
+					EBX = graphbox->mode;
+					PUSH(graphbox->y0);
+					PUSH(graphbox->x0);
+					PUSH(EDX /* winslot */);
+					PUSH(EBX);
+					PUSH((int) 0x0414);
+					EBX = ESP;
+					CALL(0x0017,0); // GUIGUI統合shellcall
+					ESP += 44;
+				}
+			} else {
+				#if 0	/* APIがシグナル処理で呼ぶこともあるので対処できない */
+					ESP += 56;
+					EAX = ESI;
+					POP(EBP);
+					POP(ESI);
+					POP(ECX);
+					SAFE_CUT("DB ..$-$-1,'drawComponent:Destroyed component@',0");
+				#else
+					INT(0x03);
+				#endif
+			}
+			LEA(EAX, win->children_back);
+			ESI = (int) [DS:ESI + 12 /* chain_next */];
+		} while (EAX != ESI);
+	}
+	ESP += 56 + 4;
+	POP(EBP);
+	POP(ESI);
+	return;
+}
+
+#if (defined(WIN31))
+
+void textbox_drawback()
+/* EAX:0x0010(box), 0x0020(boxfill) */
+// EDX:win_slot, ESI:textbox
+// EAX, ECX, EBX, EDIを破壊
+{
+	struct TBOXBACK {
+		unsigned char col;
+		signed char x0, y0, x1, y1;
+	};
+	int tmp == EDI, x_size == ECX, y_size == EBX, winslot == EDX, t == EAX;
+	TEXTBOX *textbox == DS:ESI;
+	TBOXBACK *tbp == CS:EDI;
+
+	x_size = textbox->x_size;
+	y_size = textbox->y_size;
+	x_size *= 8;
+	y_size *= 8;
+	TEST(textbox->option, 0x10);
+	if (== 0)
+		y_size *= 2;
+
+	PUSH(0x0000); /* eoc */
+
+	//	DB(x0-1, y0-1, x1+0, y1+0, bc);
+	PUSH(textbox->backcolor);
+	tmp = y_size;
+	tmp += textbox->y0;
+	PUSH(tmp);
+	tmp = x_size;
+	tmp += textbox->x0;
+	PUSH(tmp);
+	tmp = textbox->y0;
+	tmp--;
+	PUSH(tmp);
+	tmp = textbox->x0;
+	tmp--;
+	PUSH(tmp);
+	PUSH(winslot);
+	PUSH(EAX);
+	PUSH(0x0400);
+
+	/* (offset) tbp = (offset) tb_table; */
+	asmout("MOV EDI,OFFSET #tb_table");
+
+	t = tbp->col;
+	do {
+		PUSH(t);
+		t = tbp->y1;
+		if (t >= 0)
+			t += y_size;
+		t += textbox->y0;
+		PUSH(t);
+		t = tbp->x1;
+		if (t >= 0)
+			t += x_size;
+		t += textbox->x0;
+		PUSH(t);
+		t = tbp->y0;
+		if (t >= 0)
+			t += y_size;
+		t += textbox->y0;
+		PUSH(t);
+		t = tbp->x0;
+		if (t >= 0)
+			t += x_size;
+		t += textbox->x0;
+		PUSH(t);
+		PUSH(winslot);
+		PUSH(0x0020);
+		PUSH(0x0400);
+		tbp += 5;
+		t = tbp->col;
+	} while (AL != 255);
+
+	EBX = ESP;
+	CALL(0x0017,0); /* GUIGUI統合shell-call */
+	LEA(ESP, [EBX + 4]);
+	return;
+
+tb_table:
+
+	DB(15, -2, -3,  1, -3); /* outside up */
+	DB(15, -3, -3, -3,  1); /* outside left */
+	DB(15, -3,  2,  1,  2); /* outside down */
+	DB(15,  2, -3,  2,  2); /* outside right */
+	DB( 0, -1, -2,  0, -2); /* inside up */
+	DB( 0, -2, -2, -2,  0); /* inside left */
+	DB( 0, -2,  1,  0,  1); /* inside down */
+	DB( 0,  1, -2,  1,  1); /* inside right */
+	DB(255);
+
+	/* 正か零ならx1/y1、負ならx0/y0 */
+
+
+//	DB( 7, -4, -3, +1, -3); /* outside up */
+//	DB( 7, -3, -3, -3, +1); /* outside left */
+//	DB(15, -3, +2, +1, +2); /* outside down */
+//	DB(15, +2, -3, +2, +2); /* outside right */
+//	DB( 0, -3, -2, +0, -2); /* inside up */
+//	DB( 0, -2, -2, -2, +0); /* inside left */
+//	DB( 8, -2, +1, +0, +1); /* inside down */
+//	DB( 8, +1, -2, +1, +1); /* inside right */
+
+}
+
+#elif (defined(WIN9X) || defined(NEWSTYLE) || defined(TMENU))
+
+void textbox_drawback()
+/* EAX:0x0010(box), 0x0020(boxfill) */
+// EDX:win_slot, ESI:textbox
+// EAX, ECX, EBX, EDIを破壊
+{
+	struct TBOXBACK {
+		unsigned char col;
+		signed char x0, y0, x1, y1;
+	};
+	int tmp == EDI, x_size == ECX, y_size == EBX, winslot == EDX, t == EAX;
+	TEXTBOX *textbox == DS:ESI;
+	TBOXBACK *tbp == CS:EDI;
+
+	x_size = textbox->x_size;
+	y_size = textbox->y_size;
+	x_size *= 8;
+	y_size *= 8;
+	TEST(textbox->option, 0x10);
+	if (== 0)
+		y_size *= 2;
+
+	PUSH(0x0000); /* eoc */
+
+	//	DB(x0-1, y0-1, x1+0, y1+0, bc);
+	PUSH(textbox->backcolor);
+	tmp = y_size;
+	tmp += textbox->y0;
+	PUSH(tmp);
+	tmp = x_size;
+	tmp += textbox->x0;
+	PUSH(tmp);
+	tmp = textbox->y0;
+	tmp--;
+	PUSH(tmp);
+	tmp = textbox->x0;
+	tmp--;
+	PUSH(tmp);
+	PUSH(winslot);
+	PUSH(EAX);
+	PUSH(0x0400);
+
+	/* (offset) tbp = (offset) tb_table; */
+	asmout("MOV EDI,OFFSET #tb_table");
+
+	t = tbp->col;
+	do {
+		PUSH(t);
+		t = tbp->y1;
+		if (t >= 0)
+			t += y_size;
+		t += textbox->y0;
+		PUSH(t);
+		t = tbp->x1;
+		if (t >= 0)
+			t += x_size;
+		t += textbox->x0;
+		PUSH(t);
+		t = tbp->y0;
+		if (t >= 0)
+			t += y_size;
+		t += textbox->y0;
+		PUSH(t);
+		t = tbp->x0;
+		if (t >= 0)
+			t += x_size;
+		t += textbox->x0;
+		PUSH(t);
+		PUSH(winslot);
+		PUSH(0x0020);
+		PUSH(0x0400);
+		tbp += 5;
+		t = tbp->col;
+	} while (AL != 255);
+
+	EBX = ESP;
+	CALL(0x0017,0); /* GUIGUI統合shell-call */
+	LEA(ESP, [EBX + 4]);
+	return;
+
+tb_table:
+	DB( 7, -2, -3,  1, -3); /* outside up */
+	DB( 7, -3, -3, -3,  1); /* outside left */
+	DB(15, -3,  2,  1,  2); /* outside down */
+	DB(15,  2, -3,  2,  2); /* outside right */
+	DB( 0, -1, -2,  0, -2); /* inside up */
+	DB( 0, -2, -2, -2,  0); /* inside left */
+	DB( 8, -2,  1,  0,  1); /* inside down */
+	DB( 8,  1, -2,  1,  1); /* inside right */
+	DB(255);
+
+	/* 正か零ならx1/y1、負ならx0/y0 */
+
+
+//	DB( 7, -4, -3, +1, -3); /* outside up */
+//	DB( 7, -3, -3, -3, +1); /* outside left */
+//	DB(15, -3, +2, +1, +2); /* outside down */
+//	DB(15, +2, -3, +2, +2); /* outside right */
+//	DB( 0, -3, -2, +0, -2); /* inside up */
+//	DB( 0, -2, -2, -2, +0); /* inside left */
+//	DB( 8, -2, +1, +0, +1); /* inside down */
+//	DB( 8, +1, -2, +1, +1); /* inside right */
+
+}
+
+#elif (defined(CHO_OSASK))
+
+#define PushFB(opt,x0,y0,x1,y1,c) \
+	PUSH(c);PUSH(y1);PUSH(x1);PUSH(y0);PUSH(x0); \
+	PUSH(slot);PUSH(opt);PUSH(0x400)
+
+void near clipping();
+
+void near textbox_drawback()
+/* クリッピング付き版
+ *	パラメータ
+ *		TEXTBOX *textbox == ESI;
+ *		WINDOW *window == EDI;
+ 		int mode == EAX;
+ */
+{
+	struct MYSTACKFRAME{
+		int work0,work1,work2,tx,ty,tw,th,tbc,ww,wh;
+		void end[0];
+	};
+	MYSTACKFRAME *var == SS:EBP;
+	WINDOW *window == DS:EDI;
+	TEXTBOX *textbox == DS:ESI;
+	int mode == EAX, s == ECX, slot == EDX, t == EBX;
+
+	PUSH(EBP);PUSH(EDX);PUSH(ESI);
+
+	/* stack frame に必要な情報を集める(tx,ty,tw,th,tbc,ww,wh) */
+		PUSH(window->y_size);
+		PUSH(window->x_size);
+		s = textbox->y_size;
+		t = textbox->x_size;
+		s *= 8;
+		PUSH(textbox->backcolor);
+		t *= 8;
+		TEST(textbox->option, 0x10);
+		if(==0)
+			s *= 2;
+		PUSH(s);
+		PUSH(t);
+		PUSH(textbox->y0);
+		PUSH(textbox->x0);
+		PUSH(s);PUSH(s);PUSH(s);
+		(offset)var = ESP;
+
+	/* EOC と(必要なら)塗りつぶしコマンドをpush */
+	int x0 == ECX, y0 == EBX, x1 == ESI, y1 == EDI;
+
+		PUSH(0);					/* EOC */
+		if(mode==0x20){
+			x0 = var->tx;
+			y0 = var->ty;
+			x1 = var->tw;
+			y1 = var->th;
+			LEA(x1, [x1 + x0 -1]);
+			LEA(y1, [y1 + y0 -1]);
+			PushFB(mode, x0,y0, x1,y1, var->tbc);
+		}
+
+	struct TBDAT{
+		unsigned char flag, col;
+		signed char x0, y0, x1, y1;
+	};
+	TBDAT *tbdat == DS:EDI;
+
+	/* クリッピングしつつコマンドをpush */
+		/* (offset)tbdat = tbdatarray;
+			使えない:ASKA(あるいはc言語)にとってラベルとは
+			何なのか？ ポインタではないのか？ */
+		asmout("mov edi, offset #tbdatarray");
+
+		PUSH(CS);POP(DS);
+		do{
+			signed int a == EAX;
+			signed char al == AL;
+			unsigned int x == ECX, w == EBX,
+						 u == ESI, v == EDI;
+
+			al = tbdat->flag;
+			a &= 0x1;
+			if(==0)
+				al = tbdat->col;
+			else
+				al = var->tbc;
+			var->work2 = a;			/* col */
+	
+			a = tbdat->x0;
+			x = var->tx;
+			if(a>=0)
+				x += var->tw;		/* x = tx+dx0 (+tw); */
+			x += a;
+
+			a = tbdat->x1;
+			w = var->tx;
+			w -= x;
+			if(a>=0)
+				w += var->tw;		/* w = tx+dx0 (+tw) -x; */
+			LEA(w, [w+a+1]);
+
+			PUSH((offset)tbdat);
+				v = var->ww;
+				u = 8;
+				v -= 8+8;
+				clipping();			/* clipping(x, w, 8, ww-8-8); */
+			POP((offset)tbdat);
+
+			if(w!=0){
+				LEA(w, [w + x -1]);	/* 先の計算結果を保存 */
+				var->work0 = x;
+				var->work1 = w;
+
+			  unsigned int y == ECX, h == EBX;
+
+				a = tbdat->y0;
+				y = var->ty;
+				if(a>=0)
+					y += var->th;	/* y = ty+dy0 (+th); */
+				y += a;
+
+				a = tbdat->y1;
+				h = var->ty;
+				h -= y;
+				if(a>=0)
+					h += var->th;	/* h = ty+dy1 (+th) -y; */
+				LEA(h,[h+a+1]);
+
+				PUSH((offset)tbdat);
+					v = var->wh;
+					u = 29;
+					v -= 29+8;
+					clipping();		/* clipping(y, h, 8, ww-8-8); */
+				POP((offset)tbdat);
+
+				if(w!=0){
+					LEA(h, [y +h -1]);
+					PushFB(0x20, var->work0,y, var->work1,h, var->work2);
+				}
+			}
+			al = tbdat->flag;
+			(offset)tbdat += 6;		/* (sizeof)TBDAT; 使えない */
+			TEST(al,0x2);
+		}while(==0);
+
+	PUSH(SS);POP(DS);
+	EBX = ESP;
+	CALL(0x17,0);		/* GUIGUI00Shell(); */
+
+	LEA(ESP, [(offset)var->end]);
+	POP(ESI);POP(EDX);POP(EBP);
+	return;
+
+tbdatarray:
+  DB( 0,  0,  -3, -3,   2, -3);	/* upside line     white */
+  DB( 0,  0,  -3, -2,  -3,  1);	/* leftside line   white */
+  DB( 0, 15,   2, -2,   2,  1);	/* rightside line  black */
+  DB( 0, 15,  -3,  2,   2,  2);	/* downside line   black */
+  DB( 1,  0,  -2, -2,   1, -1);	/* upside fill     tbc */
+  DB( 1,  0,  -2, -1,  -1,  0);	/* leftside fill   tbc */
+  DB( 1,  0,   0, -1,   1,  0);	/* rightside fill  tbc */
+  DB( 3,  0,  -2,  0,   1,  2);	/* downside fill   tbc,  end */
+}
+
+void near clipping()
+/* 一次元のクリッピング
+ * x から始まる長さ w の直線を u からの長さ v の枠でクリップ
+ * ASKAらしく(?)引数はレジスタ渡し
+ */
+{
+	unsigned int x == ECX, w == EBX, u == ESI, v == EDI, t == EAX;
+
+	t = u;
+	t -= x;
+	if((unsigned)<=){		/* 左にはみ出している */
+		t += v;
+		if((signed)>)		/* 右端は入っている */
+			goto clipR;
+	  notdraw:				/* 全く入っていない */
+		w = 0;
+		return;
+	}
+	if((unsigned)t>=w)		/* 右に全く飛び出している */
+		goto notdraw;
+	w -= t;					/* clipL */
+	t = v;
+	x = u;
+  clipR:
+	if((unsigned)t<w)		/* 右にはみ出している */
+		w = t;
+	return;
+}
+#endif
+
+void near lineconv()
+/* EBPには本来の値より1小さい値が返るので、使う前にインクリメントすること */
+{
+	int x0 == EDX, y0 == EBX, x1 == EAX, y1 == ECX;
+	int dx == EAX, dy == ECX, len == EBP;
+
+	x1 -= x0;
+	y1 -= y0;
+	x0 <<= 16;
+	y0 <<= 16;
+	if (dx == 0) {
+		if (dy == 0) {
+			len = 0;
+			return;
+		}
+	}
+	PUSH(y0);
+	PUSH(x0);
+	EDX = 0; /* DIVのため */
+	if (dx >= 0) {
+		if (dy >= 0) {
+			if (dx >= dy) {
+				len = dx;
+				EAX = dy;
+				EAX <<= 16;
+				DIV(len);
+				POP(x0);
+				dy = EAX;
+				POP(y0);
+				dx = 0x10000;
+				y0 += 0x8000;
+				return;
+			}
+		//	else {
+				len = dy;
+			//	EAX = dx;
+				EAX <<= 16;
+				DIV(len);
+				POP(x0);
+			//	dx = EAX;
+				dy = 0x10000;
+				POP(y0);
+				x0 += 0x8000;
+				return;
+		//	}
+		}
+	//	else { /* dx >= 0, dy < 0 */
+			dy =- dy;
+			if (dx >= dy) {
+				len = dx;
+				EAX = dy;
+				EAX <<= 16;
+				DIV(len);
+				dy = EAX;
+				POP(x0);
+				dx = 0x10000;
+				POP(y0);
+				dy =- dy;
+				y0 += 0x8000;
+				return;
+			}
+		//	else {
+				len = dy;
+			//	EAX = dx;
+				EAX <<= 16;
+				DIV(len);
+				POP(x0);
+			//	dx = EAX;
+				dy = 0-0x10000;
+				POP(y0);
+				x0 += 0x8000;
+				return;
+		//	}
+	//	}
+	}
+//	else {
+		dx =- dx;
+		if (dy >= 0) { /* dx < 0, dy >= 0 */
+			if (dx >= dy) {
+				len = dx;
+				EAX = dy;
+				EAX <<= 16;
+				DIV(len);
+				POP(x0);
+				dy = EAX;
+				POP(y0);
+				dx = 0-0x10000;
+				y0 += 0x8000;
+				return;
+			}
+		//	else {
+				len = dy;
+			//	EAX = dx;
+				EAX <<= 16;
+				DIV(len);
+			//	dx = EAX;
+				POP(x0);
+				dy = 0x10000;
+				POP(y0);
+				dx =- dx;
+				x0 += 0x8000;
+				return;
+		//	}
+		}
+	//	else { /* dx < 0, dy < 0 */
+			dy =- dy;
+			if (dx >= dy) {
+				len = dx;
+				EAX = dy;
+				EAX <<= 16;
+				DIV(len);
+				POP(x0);
+				dy = EAX;
+				POP(y0);
+				dx = 0-0x10000;
+				dy =- dy;
+				y0 += 0x8000;
+				return;
+			}
+		//	else {
+				len = dy;
+			//	EAX = dx;
+				EAX <<= 16;
+				DIV(len);
+			//	dx = EAX;
+				POP(x0);
+				dy = 0-0x10000;
+				POP(y0);
+				dx =- dx;
+				x0 += 0x8000;
+				return;
+		//	}
+	//	}
+//	}
+}
+
+#if (defined(SAFEAPI_FLAG))
+asmout("hextable: DB '0123456789abcdef'");
+
+void signal_cut_mode()
+{
+	WORK *work == SS:EBP;
+	int *cmd == DS:ESI;
+
+	PUSHAD();
+	EAX = 0;
+
+	/* 溜っているシグナルをもみ消す */
+	work->signalbox_read_free = EAX;
+	/* フラグに記録, 以後シグナルは握りつぶされアプリに制御が渡らない */
+	work->signalbox_status |= SAFEAPI_FLAG;
+
+	/* メッセージ */
+	EBP = ESP;
+	EBX = [SS:EBP + 4*8];			/* ret-eip */
+	EDX = (unsigned char) [CS:EBX];	/* message length */
+	EDI = EDX;
+	do {
+		AL = [CS:EBX+1 +EDX-1]; /* 後ろから1文字ずつ読む */
+		if ((unsigned) AL < 16) {
+			EDI += 7;
+			EAX *= 4;
+			ECX = 0;
+			if ((unsigned) AL < 8*4) {
+				AL ^= 7*4;
+				do {						/* レジスタダンプ */
+					CL = 0x0f;
+					CL &= [SS:EBP+EAX];
+					asmout("MOV CL,BYTE [CS:hextable+ECX]");
+					PUSH(ECX);
+					CL = [SS:EBP+EAX];
+					ECX >>= 4;
+					asmout("MOV CL,BYTE [CS:hextable+ECX]");
+					EAX++;
+					PUSH(ECX);
+					TEST(AL,3);
+				} while(!=0);
+			} else {	/* コマンドダンプ */
+				do {
+					CL = 0x0f;
+					CL &= [DS:ESI+EAX-8*4];
+					asmout("MOV CL,BYTE [CS:hextable+ECX]");
+					PUSH(ECX);
+					CL = [DS:ESI+EAX-8*4];
+					ECX >>= 4;
+					asmout("MOV CL,BYTE [CS:hextable+ECX]");
+					PUSH(ECX);
+					EAX++;
+					TEST(AL,3);
+				} while (!=0);
+			}
+		} else
+			PUSH(EAX); /* 通常文字 */
+		EDX--;
+	} while (!=0);
+
+	EBX = ESP;
+	PUSH(EDX);			/* eoc */
+	PUSH(SS);
+	PUSH(EBX);
+	PUSH(EDI);			/* length */
+	PUSH(EDX);			/* base */
+	PUSH(0xc0);			/* ascii */
+	PUSH(EDX);			/* backcolor */
+	PUSH(15);			/* color */
+	PUSH(EDX);			/* y */
+	PUSH(EDX);			/* x */
+	PUSH(EDX);			/* no slot for window */
+	PUSH(EDX);			/* opt */
+	PUSH(0x0404);			/* put text */
+	EBX = ESP;
+	CALL(0x0017,0);		/* GUIGUI統合shellcall */
+
+	/* waitsignalコマンドを捏造, 永眠せよ */
+	cmd[0] = 0x18;		/* wait signal */
+	cmd[4] = 0x01;
+	cmd[8] = EDX;
+	cmd[12] = EDX;
+	cmd[16] = EDX;		/* end of command */
+
+	ESP = EBP;
+	POPAD();
+	asmout("JMP nextcmd");
+}
+/*
+   処理の流れ:
+   user:	waitsignal
+   pion:	cmd018:shell call to sleep (LocalLevel=30).
+   TAPI(?):
+   pion.sint:	called by TAPI(?), sendusersignal.
+		if succeeded, set LocalLevel (of after sint ends) to 2, and
+		if user signal handler is present, prepare for it to be called.
+   (user.sint:)
+   TAPI(?):
+   pion:	return into cmd018, return to user program.
+   user:	waken.
+*/
+/*
+   あと書くべき事:
+   メッセージ表示。
+*/
+#endif

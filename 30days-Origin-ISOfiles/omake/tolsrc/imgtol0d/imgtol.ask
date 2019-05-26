@@ -1,0 +1,1290 @@
+/* "IMGTOL.ASK":ディスクイメージ操作ツールDOS汎用版 */
+/* DOSファンクションの都合で、maxが32MB */
+
+/*	read.   >imgtol r [opt] drive: filename  size (drv -> file)		*/
+/*	write.  >imgtol w [opt] drive: filename [size] (file -> drv)	*/
+/*	exp-w.f.>imgtol f [opt] drive: filename [size] (file -> drv)	*/
+/*	exp-w.  >imgtol F [opt] drive: filename [size] (file -> drv)	*/
+/*	expand. >imgtol e inputfile outputfile   size					*/
+/*	release.>imgtol R sourceimage compedimage						*/
+/*	ovrcopy.>imgtol c inputfile outputfile  [size]					*/
+/*	exe2sys.>imgtol s inputfile outputfile   base					*/
+/*  drvinfo.>imgtol i drive:										*/
+/*	  opt(sector-bytes) = -512(default), -1024						*/
+/*	  size unit : kilobyte											*/
+
+segment CODE(USE32, PARA);
+default(code == CODE);
+
+void get_param0();
+void get_filename();
+void skipspace();
+void get_param1();
+void get_numdec();
+void fix_seclen();
+void read32k();
+void write32k();
+void drvwrite32k();
+void comp_sub0();
+void format_sub0();
+void fake_fat();
+
+#define FILEBUF			0x4000   /* 40KB */
+#define WORKBASE		0xe000
+#define DRIVE			0xe000
+#define SECTORS			0xe004
+#define LBA				0xe008
+#define TEMP			0xe010
+#define FILENAME0		0xe800
+#define HANDLE0			0xebfe
+#define FILENAME1		0xec00
+#define HANDLE1			0xeffe
+
+void main()
+{
+	asmout("ORG 0x100");
+	asmout("[BITS 16]");
+
+	SI = 0x0081;
+	CLD();
+	LODSB();
+	skipspace();
+	if (AL == 0x72)
+		goto cmd_read;
+	if (AL == 0x77)
+		goto cmd_write;
+	if (AL == 0x65)
+		goto cmd_expand;
+	if (AL == 0x63)
+		goto cmd_ovrcopy;
+	if (AL == 0x73)
+		goto cmd_exe2sys;
+	if (AL == 0x66)
+		goto cmd_fake;
+	if (AL == 0x46)
+		goto cmd_format;
+	if (AL == 0x52)
+		goto cmd_release;
+	asmout("MOV SI,dat.usage");
+msgout:
+	LODSB();
+	PUSH(AX);
+	DX = SI;
+	AH = 0x09;
+	INT(0x21);
+	POP(AX);
+	AH = 0x4c;
+	INT(0x21);
+
+cmd_read:
+	get_param0();
+	asmout("JZ get_param0.err");
+	fix_seclen();
+	DX = FILENAME1;
+	CX = 0;
+	AH = 0x3c;
+	INT(0x21);
+	if (CF != 0)
+		goto file_err;
+	[DS:HANDLE1] = AX;
+	DX = 0;
+	do {
+		PUSH(DX);
+		DX = 0;
+		asmout("MOV CX,[dat.size]");
+		asmout("MOV AX,[dat.clulen]");
+		if ((unsigned) CX < 0x80) {
+			CX *= 512;
+			if ((unsigned) AX >= CX)
+				AX = CX;
+		}
+		asmout("DIV WORD [dat.seclen]");
+		POP(DX);
+		BX = FILEBUF;
+		CX = AX;
+		AL = [DS:DRIVE];
+		PUSH(DX);
+		PUSH(CX);
+		INT(0x25);
+		POP(AX);
+		POP(AX);
+		POP(DX);
+		if (CF != 0)
+			goto drive_err;
+		DX += AX;
+		PUSH(DX);
+		asmout("MUL WORD [dat.seclen]");
+		CX = AX;
+		AH = 0x40;
+		BX = [DS:HANDLE1];
+		DX = FILEBUF;
+		PUSH(CX);
+		INT(0x21);
+		POP(CX);
+		POP(DX);
+		if (CF != 0)
+			goto file_err;
+		if (AX != CX)
+			goto file_err;
+		(unsigned short) AX /= 512;
+		asmout("SUB [dat.size],AX");
+	} while ((unsigned) > 0);
+	AX = 0x4c00;
+	INT(0x21);
+
+file_err:
+	asmout("MOV SI,dat.file_msg");
+	goto msgout;
+
+drive_err:
+	asmout("MOV SI,dat.drive_msg");
+	goto msgout;
+
+cmd_write:
+	get_param0();
+	fix_seclen();
+	DX = FILENAME1;
+	CX = 0;
+	AX = 0x3d00;
+	INT(0x21);
+	if (CF != 0)
+		goto file_err;
+	[DS:HANDLE1] = AX;
+	DX = 0;
+writeloop:
+	do {
+		PUSH(DX);
+		AH = 0x3f;
+		BX = [DS:HANDLE1];
+		asmout("MOV CX,[dat.clulen]");
+		DX = FILEBUF;
+		INT(0x21);
+		POP(DX);
+		if (CF != 0)
+			goto file_err;
+		if (AX == 0)
+			break;
+		PUSH(DX);
+		DX = 0;
+		DI = AX;
+		asmout("DIV WORD [dat.seclen]");
+		if (DX != 0) {
+			PUSH(AX);
+			asmout("MOV CX,[dat.clulen]");
+			CX -= DI;
+			DI += FILEBUF;
+			AX = 0;
+			asmout("REP STOSB");
+			POP(AX);
+			AX++; /* 端数があれば切り上げ */
+		}
+		POP(DX);
+		CX = AX;
+		AL = [DS:DRIVE];
+		BX = FILEBUF;
+		PUSH(DX);
+		PUSH(CX);
+		INT(0x26);
+		POP(AX);
+		POP(CX);
+		POP(DX);
+		if (CF != 0)
+			goto drive_err;
+		asmout("MOV AX,[dat.clulen]");
+		(unsigned short) AX /= 512;
+		DX += CX;
+		asmout("SUB [dat.size],AX");
+	} while ((unsigned) > 0);
+	AX = 0x4c00;
+	INT(0x21);
+
+cmd_ovrcopy:
+	get_param1();
+	AX = 0x3d01;
+	goto ovrcopy_entry2;
+
+cmd_expand:
+	get_param1();
+	asmout("JZ get_param0.err");
+	CX = 0;
+	AH = 0x3c;
+ovrcopy_entry2:
+	DX = FILENAME1;
+	INT(0x21);
+	if (CF != 0)
+		goto outfile_err;
+	[DS:HANDLE1] = AX;
+	DX = FILENAME0;
+	AX = 0x3d00;
+	INT(0x21);
+	if (CF != 0)
+		goto infile_err;
+	[DS:HANDLE0] = AX;
+	do {
+		AH = 0x3f;
+		BX = [DS:HANDLE0];
+		CX = 32 * 1024;
+		DX = FILEBUF;
+		INT(0x21);
+		if (CF != 0)
+			goto infile_err;
+		if (AX != 32 * 1024) {
+			asmout("TEST BYTE [dat.size],0x01");
+			if (!= 0)
+				goto ovrcopy_skip;
+			if (AX == 0)
+				goto expanding;
+			CX = 32 * 1024;
+			DI = AX;
+			CX -= AX;
+			DI += FILEBUF;
+			AX = 0;
+			asmout("REP STOSB");
+		}
+		asmout("MOV AX,[dat.size]");
+		if ((unsigned) AX > 64)
+			AX = 64;
+		AX *= 512;
+		CX = AX;
+		AH = 0x40;
+		BX = [DS:HANDLE1];
+		DX = FILEBUF;
+		PUSH(CX);
+		INT(0x21);
+		POP(CX);
+		if (CF != 0)
+			goto outfile_err;
+		if (AX != CX)
+			goto outfile_err;
+		(unsigned short) AX /= 512;
+		asmout("SUB [dat.size],AX");
+	} while ((unsigned) > 0);
+	AX = 0x4c00;
+	INT(0x21);
+ovrcopy_skip:
+	CX = AX;
+	AH = 0x40;
+	BX = [DS:HANDLE1];
+	DX = FILEBUF;
+	PUSH(CX);
+	INT(0x21);
+	POP(CX);
+	if (CF != 0)
+		goto outfile_err;
+	if (AX != CX)
+		goto outfile_err;
+	AX = 0x4c00;
+	INT(0x21);
+expanding:
+	DI = FILEBUF;
+	CX = 32 * 1024 / 2;
+	AX = 0;
+	asmout("REP STOSW");
+	do {
+		AH = 0x40;
+		BX = [DS:HANDLE1];
+		asmout("MOV CX,[dat.size]");
+		if ((unsigned) CX > 64)
+			CX = 64;
+		CX *= 512;
+		DX = 0x1000;
+		PUSH(CX);
+		INT(0x21);
+		POP(CX);
+		if (CF != 0)
+			goto outfile_err;
+		if (AX != CX)
+			goto outfile_err;
+		(unsigned short) AX /= 512;
+		asmout("SUB [dat.size],AX");
+	} while ((unsigned) > 0);
+exit0:
+	AX = 0x4c00;
+	INT(0x21);
+
+infile_err:
+	asmout("MOV SI,dat.infile_msg");
+	goto msgout;
+
+outfile_err:
+	asmout("MOV SI,dat.outfile_msg");
+	goto msgout;
+
+cmd_exe2sys:
+	get_param1();
+	asmout("JZ get_param0.err");
+	asmout("ROR WORD [dat.size],1");
+	DX = FILENAME0;
+	AX = 0x3d00;
+	INT(0x21);
+	if (CF != 0)
+		goto infile_err;
+	[DS:HANDLE0] = AX;
+	DX = FILENAME1;
+	CX = 0;
+	AH = 0x3c;
+	INT(0x21);
+	if (CF != 0)
+		goto outfile_err;
+	[DS:HANDLE1] = AX;
+
+	DX = FILENAME0;
+	AH = 0x3f;
+	CX = 0x1c;
+	BX = [DS:HANDLE0];
+	PUSH(BX);
+	INT(0x21);
+	POP(BX);
+	if (CF != 0)
+		goto infile_err;
+	if (AX != 0x1c)
+		goto infile_err;
+	if ((unsigned) (short) [DS:FILENAME0] != 0x5a4d)
+		goto infile_err;
+	AX = 0x4200;
+	CX = 0;
+	DX = [DS:FILENAME0 + 0x0018];
+	PUSH(BX);
+	INT(0x21);
+	POP(BX);
+	if (CF != 0)
+		goto infile_err;
+	CX = [DS:FILENAME0 + 0x0006];
+	if ((unsigned) CX > 6144)
+		goto infile_err; /* リロケーション項目が多すぎる */
+	CX *= 4;
+	AH = 0x3f;
+	DX = FILEBUF;
+	PUSH(BX);
+	PUSH(CX);
+	INT(0x21);
+	POP(CX);
+	POP(BX);
+	if (CF != 0)
+		goto infile_err;
+	if (AX != CX)
+		goto infile_err;
+	AX = 0x4200;
+	DX = [DS:FILENAME0 + 0x0008];
+	CX = 0;
+	DX *= 16;
+	PUSH(BX);
+	INT(0x21);
+	POP(BX);
+	if (CF != 0)
+		goto infile_err;
+	BP = 0;
+	for (;;) {
+		AH = 0x3f;
+		BX = [DS:HANDLE0];
+		CX = 16 * 1024;
+		DX = FILEBUF + 0x6000;
+		PUSH(BP);
+		INT(0x21);
+		POP(BP);
+		if (CF != 0)
+			goto infile_err;
+		if (AX == 0)
+			goto exit0;
+		PUSH(AX);
+		CX = [DS:FILENAME0 + 0x0006];
+		if (CX != 0) {
+			SI = FILEBUF;
+			do {
+				LODSW();
+				XCHG(AX, DI);
+				LODSW();
+				DX = DI;
+				DI &= 0x0f;
+				(unsigned short) DX /= 16;
+				AX += DX;
+				AX -= BP;
+				if ((unsigned) >= 0) {
+					if ((unsigned) AX < 2048) {
+						AX *= 16;
+						DI += AX;
+						asmout("MOV AX,[dat.size]");
+						[DS:DI + FILEBUF + 0x6000] += AX;
+					}
+				}
+				CX--;
+			} while (!= 0);
+		}
+		POP(CX);
+		AH = 0x40;
+		BX = [DS:HANDLE1];
+		DX = FILEBUF + 0x6000;
+		PUSH(BP);
+		PUSH(CX);
+		INT(0x21);
+		POP(CX);
+		POP(BP);
+		if (CF != 0)
+			goto outfile_err;
+		if (AX != CX)
+			goto outfile_err;
+		BP += 1024; /* 16KBは1024パラグラフ */
+	}
+
+cmd_release:
+	get_param1();
+	asmout("JNZ get_param0.err");
+	DX = FILENAME0;
+	AX = 0x3d00;
+	INT(0x21);
+	if (CF != 0)
+		goto infile_err;
+	[DS:HANDLE0] = AX;
+	BX = AX;
+
+	AX = 0x4202;
+	DX = 0;
+	CX = 0;
+	PUSH(BX);
+	INT(0x21);
+	POP(BX);
+	if (CF != 0)
+		goto infile_err;
+
+	if ((unsigned) DX < 5) /* 0x50000 (320KB) */
+		goto infile_err; /* ファイルが小さすぎて意味ない */
+	/* これをセクタ数に変換（＝512で割る） */
+	AL = AH;
+	AH = DL;
+	DL = DH;
+	DH = 0;
+	SHR(DX, 1);
+	RCR(AX, 1);
+	[DS:SECTORS + 0] = AX; /* 32MB以上はありえない */
+	[DS:SECTORS + 2] = DX;
+
+	AX = 0x4200;
+	DX = 0;
+	CX = 0;
+	INT(0x21);
+	if (CF != 0)
+		goto infile_err;
+
+	read32k();
+	if (CF != 0)
+		goto infile_err;
+
+	/* KHBIOSでSF16であることを確認 */
+	AX = 0;
+	if ((unsigned) (short) [DS:FILEBUF + 0x0040] != 0x4653) /* SF */
+		goto infile_err;
+	if ((unsigned) (short) [DS:FILEBUF + 0x0042] != 0x3631) /* 16 */
+		goto infile_err;
+	if ((unsigned) (short) [DS:FILEBUF + 0x01f0] != 0x0030)
+		goto infile_err;
+	if ((unsigned) (short) [DS:FILEBUF + 0x01f2] != AX)
+		goto infile_err;
+	if ((unsigned) (short) [DS:FILEBUF + 0x01f4] != AX)
+		goto infile_err;
+	if ((unsigned) (short) [DS:FILEBUF + 0x01f6] != AX)
+		goto infile_err;
+	if ((unsigned) (short) [DS:FILEBUF + 0x01f8] != 0x484b) /* KH */
+		goto infile_err;
+	if ((unsigned) (short) [DS:FILEBUF + 0x01fa] != 0x3042) /* B0 */
+		goto infile_err;
+	if ((unsigned) (short) [DS:FILEBUF + 0x01fc] != 0x0009)
+		goto infile_err;
+
+	SI = FILEBUF + 0x6000;
+	if ((unsigned) (short) [DS:SI +   0] != 0x2000)
+		goto infile_err;
+	if ((unsigned) (short) [DS:SI +   2] != AX)
+		goto infile_err;
+	if ((unsigned) (short) [DS:SI +   4] != 0x2000)
+		goto infile_err;
+	if ((unsigned) (short) [DS:SI +   6] != AX)
+		goto infile_err;
+	if ((unsigned) (short) [DS:SI +   8] != 0x484b)
+		goto infile_err;
+	if ((unsigned) (short) [DS:SI +  10] != 0x4942)
+		goto infile_err;
+	if ((unsigned) (short) [DS:SI +  12] != 0x534f)
+		goto infile_err;
+	if ((unsigned) (short) [DS:SI +  14] != 0x3030)
+		goto infile_err;
+	if ((unsigned) (char)  [DS:SI +  19] != 0x09)
+		goto infile_err;
+	if ((unsigned) (short) [DS:SI +  48] != 0x0030)
+		goto infile_err;
+	if ((unsigned) (short) [DS:SI +  50] != AX)
+		goto infile_err;
+	if ((unsigned) (short) [DS:SI +  52] != 0x0800)
+		goto infile_err;
+	if ((unsigned) (short) [DS:SI +  54] != AX)
+		goto infile_err;
+	if ((unsigned) (char)  [DS:SI +  99] != 0x09)
+		goto infile_err;
+	if ((unsigned) (short) [DS:SI + 100] != 0x0200)
+		goto infile_err;
+	if ((unsigned) (short) [DS:SI + 102] != AX)
+		goto infile_err;
+
+	SI = FILEBUF + 0x6200;
+	if ((unsigned) (short) [DS:SI +   0] == AX) {
+		if ((unsigned) (short) [DS:SI +   2] == AX)
+			goto infile_err;
+	}
+	if ((unsigned) (char)  [DS:SI +   5] != 0x09)
+		goto infile_err;
+	if ((unsigned) (short) [DS:SI +   6] != 0x0909)
+		goto infile_err;
+	if ((unsigned) (short) [DS:SI +  48] != 0x0020)
+		goto infile_err;
+	if ((unsigned) (short) [DS:SI +  50] != AX)
+		goto infile_err;
+	SI = FILEBUF + 0x6800;
+	if ((unsigned) (short) [DS:SI +   0] == AX) {
+		if ((unsigned) (short) [DS:SI +   2] == AX)
+			goto infile_err;
+	}
+	if ((unsigned) (char)  [DS:SI +   5] != 0x09)
+		goto infile_err;
+	if ((unsigned) (short) [DS:SI +   6] != 0x0909)
+		goto infile_err;
+	if ((unsigned) (short) [DS:SI +  48] != 0x0020)
+		goto infile_err;
+	if ((unsigned) (short) [DS:SI +  50] != AX)
+		goto infile_err;
+	SI = FILEBUF + 0x6880;
+	do {
+		if ((unsigned) (short) [DS:SI + 0] != AX)
+			goto infile_err;
+		if ((unsigned) (short) [DS:SI + 2] != AX)
+			goto infile_err;
+		SI += 128;
+	} while ((unsigned) SI < FILEBUF + 0x8000);
+
+	/* BPBの解析 */
+	SI = FILEBUF;
+	AX = [DS:SI + 68];
+	[DS:LBA] = AX; /* fat limit */
+	AL = [DS:SI + 13];
+	AH = 0;
+	[DS:HANDLE1] = AX;
+
+	/* FATの解析 */
+	read32k();
+	if (CF != 0)
+		goto infile_err;
+
+	CX = 2;
+	SI = FILEBUF + 4;
+	(short) [DS:LBA + 2] = 1;
+	do {
+		if ((unsigned) CX < [DS:LBA]) {
+			if ((unsigned) (short) [DS:SI] != 0)
+				[DS:LBA + 2] = CX;
+		}
+		SI += 2;
+		CX++;
+	} while ((unsigned) SI < FILEBUF + 0x8000);
+
+	if ((unsigned) (short) [DS:LBA] >= 0x4000) {
+		read32k();
+		if (CF != 0)
+			goto infile_err;
+		CX = 0x4000;
+		SI = FILEBUF;
+		do {
+			if ((unsigned) CX < [DS:LBA]) {
+				if ((unsigned) (short) [DS:SI] != 0)
+					[DS:LBA + 2] = CX;
+			}
+			SI += 2;
+			CX++;
+		} while ((unsigned) SI < FILEBUF + 0x8000);
+	}
+
+	if ((unsigned) (short) [DS:LBA] >= 0x8000) {
+		read32k();
+		if (CF != 0)
+			goto infile_err;
+		CX = 0x8000;
+		SI = FILEBUF;
+		do {
+			if ((unsigned) CX < [DS:LBA]) {
+				if ((unsigned) (short) [DS:SI] != 0)
+					[DS:LBA + 2] = CX;
+			}
+			SI += 2;
+			CX++;
+		} while ((unsigned) SI < FILEBUF + 0x8000);
+	}
+
+	if ((unsigned) (short) [DS:LBA] >= 0xc000) {
+		read32k();
+		if (CF != 0)
+			goto infile_err;
+		CX = 0xc000;
+		SI = FILEBUF;
+		do {
+			if ((unsigned) CX < [DS:LBA]) {
+				if ((unsigned) (short) [DS:SI] != 0)
+					[DS:LBA + 2] = CX;
+			}
+			SI += 2;
+			CX++;
+		} while ((unsigned) SI < FILEBUF + 0x8000);
+	}
+
+	/* これで[LBA+2]までが使用中だと判明 */
+	/* 新リミットは[LBA+2]+1になる */
+	AX = [DS:LBA + 2];
+	AX--;
+	MUL((short) [DS:HANDLE1]);
+	AX += 0x280;
+	ADC(DX, 0);
+	CX = [DS:SECTORS + 2];
+	CMP([DS:SECTORS + 0], AX);
+	SBB(CX, DX);
+	if ((unsigned) < 0)
+		goto size_err;
+	[DS:SECTORS + 0] = AX;
+	[DS:SECTORS + 2] = DX;
+
+	/* 加工して出力 */
+	AX = 0x4200;
+	DX = 0x0000;
+	CX = 0;
+	INT(0x21);
+	if (CF != 0)
+		goto infile_err;
+
+	DX = FILENAME1;
+	CX = 0;
+	AH = 0x3c;
+	INT(0x21);
+	if (CF != 0)
+		goto outfile_err;
+	[DS:HANDLE1] = AX;
+
+	/* 新サイズ反映 */
+	read32k();
+	if (CF != 0)
+		goto infile_err;
+
+	SI = FILEBUF;
+	AX = [DS:SECTORS + 0];
+	DX = [DS:SECTORS + 2];
+	CX = [DS:LBA + 2];
+	CX++;
+	(char) [DS:SI + 19] = 0;
+	(char) [DS:SI + 20] = 0;
+	if ((unsigned) DX == 0) {
+		(char) [DS:SI + 19] = AL;
+		(char) [DS:SI + 20] = AH;
+	}
+	[DS:SI + 0x20] = AX;
+	[DS:SI + 0x22] = DX;
+	[DS:SI + 0x44] = CX;
+	[DS:SI + 0x48] = AX;
+	[DS:SI + 0x4a] = DX;
+
+	SI = FILEBUF + 0x6000;
+	[DS:SI +  32] = AX;
+	[DS:SI +  34] = DX;
+	[DS:SI + 112] = AX;
+	[DS:SI + 114] = DX;
+	[DS:FILEBUF + 0x6850] = AX;
+	[DS:FILEBUF + 0x6852] = DX;
+	[DS:FILEBUF + 0x6860] = AX;
+	[DS:FILEBUF + 0x6862] = DX;
+
+	write32k();
+	if (CF != 0)
+		goto outfile_err;
+
+	/* FATクリア */
+	comp_sub0();
+	comp_sub0();
+
+	(short) [DS:SECTORS + 0] -= 576; /* 64Kセクタ以上はないと仮定できる */
+//	SBB((short) [DS:SECTORS + 2], 0);
+	if ((unsigned) (short) [DS:SECTORS] >= 64) {
+		do {
+			read32k();
+			if (CF != 0)
+				goto infile_err;
+			write32k();
+			if (CF != 0)
+				goto outfile_err;
+			(short) [DS:SECTORS] -= 64;
+		} while ((unsigned) (short) [DS:SECTORS] >= 64);
+	}
+	if ((unsigned) (short) [DS:SECTORS] > 0) {
+		BX = [DS:HANDLE0];
+		AH = 0x3f;
+		CX = [DS:SECTORS];
+		DX = FILEBUF;
+		CX *= 512;
+		PUSH(CX);
+		INT(0x21);
+		POP(CX);
+		if (CF != 0)
+			goto infile_err;
+		if (AX != CX)
+			goto infile_err;
+
+		BX = [DS:HANDLE1];
+		AH = 0x40;
+		DX = FILEBUF;
+		PUSH(CX);
+		INT(0x21);
+		POP(CX);
+		if (CF != 0)
+			goto outfile_err;
+		if (AX != CX)
+			goto outfile_err;
+	}
+	AX = 0x4c00;
+	INT(0x21);
+
+size_err:
+	asmout("MOV SI,dat.size_msg");
+	goto msgout;
+
+cmd_format:
+	format_sub0();
+format2:
+	/* BPB補正 */
+	MUL(CX);
+	AX += 640;
+	ADC(DX, 0);
+	if (DX == 0) {
+		(char) [DS:SI + 0x13] = AL;
+		(char) [DS:SI + 0x14] = AH;
+	}
+	[DS:SI + 0x20] = AX;
+	[DS:SI + 0x22] = DX;
+
+	AL = [DS:SI + 0x0c];
+	asmout("MOV [dat.seclen+1],AL");
+	AX = [DS:SECTORS + 0]; /* 32MB以上はありえない */
+	AX -= 64;
+	asmout("MOV WORD [dat.size],AX");
+	asmout("MOV WORD [dat.clulen],32*1024");
+
+	DX = 0;
+	drvwrite32k(); /* エラー処理付き */
+	goto writeloop;
+
+cmd_fake:
+	format_sub0();
+	if ((unsigned) AX > 0xff5)
+		goto format2;
+
+	/* BPB補正 */
+	[DS:TEMP] = AX;
+	AX = 0xffee;
+	MUL(CX);
+	AX += 640;
+	ADC(DX, 0);
+	if (DX == 0) {
+		(char) [DS:SI + 0x13] = AL;
+		(char) [DS:SI + 0x14] = AH;
+	}
+	[DS:SI + 0x20] = AX;
+	[DS:SI + 0x22] = DX;
+
+	AL = [DS:SI + 0x0c];
+	asmout("MOV [dat.seclen+1],AL");
+	AX = [DS:SECTORS + 0]; /* 32MB以上はありえない */
+	AX -= 576;
+	asmout("MOV WORD [dat.size],AX");
+	asmout("MOV WORD [dat.clulen],32*1024");
+
+	DX = 0;
+	drvwrite32k(); /* エラー処理付き */
+
+	/* 128KBx2のFATを加工 */
+	fake_fat();
+	fake_fat();
+	goto writeloop;
+}
+
+void get_param0()
+{
+	LODSB();
+	if ((unsigned) AL > 0x20)
+		goto err;
+	skipspace();
+
+	if (AL == 0x2d) {
+		LODSB();
+		get_numdec();
+		asmout("MOV [dat.seclen],CX");
+		if ((unsigned) CX < 512)
+			goto err;
+	}
+
+	if ((unsigned) AL >= 0x60)
+		AL -= 0x20;
+	AL -= 0x41;
+	if ((unsigned) < 0)
+		goto err;
+	if ((unsigned) AL >= 26)
+		goto err;
+	[DS:DRIVE] = AL;
+	LODSB();
+	if (AL != 0x3a)
+		goto err;
+	LODSB();
+	if ((unsigned) AL > 0x20)
+		goto err;
+	skipspace();
+
+param01:
+	DI = FILENAME1;
+	get_filename();
+
+	if ((unsigned) AL >= 0x30) {
+		if ((unsigned) AL <= 0x39) {
+			get_numdec();
+			ROL(CX, 1);
+			asmout("MOV [dat.size],CX");
+		}
+	}
+
+	if (AL != 0x0d)
+		goto err;
+
+	asmout("CMP WORD [dat.size],0xffff");
+	return;
+
+err:
+	asmout("MOV SI,dat.cmdlin_msg");
+	asmout("JMP main.msgout");
+}
+
+void get_filename()
+{
+	CMP(AL, 0x20);
+	asmout("JBE get_param0.err");
+	do {
+		STOSB();
+		LODSB();
+	} while ((unsigned) AL > 0x20);
+	(char) [DS:DI] = 0;
+//	skipspace();
+//	return;
+}
+
+void skipspace()
+{
+	if ((unsigned) AL <= 0x20) {
+		do {
+			if (AL == 0x0d)
+				break;
+			LODSB();
+		} while ((unsigned) AL <= 0x20);
+	}
+	return;
+}
+
+void get_param1()
+{
+	LODSB();
+	CMP(AL, 0x20);
+	asmout("JA get_param0.err");
+	skipspace();
+
+	DI = FILENAME0;
+	get_filename();
+
+	asmout("JMP get_param0.param01");
+}
+
+void get_numdec()
+{
+	CX = 0;
+	for (;;) {
+		if (AL < 0x30)
+			break;
+		if (AL > 0x39)
+			break;
+		AX &= 0x0f;
+		IMUL(CX, 10);
+		CX += AX;
+		LODSB();
+	}
+	CMP(AL, 0x20);
+	asmout("JA get_param0.err");
+//	skipspace();
+//	return;
+	asmout("JMP skipspace");
+}
+
+void fix_seclen()
+{
+	asmout("MOV SI,dat.clulen");
+	AX = [DS:SI + 0];
+	if (AX == 512) {
+		(short) [DS:SI + 0] = 512 * 72;
+		(short) [DS:SI + 2] = AX;
+	}
+	if (AX == 1024) {
+		(short) [DS:SI + 0] = 1024 * 32;
+		(short) [DS:SI + 2] = AX;
+	}
+	return;
+}
+
+void read32k()
+{
+	CX = 32 * 1024;
+	DX = FILEBUF;
+	BX = [DS:HANDLE0];
+	AH = 0x3f;
+	PUSH(CX);
+	INT(0x21);
+	POP(CX);
+	if (CF == 0)
+		CMP(AX, CX);
+	return;
+}
+
+void write32k()
+{
+	CX = 32 * 1024;
+	DX = FILEBUF;
+	BX = [DS:HANDLE1];
+	AH = 0x40;
+	PUSH(CX);
+	INT(0x21);
+	POP(CX);
+	if (CF != 0)
+		CMP(AX, CX);
+	return;
+}
+
+void comp_sub0()
+{
+	read32k();
+	if (CF != 0)
+		goto infile_err;
+	SI = [DS:LBA + 2];
+	SI++;
+	if ((unsigned) SI < 0x4000) {
+		SI *= 2;
+		SI += FILEBUF;
+		do {
+			(short) [DS:SI] = 0;
+			SI += 2;
+		} while ((unsigned) SI < FILEBUF + 0x8000);
+	}
+	write32k();
+	if (CF != 0)
+		goto outfile_err;
+
+	read32k();
+	if (CF != 0)
+		goto infile_err;
+	SI = [DS:LBA + 2];
+	SI++;
+	if ((unsigned) SI < 0x8000) {
+		SI -= 0x4000;
+		if ((unsigned) < 0)
+			SI = 0;
+		SI *= 2;
+		SI += FILEBUF;
+		do {
+			(short) [DS:SI] = 0;
+			SI += 2;
+		} while ((unsigned) SI < FILEBUF + 0x8000);
+	}
+	write32k();
+	if (CF != 0)
+		goto outfile_err;
+
+	read32k();
+	if (CF != 0)
+		goto infile_err;
+	SI = [DS:LBA + 2];
+	SI++;
+	if ((unsigned) SI < 0xc000) {
+		SI -= 0x8000;
+		if ((unsigned) < 0)
+			SI = 0;
+		SI *= 2;
+		SI += FILEBUF;
+		do {
+			(short) [DS:SI] = 0;
+			SI += 2;
+		} while ((unsigned) SI < FILEBUF + 0x8000);
+	}
+	write32k();
+	if (CF != 0)
+		goto outfile_err;
+
+	read32k();
+	if (CF != 0)
+		goto infile_err;
+	SI = [DS:LBA + 2];
+	SI++;
+//	if ((unsigned) SI < 0x10000) {
+		SI -= 0xc000;
+		if ((unsigned) < 0)
+			SI = 0;
+		SI *= 2;
+		SI += FILEBUF;
+		do {
+			(short) [DS:SI] = 0;
+			SI += 2;
+		} while ((unsigned) SI < FILEBUF + 0x8000);
+//	}
+	write32k();
+	if (CF != 0)
+		goto outfile_err;
+
+	return;
+
+outfile_err:
+	asmout("JMP main.outfile_err");
+
+infile_err:
+	asmout("JMP main.infile_err");
+}
+
+void format_sub0()
+{
+	get_param0();
+	asmout("JNZ get_param0.err");
+
+	AL = [DS:DRIVE];
+	CX = 1; /* 1セクタリード */
+	DX = 0;
+	BX = FILEBUF + 32 * 1024;
+	INT(0x25);
+	POP(AX);
+	if (CF != 0)
+		goto drive_err;
+
+	DX = FILENAME1;
+	AX = 0x3d00;
+	INT(0x21);
+	if (CF != 0)
+		goto file_err;
+	[DS:HANDLE0] = AX; /* read32kをつかうため */
+	[DS:HANDLE1] = AX; /* writeloopをつかうため */
+	BX = AX;
+	AX = 0x4202;
+	DX = 0;
+	CX = 0;
+	INT(0x21);
+	if (CF != 0)
+		goto file_err;
+	if ((unsigned) DX < 5) /* 0x50000 (320KB) */
+		goto file_err; /* ファイルが小さすぎて意味ない */
+	/* これをセクタ数に変換（＝512で割る） */
+	AL = AH;
+	AH = DL;
+	DL = DH;
+	DH = 0;
+	SHR(DX, 1);
+	RCR(AX, 1);
+
+	[DS:SECTORS + 0] = AX; /* 32MB以上はありえない */
+	[DS:SECTORS + 2] = DX;
+	SI = FILEBUF + 0x8000;
+	if ((unsigned) (short) [DS:SI + 0x40] == 0x4653) {
+		if ((unsigned) (short) [DS:SI + 0x42] == 0x3631) {
+			AX = [DS:SI + 0x48];
+			DX = [DS:SI + 0x4a];
+			goto skip0;
+		}
+	}
+	AL = [DS:SI + 0x13];
+	AH = [DS:SI + 0x14];
+	DX = 0;
+	if (AX == 0) {
+		AX = [DS:SI + 0x20];
+		DX = [DS:SI + 0x22];
+	}
+	CL = [DS:SI + 0x0c];
+	(unsigned char) CL /= 4; /* 512バイトセクタなら0になる */
+	if (!= 0) {
+		do {
+			AX *= 2;
+			ADC(DX, DX);
+			(unsigned char) CL /= 2;
+		} while (!= 0);
+	}
+skip0:
+	if ((unsigned) DX >= 0x1000)
+		goto drive_err; /* ドライブがでかすぎて誤操作の可能性あり(2.0GBまで) */
+	[DS:TEMP + 0] = AX; /* パーティション総容量(512単位) */
+	[DS:TEMP + 2] = DX;
+	CMP(AX, [DS:SECTORS + 0]);
+	SBB(DX, [DS:SECTORS + 2]);
+	if ((unsigned) < 0)
+		goto drive_err; /* 容量が足りない */
+	BX = [DS:HANDLE0]; /* writeloopをつかうため */
+	AX = 0x4200;
+	DX = 0;
+	CX = 0;
+	INT(0x21);
+	if (CF != 0)
+		goto file_err;
+
+	read32k();
+	if (CF != 0)
+		goto file_err;
+	SI = FILEBUF;
+	BX = FILEBUF + 0x8000;
+	if ((unsigned) (short) [DS:SI + 0x40] != 0x4653) /* SF */
+		goto file_err;
+	if ((unsigned) (short) [DS:SI + 0x42] != 0x3631) /* 16 */
+		goto file_err;
+
+	AX = [DS:TEMP + 0]; /* パーティション総容量(512単位) */
+	DX = [DS:TEMP + 2];
+	[DS:SI + 0x48] = AX;
+	[DS:SI + 0x4a] = DX;
+	[DS:FILEBUF + 0x6020] = AX; /* デバイス総容量（一応） */
+	[DS:FILEBUF + 0x6022] = DX;
+	[DS:FILEBUF + 0x6850] = AX; /* usesiz */
+	[DS:FILEBUF + 0x6852] = DX;
+	[DS:FILEBUF + 0x6860] = AX; /* alcsiz */
+	[DS:FILEBUF + 0x6862] = DX;
+
+	AX -= 640; /* ファイル領域として利用可能なセクタ数 */
+	SBB(DX, 0);
+	CL = [DS:SI + 0x0d]; /* クラスタサイズ */
+	CH = 0;
+	if (DX >= CX)
+		goto skip1; /* ffeeに確定 */
+	DIV(CX);
+	if ((unsigned) AX >= 0xffee) {
+skip1:
+		AX = 0xffee;
+	}
+	AX += 2;
+	[DS:SI + 0x44] = AX;
+	AL = [DS:BX + 0x0c]; /* セクタ長 */
+	[DS:SI + 0x0c] = AL;
+	(char) [DS:SI + 0x13] = 0;
+	(char) [DS:SI + 0x14] = 0;
+	AX = [DS:BX + 0x18]; /* 1トラックあたりのセクタ数 */
+	DX = [DS:BX + 0x1a]; /* 1シリンダあたりのヘッド数 */
+	[DS:SI + 0x18] = AX;
+	[DS:SI + 0x1a] = DX;
+	AX = [DS:BX + 0x1c]; /* LBA0 */
+	DX = [DS:BX + 0x1e];
+	[DS:SI + 0x1c] = AX;
+	[DS:SI + 0x1e] = DX;
+
+	/* KHBIOS情報の補正 */
+	[DS:FILEBUF + 0x6870] = AX;
+	[DS:FILEBUF + 0x6872] = DX;
+
+	AX = [DS:SI + 0x44];
+	AX -= 2;
+//	CL = [DS:SI + 0x0d]; /* クラスタサイズ */
+//	CH = 0;
+	return;
+file_err:
+	asmout("JMP main.file_err");
+drive_err:
+	asmout("JMP main.drive_err");
+}
+
+void drvwrite32k()
+{
+	AX = 32 * 4; /* 32KB（256バイト単位） */
+	asmout("DIV BYTE [dat.seclen+1]");
+	CX = AX; /* あまりはでない */
+	AL = [DS:DRIVE];
+	BX = FILEBUF;
+	PUSH(DX);
+	PUSH(CX);
+	INT(0x26);
+	POP(AX);
+	POP(CX);
+	POP(DX);
+	asmout("JC format_sub0.drive_err");
+	DX += CX;
+	return;
+}
+
+void fake_fat()
+/* 実クラスタ数は0xff5以下 */
+{
+	PUSH(DX);
+	read32k();
+	POP(DX);
+	BX = [DS:TEMP];
+	/* fff7で埋める必要がある */
+	BX += 2;
+	AX = 0xfff7;
+	BX *= 2;
+	BX += FILEBUF;
+	do {
+		[DS:BX] = AX;
+		BX += 2;
+	} while ((unsigned) BX < FILEBUF + 0x8000);
+
+	drvwrite32k(); /* エラー処理付き */
+
+	PUSH(DX);
+	read32k();
+	read32k();
+	read32k();
+	POP(DX);
+	AX = 0xfff7;
+	BX = FILEBUF;
+	do {
+		[DS:BX] = AX;
+		BX += 2;
+	} while ((unsigned) BX < FILEBUF + 0x8000);
+
+	drvwrite32k(); /* エラー処理付き */
+	drvwrite32k(); /* エラー処理付き */
+//	drvwrite32k(); /* エラー処理付き */
+//	return;
+	asmout("JMP drvwrite32k");
+}
+
+void dat()
+{
+usage:
+	DB(1);
+	asmout("DB 'read.   >imgtol r [opt] drive: filename  size  (drv -> file)',0x0d,0x0a");
+	asmout("DB 'write.  >imgtol w [opt] drive: filename [size] (file -> drv)',0x0d,0x0a");
+	asmout("DB 'exp-w.f.>imgtol f [opt] drive: filename (file -> drv)',0x0d,0x0a");
+	asmout("DB 'exp-w.  >imgtol F [opt] drive: filename (file -> drv)',0x0d,0x0a");
+	asmout("DB 'ovrcopy.>imgtol c inputfile outputfile  [size]',0x0d,0x0a");
+	asmout("DB 'expand. >imgtol e inputfile outputfile   size',0x0d,0x0a");
+	asmout("DB 'release.>imgtol R sourceimage compedimage',0x0d,0x0a");
+	asmout("DB 'exe2sys.>imgtol s inputfile outputfile base(dec)',0x0d,0x0a");
+//	asmout("DB 'drvinfo.>imgtol i drive:',0x0d,0x0a");
+	asmout("DB '  opt(sector-bytes) = -512(default), -1024',0x0d,0x0a");
+	asmout("DB '  size unit : kilobyte',0x0d,0x0a,'$'");
+
+cmdlin_msg:
+	asmout("DB 2,'command line error!',0x0d,0x0a,'$'");
+
+file_msg:
+	asmout("DB 3,'file error!',0x0d,0x0a,'$'");
+
+drive_msg:
+	asmout("DB 4,'drive error!',0x0d,0x0a,'$'");
+
+infile_msg:
+	asmout("DB 5,'inputfile error!',0x0d,0x0a,'$'");
+
+outfile_msg:
+	asmout("DB 6,'outputfile error!',0x0d,0x0a,'$'");
+
+size_msg:
+	asmout("DB 7,'volume size error!',0x0d,0x0a,'$'");
+
+	ALIGNB(2);
+size:		DW(0xffff);
+clulen:		DW(512);
+seclen:		DW(512);
+}

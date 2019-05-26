@@ -1,0 +1,17 @@
+# linker options for pokon0
+
+STK_PK_AT = 1m
+STK_PK_TW = 1m
+STK_PK_NE = 1m
+
+MLC_PK_AT = 90k
+MLC_PK_TW = 90k
+MLC_PK_NE = 90k
+
+MMA_PK_AT = 4096k
+MMA_PK_TW = 4096k
+MMA_PK_NE = 4096k
+
+BIM_PK_AT = -tek5 eopt:-fb106 eprm:z1
+BIM_PK_TW = -tek5 eopt:-fb88  eprm:z1
+BIM_PK_NE = -tek5 eopt:-fb88  eprm:z1

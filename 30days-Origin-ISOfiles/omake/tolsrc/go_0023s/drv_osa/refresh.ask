@@ -1,0 +1,24 @@
+segment CODE(USE32, PARA);
+default(code == CODE);
+
+asmout("[FILE 'refresh.ask']");
+asmout("GLOBAL _refresh_static_sub");
+
+/* void refresh_static_sub(); */
+
+void _refresh_static_sub()
+{
+	PUSHAD();
+	EDI = (int) [CS:0x20]; /* extract static data begin */
+	PUSH(-1);
+	PUSH(CS);
+	PUSH((int) [CS:0x2c]); /* compressed data begin */
+	PUSH((int) [CS:0x24]); /* bytes */
+	PUSH(0xffffff82);
+	PUSH(0x0004);
+	EBX = ESP;
+	CALL(0xc7, 0);
+	ESP += 24;
+	POPAD();
+	return;
+}

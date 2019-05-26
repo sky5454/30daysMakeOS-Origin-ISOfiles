@@ -1,0 +1,1832 @@
+// "tapi0.ask" ver.0.4 copyright(C) 2002 H.Kawai(川合秀実)
+
+/* "for DEBUG"を検索すれば、デバッグのために追加された部分を見つけられる */
+
+#include "osaskinc.ask"
+
+segment CODE(USE32, PARA);
+default(code == CODE);
+
+struct TAPI_TSS386 {  // 全てTL-0
+	short BackLink, [2];
+	int stack0_ESP; short stack0_SS, [2];
+	int stack1_ESP; short stack1_SS, [2];
+	int stack2_ESP; short stack2_SS, [2];
+	int CR3;
+	int EIP;
+	int EFLAGS;
+	int EAX, ECX, EDX, EBX;
+	int ESP, EBP, ESI, EDI;
+	short ES, [2], CS, [2], SS, [2];
+	short DS, [2], FS, [2], GS, [2];
+	short LDTR, [2], TaskFlags, IOBitMap;
+	// 合計104bytes
+};
+
+struct TAPI_LlvPrm { // 32bytes
+	int run[12];
+	int Glv;
+	int short_run[12]; // 0x10～0x1b  0x1bが-1なら、invalid
+	int Ilv;
+};
+
+
+struct TAPI_TSS {
+	TAPI_TSS386 tss386;  // TL-0ブロック(104bytes)
+
+	// system-signal処理のブロック(24bytes)
+	int sysbox_write_free, sysbox_write_ptr, sysbox_write_ptr0, sysbox_write_ptr1;
+	int sysbox_read_ptr;
+	unsigned char msgbox_status, softint_nest, [2];
+		// bit0 : buffer write overrun
+		// bit6 : sysbox empty(0:empty)
+		// bit7 : msgbox empty(0:empty)
+
+	int set[12], tr[4], run[12], ldt_img; // TL-1ブロック(48bytes)
+	int fpu_reg_img, sse_reg_img /* for SSE & SSE2 */;
+//	TAPI_TSS near *back, near *next;
+	int back, next;
+
+	int softint_EIP /* +0x00b0 */; short softint_CS; // signal処理のブロック(48bytes)
+	short softint_oldCS;
+	int softint_oldEIP;
+	unsigned char softint_Llv, sysint_Llv /* このフィールドは使わない。softintと共通 */, now_Llv, softint_oldLlv;
+	int msgbox_write_free, msgbox_write_ptr, msgbox_write_ptr0, msgbox_write_ptr1;
+	int msgbox_eom_code, msgbox_rewind_code, [8];
+
+//	softint_oldLlvは、スタックにつむと0xffに変化する...で、0xffのときに、ストアされる
+//	softint_CS == 0のとき、CS:EIPの変化無し
+//	softint_Llv == 0のとき、Llvの変化無し
+
+// TL-2ブロック 32bytes
+//	GlvPrm near *Glv /* +0x00e0 */; // TapiWorkSelの中のオフセット
+//	LlvPrm near *Llv; // TapiWorkSelの中のオフセット
+	int Glv, Llv; // 0xe0～0xe7
+	int Ilv, Llv_base; // Inner-level
+	int short_run[12]; // +0x00f0
+	char flags, [3];  // Setの再評価要求フラグ
+
+
+// このタスクの全実行時間は、runではない。runは、現在のLlvのrunningタイムを示しているに過ぎない。
+// 現在のLlvのLlvPrm.runは無効。
+
+};
+
+
+struct TAPI_WORK {
+	int TskStart[12];              // (TL-1)タスクがスタートした時刻
+	/* TAPI_TSS near * */ int TskPointer;   // (TL-1)現在走行中のタスクのポインタ
+
+	int GlvStart[12];              // (TL-2)現在のGlvがスタートした時刻
+	// TAPI_GlvPrm near *GlvNow;    // (TL-2)現在走行中のGlv
+	int GlvNow;
+//	int TskTimerMin[12];
+	char TskTimerMode; // == 0 : 1タスクで独占。タイマー未使用。
+	void [3];
+	int taskFPU, [8]; /* taskFPUは0x0024 */
+
+//	void (far *TimerSysCmd)(); 関数へのポインタ(far)
+	int TimerSysCmd[8]; // +0x30
+//	int *TimerNodeTimePtr; // タイマーフィールドのfarptr
+	int TimerNodeTimePtr[8];  // +0x38
+	int TimerCommand_Regist; // == 04 * 4; +0x40
+	int TimerNode1;
+	int TimerCommand_EOC1;
+	int TimerCommand_Cancel; // == 05 * 4; +0x4c
+	int TimerNode2;
+	int TimerCommand_EOC2;
+	int TimerCommand_GetTime; // == 06 * 4; +0x58
+	int NowTimeCT[12]; // +0x5c
+	int TimerCommand_EOC3; // == 00 * 4;	// 以上 (TL-2)
+
+	// グローバルレベルは、0x100～0x800。１つ当たり0x40バイト(計28レベル)
+	// とりあえず、使うのは３つ。0x200, 0x400, 0x7c0(sleep)
+
+
+};
+
+struct TAPI_GlvPrm { // 計64bytes
+	int run[12];
+//	struct Tss near *Pointer;
+	int pointer;
+	int totalIlv; // +0x10
+	int tasks;
+	// bit0:Ilv変更フラグ(0で変更あり)、bit1:時分割抑制フラグ(1で抑制)。
+	int MinIlv, MaxIlv;
+	char flags; // フラグによっては、Ilvを考慮しない。
+	void [31];
+};
+
+void near TapiFixOn();
+void near TapiFixTsk();
+void near TapiChgLlv();
+void near TapiRemoveTsk();
+void near TapiAddTsk();
+void near TapiChangeTsk();
+
+void near TAPI_Init();
+void near TAPI_init_tssinit();
+void near TAPI_AddNestSleep();
+void near TAPI_SignalMessage();
+void near TAPI_SignalMessage2();
+void near TAPI_Softint1Ret();
+
+void far TAPI_syscmd()
+// TAPIコマンド受け付け
+// これは、かならずlv0から呼ばれる
+{
+	unsigned int Init_sel     ==  2 * 8, TAPI_sel   == 12 * 8;
+	int *cmd == FS:EBX;
+
+	// なお、send_messageへのポインタは、このコマンドで質問してくれれば、教えます。
+
+	PUSHAD();
+	MOV(EAX, CS);
+	PUSH(DS);
+	EAX += 8;
+	DS = AX;
+nextcmd:
+	EAX = *cmd;
+	if (EAX == 0)
+		goto cmd00;
+	if (EAX == 0x0114)
+		goto cmd0114; // コマンドシグナル
+	if (EAX == 0x0118)
+		goto cmd0118; // コマンドシグナル間接
+	if (EAX == 0x0128)
+		goto cmd0128; // コマンドシグナル2(with wait)
+	if (EAX == 0x012c)
+		goto cmd012c; // コマンドシグナル2(with wait)間接
+	if (EAX == 0x010c)
+		goto cmd010c; // AddNestSleep
+	if (EAX == 0x0124)
+		goto cmd0124; // TAPI_Softint1Ret
+	if (EAX == 0x0100)
+		goto cmd100; // Llv変更
+	if (EAX == 0x0104)
+		goto cmd104; // タスク登録
+	if (EAX == 0x0110)
+		goto cmd0110; // DestoryTask
+	if (EAX == 0x011c)
+		goto cmd011c; // シグナル処理ルーチン通知
+	if (EAX == 0x0108)
+		goto cmd0108; // TAPIの初期化
+	if (EAX == 0x0120)
+		goto cmd0120; // int07用のルーチン
+	if (EAX == 0x0130)
+		goto cmd0130;
+	if (EAX == 0x0018)
+		goto cmd0018; // バージョン要求
+
+	INT(0x03);
+
+cmd00:
+	POP(DS);
+	[SS:ESP + 16] = EBX;
+	POPAD();
+	return;
+
+cmd100:
+	/* 指定したタスクのローカルレベルを変更 */
+	TAPI_TSS *cmd100_tss == DS:ESI;
+	(offset) cmd100_tss = cmd[4];
+	EAX = cmd[8];
+	PUSHFD();
+	if (AL != cmd100_tss->now_Llv) {
+		EDI = EAX;
+		CLI();
+		PUSH((offset) cmd);
+		TapiChgLlv();
+		TapiFixTsk();
+		POP((offset) cmd);
+	}
+	(offset) cmd += 12;
+	POPFD();
+	goto nextcmd;
+
+cmd104:
+	// 指定したタスクを登録して、ローカルレベルをセット
+	TAPI_TSS *cmd104_tss == DS:ESI;
+	(offset) cmd104_tss = cmd[4];
+	EDI = cmd[8];
+	PUSHFD();
+	CLI();
+	PUSH((offset) cmd);
+	PUSH(EDI);
+
+	/* for DEBUG */
+//	TEST(ESI, 0xfff);
+//	if (!= 0)
+//		INT(0x03);
+
+	TapiAddTsk();
+	POP(EAX);
+	EDI = EAX;
+	if (AL != cmd104_tss->now_Llv) {
+		TapiChgLlv();
+		TapiFixTsk();
+	}
+	POP((offset) cmd);
+	POPFD();
+	(offset) cmd += 12;
+	goto nextcmd;
+
+cmd0108:
+	/* TAPIの初期化 */
+	PUSH((offset) cmd);
+	TAPI_Init();
+	POP((offset) cmd);
+	(offset) cmd += 4;
+	goto nextcmd;
+
+cmd010c:
+	// AddNestSleep
+	PUSH((offset) cmd);
+	AL = cmd[ 4];
+	ECX = cmd[ 8];
+	DL = cmd[ 5];
+	TAPI_AddNestSleep();
+	POP((offset) cmd);
+	(offset) cmd += 12;
+	goto nextcmd;
+
+cmd0110:
+	// TAPI_DestoryTask
+	PUSHFD();
+	PUSH((offset) cmd);
+	ESI = cmd[4];
+	CLI();
+	TapiRemoveTsk();
+	TapiFixTsk();
+	POP((offset) cmd);
+	POPFD();
+	(offset) cmd += 8;
+	goto nextcmd;
+
+cmd0114:
+	// コマンドシグナル
+	MOV(EAX, FS);
+	PUSH(ES);
+	ES = AX;
+	LEA(EBP, [(offset) cmd + 4]);
+	TAPI_SignalMessage();
+	POP(ES);
+	(offset) cmd = EBP;
+	goto nextcmd;
+
+cmd0118:
+	// コマンドシグナル間接
+	PUSH(ES);
+	PUSH((offset) cmd);
+//	LES(EBP, cmd[4]);
+	asmout("LES EBP,DWORD PTR FS:[EBX+4]");
+	TAPI_SignalMessage();
+	POP((offset) cmd);
+	POP(ES);
+	(offset) cmd += 12;
+	goto nextcmd;
+
+cmd011c:
+	// シグナル処理ルーチン通知
+	asmout("MOV DWORD PTR FS:[EBX+4],OFFSET TAPI_SignalMessageTimer");
+	cmd[8] = TAPI_sel;
+	(offset) cmd += 12;
+	goto nextcmd;
+
+cmd0120:
+	// int07処理ルーチン通知
+	asmout("MOV DWORD PTR FS:[EBX+4],OFFSET TAPI_INT07");
+	cmd[8] = TAPI_sel;
+	(offset) cmd += 12;
+	goto nextcmd;
+
+cmd0124:
+	// TAPI_Softint1Ret
+	ECX = cmd[4];
+	EAX = cmd[8];
+	TAPI_Softint1Ret();
+	(offset) cmd += 12;
+	goto nextcmd;
+
+cmd0018:
+	//バージョン情報
+	cmd[ 8] = 100;
+	cmd[12] = 0;
+	cmd[16] = 0;
+	cmd[20] = 0;
+	(offset) cmd += 24;
+	goto nextcmd;
+
+cmd0128:
+	// コマンドシグナル(with wait)
+	MOV(EAX, FS);
+	PUSH(ES);
+	ES = AX;
+	LEA(EBP, [(offset) cmd + 4]);
+	TAPI_SignalMessage2();
+	POP(ES);
+	(offset) cmd = EBP;
+	goto nextcmd;
+
+cmd012c:
+	// コマンドシグナル(with wait)間接
+	PUSH(ES);
+	PUSH((offset) cmd);
+//	LES(EBP, cmd[4]);
+	asmout("LES EBP,DWORD PTR FS:[EBX+4]");
+	TAPI_SignalMessage2();
+	POP((offset) cmd);
+	POP(ES);
+	(offset) cmd += 12;
+	goto nextcmd;
+
+cmd0130:
+	PUSH((offset) cmd);
+	PUSHFD();
+	CLI();
+	asmout("INC BYTE PTR SS:[0FFFFFFF0H]");
+	TapiChangeTsk();
+	TapiFixTsk();
+	(char) [SS:0xfffffff0]--;
+	/* ここは必ず0。そうじゃないなら、TapiChangeTskなんか呼ぶな */
+	asmout("CALL FAR DWORD PTR SS:[0FFFFFFF8H]"); /* DSおよびreg32を破壊 */
+	POPFD();
+	POP((offset) cmd);
+	(offset) cmd += 8;
+	goto nextcmd;
+}
+
+void near TAPI_Init()
+{
+	unsigned int Init_sel     ==  2 * 8, TAPI_sel   == 12 * 8;
+	unsigned int timerint_sel == 10 * 8, timerdata_sel == 11 * 8;
+	unsigned int tss386_0_sel == 14 * 8;
+	unsigned int tss386_1_sel == 16 * 8, stack1_sel == 17 * 8;
+	unsigned int tss386_2_sel == 18 * 8, stack2_sel == 19 * 8;
+	unsigned int tss386_3_sel == 20 * 8, stack3_sel == 21 * 8;
+	unsigned int tss386_4_sel == 24 * 8, stack4_sel == 25 * 8;
+	unsigned int tss386_5_sel == 26 * 8, stack5_sel == 27 * 8;
+
+	TAPI_TSS *tss0 == DS:0x0400, *tss1 == DS:0x0800, *tss2 == DS:0x0c00, *tss3 == DS:0x1000;
+	TAPI_TSS *tss4 == DS:0x1400, *tss5 == DS:0x1800;
+	TAPI_WORK *work == DS:0;
+	TAPI_GlvPrm *glevel0 == DS:0x100, *glevel1 == DS:0x200, *glevel_sleep == DS:0x7c0;
+
+	asmout("#work_TimerSysCmd EQU 030H");
+	asmout("#work_NowTimeCT EQU 05CH");
+//	asmout("#TS_short_run EQU 0F0H");
+
+//	PUSH(DS);
+	MOV(EAX, DS);
+
+	// 現在時刻、ノードを取得
+
+	EDI = 0;
+
+	work->taskFPU = EDI;
+
+	PUSH(FS);
+	FS = AX;
+	asmout("MOV DWORD PTR DS:[#work_TimerSysCmd+0],0 ; OFFSET TimerSysCmd");
+	asmout("MOV DWORD PTR DS:[#work_TimerSysCmd+4],10*8");
+
+	work->TimerNode2 = 2 * 4 /* GetNode */;
+	work->TimerCommand_GetTime = 6 * 4 /* SetNowTime */;
+	work->TimerCommand_EOC3 = EDI;
+//	/* EBX = &(work->TimerNode2) */ EBX = 0x0050;
+	LEA(EBX, work->TimerNode2);
+	asmout("CALL FAR DWORD PTR DS:[#work_TimerSysCmd]");
+	ESI = work->TimerCommand_EOC2;
+	work->TimerCommand_Regist = 4 * 4 /* SetTimer */;
+	work->TimerNode1 = ESI;
+	work->TimerCommand_EOC1 = EDI;
+	work->TimerCommand_Cancel = 5 * 4 /* CancelTimer */;
+	work->TimerNode2 = ESI;
+	work->TimerCommand_EOC2 = EDI;
+	ESI += 40; // これは少しずるい
+	asmout("MOV DWORD PTR DS:[38H],ESI");
+	asmout("MOV DWORD PTR DS:[3CH],11*8");
+	EAX = work->NowTimeCT[0];
+	ECX = work->NowTimeCT[4];
+	EDX = work->NowTimeCT[8];
+	work->TskStart[0] = EAX;
+	work->TskStart[4] = ECX;
+	work->TskStart[8] = EDX;
+	work->GlvStart[0] = EAX;
+	work->GlvStart[4] = ECX;
+	work->GlvStart[8] = EDX;
+	work->NowTimeCT[8] = EDI;
+
+	asmout("MOV FS,WORD PTR DS:[03CH]"); // TimerNodeTimePtr[4];
+	asmout("MOV DWORD PTR FS:[ESI-40+32+0],OFFSET TAPI_TskChgTimer");
+	asmout("MOV DWORD PTR FS:[ESI-40+32+4],12*8");
+
+	POP(FS);
+
+	TAPI_GlvPrm *glv == DS:ESI;
+
+	(offset) glv = 0x0100;
+//	EAX = 0;
+	ECX = 0x0800 / sizeof (TAPI_GlvPrm);
+	do {
+		glv->run[0] = EDI;
+		glv->run[4] = EDI;
+		glv->run[8] = EDI;
+		glv->tasks = EDI;
+		glv->totalIlv = EDI;
+		glv->flags = 3; // inner無効
+		ESI += sizeof (TAPI_GlvPrm);
+		ECX--;
+	} while (!= 0);
+
+//	work->TskPointer = EDI;
+//	work->GlvNow = EDI;
+	work->TskTimerMode = 0;
+
+//	glevel_sleep->run[0] = EDI;
+//	glevel_sleep->run[4] = EDI;
+//	glevel_sleep->run[8] = EDI;
+//	glevel_sleep->tasks = EDI;
+//	glevel_sleep->flags = 0x03; // inner無効
+//	glevel_sleep->pointer = EDI;
+
+	// スタック初期化
+//	EAX = 0xff80;
+//	/* (int) */ [SS:0xffffffe0] = EAX;
+//	/* (int) */ [SS:0xfffffff0] = EAX;
+	MOV(EAX, CS);
+	asmout("MOV DWORD PTR SS:[0FFFFFFE8H],OFFSET TAPI_SysCntZero");
+	(int) [SS:0xffffffec] = EAX;
+	asmout("MOV DWORD PTR SS:[0FFFFFFF8H],OFFSET TAPI_TskChgTimer2");
+	(int) [SS:0xfffffffc] = EAX;
+
+//	POP(DS);
+	return;
+}
+
+// ----------------------------------------------------------------- TAPI Layer-1
+//   第１層：ただチェーンをたどって、指定間隔でタスクを回していくだけ
+
+void far TAPI_TskChgTimer()    /* far-callで呼ばれる */
+/* このルーチンはTimerDriverから呼ばれる */
+{
+	TAPI_WORK *work == DS:0;
+	TAPI_TSS *NowTss == DS:EBX, *next == DS:EDI;
+
+	asmout("#work_NowTimeCT EQU 05CH");
+
+	MOV(EAX, CS);
+	PUSH(DS);
+	EAX += 8; DS = AX; /* DSのセット */
+
+	// タイムアウトbitを調べる。もし、既にタイムアウトしていれば、重複である。
+	// こうなるとぬけられないので、タイマーをキャンセルし、Fixを要求する。
+	// 強制的にTimeOut処理をしないのは、タスクチェンジ抑制モードに配慮しているためである。
+//	asmout("TEST BYTE PTR SS:[0FFFFFFF1H],01H");
+	TEST((char) [SS:0xfffffff1], 0x01);
+	(offset) NowTss  = work->TskPointer;
+	if (== 0)
+		goto dead_lock;
+
+	(offset) next = NowTss->next;
+	// Lv0Stack->IntCountFlags &= ~(On | TimeOut); // 指定ビットを0にする
+	(int) [SS:0xfffffff0] &= 0xfffffe7f;
+	EAX = next->set[0];
+	ECX = next->set[4];
+	EDX = next->set[8];
+	if ((unsigned) (char) next->short_run[11] == 0xff) {
+		POP(DS);
+		/* CF = 1 */ STC();    /* 連続起動モード */
+	//	asmout("CMP ESP,-1"); // ESPは-1より小さいから、CF = 1となる。
+		return;
+	} else {
+		EAX -= next->short_run[0];
+		SBB(ECX, next->short_run[4]);
+		SBB(EDX, next->short_run[8]);
+		// これがあまりにも小さいと、またすぐに割り込まれることになる。
+		// どうすれば、重複を避けられるか？
+		POP(DS);
+		/* CF = 1 */ STC();    /* 連続起動モード */
+	//	asmout("CMP ESP,-1"); // ESPは-1より小さいから、CF = 1となる。
+		return;
+	}
+
+dead_lock:
+	// short_run[11] == 0xffかどうかを調べて、別々に統計すべきかもしれない
+//	NowTss->dead_lock_count++;
+
+	work->TskTimerMode = 0;
+	TapiFixOn(); /* EAX～EBXを破壊 */
+	POP(DS); // tapiwork_sel
+	/* CF = 0 */ CLC();    /* 単発起動モード */
+	return;
+
+	// 時分割切り替えのためのタイマーをセットするときは、
+	// work->TskPointerと、それで示されるタスクtssのnextフィールド、
+	// tss->nextの中のsetフィードを有効にしておく必要がある。
+	// tss->nextのshort_runも更新しておくこと。
+	// tss->nextのshort_runが有効なら、setとshort_runの大小関係をチェックしないで、
+	// short_run < setを仮定するので、注意。
+}
+
+void far TAPI_TskChgTimer2()    /* これは、far-callで入ってくる */
+/*	DSおよび全汎用レジスタ破壊
+	IF == 0であること */
+{
+	TAPI_WORK *work == DS:0;
+	TAPI_TSS *now == DS:EBX, *next == DS:ESI;
+
+//	asmout("#TS_short_run EQU 0F0H");
+
+	(char) [SS:0xfffffff0] |= 0x80;
+	MOV(EAX, CS); EAX += 8; DS = AX; /* DSのセット */
+
+	// Fixチェック
+//	asmout("TEST BYTE PTR SS:[0FFFFFFF1H],02H");
+	TEST((char) [SS:0xfffffff1], 0x02);
+	if (== 0) {
+		asmout("CALL TAPI_FixMain"); // (near) call(FixMain);
+	}
+
+	// timeoutチェック
+//	asmout("TEST BYTE PTR SS:[0FFFFFFF1H],01H");
+	TEST((char) [SS:0xfffffff1], 0x01);
+	if (== 0) {
+		(offset) now = work->TskPointer;
+	//	Lv0Stack->IntCountFlags |= (On | TimeOut | Fix); // 指定ビットを1にする
+	//	EAX = now->set[0];
+	//	ECX = now->set[4];		now->run[0] += EAX;     /* 走行時間を更新 */
+	//	EDX = now->set[8];		now->run[4] += ECX + CF;
+	//	(offset) next = now->next;	now->run[8] += EDX + CF;
+	//	work->TskStart[0] += EAX;     /* 走行開始時刻を更新 */
+	//	work->TskPointer = next;
+	//	work->TskStart[4] += ECX + CF;
+	//	work->TskStart[8] += EDX + CF;
+		(int) [SS:0xfffffff0] |= 0x0380;
+		EAX = now->set[0];
+		ECX = now->set[4];
+		CMP((char) now->short_run[11], 0xff);
+	//	DL = 0xff; CMP((char) now->short_run[11], DL);
+		EDX = now->set[8];
+		/* (false) */ if (!=) {
+			EAX -= now->short_run[0];
+			SBB(ECX, now->short_run[4]);
+			SBB(EDX, now->short_run[8]);
+			(char) now->short_run[11] = 0xff;
+		}
+		now->run[0] += EAX;
+		ADC(now->run[4], ECX);		(offset) next = now->next;
+		ADC(now->run[8], EDX);
+		work->TskStart[0] += EAX;	work->TskPointer = (offset) next;
+		ADC(work->TskStart[4], ECX);
+		ADC(work->TskStart[8], EDX);
+		// goto *((void far *()) next->Tr[-4]);   /* タスク切り替え */
+		asmout("JMP FAR DWORD PTR DS:[ESI+128+8]");
+	}
+
+// ----------------------------------------------------------------- TAPI Layer-2
+/*
+	asmout("TEST BYTE PTR SS:[0FFFFFFF1H],04H");
+	if (== 0) {
+		TAPI_TSS *tss == DS:ESI;
+		(offset) tss = work->TskPointer;
+	//	ここで、レベル0の待機割り込みを呼び出す
+	//	Lv0Stack->IntCountFlags |= SoftInt0; // 指定ビットを1にする
+		STI();
+		POP(EAX);
+		(char) [SS:0xfffffff1] |= 0x04;
+		POP(ECX);
+		PUSHFD();
+		ESP -= 44;
+		[SS:ESP] = DS;
+		asmout("JMP TAPI_softint0_2");
+	}
+*/
+	return;
+}
+
+void far TAPI_SysCntZero()
+// このルーチンを呼ぶにはコツがいる。ZF = 1の場合、IRETD。ZF = 0の場合、FRET。
+// CMP(EAX, EAX); か TEST(ESP, ESP); // lv0では、ESPは0にはならない。
+// ZF == 0の場合、スタックトップはEFLAGS。
+// しかもジャンプで呼ぶ。CLI状態にしておくこと。
+// このバージョンでは、システムコードセグメントかどうかをlv0かどうかで判定する
+// 将来は、呼び出し用のコードと戻るレベルが違えば、システム内と判断する。
+{
+	TAPI_WORK *work == DS:0;
+	TAPI_TSS *tss == DS:ESI;
+	PUSHAD();
+
+//	PUSH(EDX); // デバッグ用
+//	PUSH(EBX);
+//	PUSH(ESP);
+//	PUSH(EBP);
+//	PUSH(ESI);
+//	PUSH(EDI);
+//	EBX = (int) [SS:ESP + 24]; // EIP
+//	EDI = (int) [SS:ESP + 28]; // CS
+//	(int) [SS:ESP + 24] = ECX;
+//	(int) [SS:ESP + 28] = EAX;
+
+	if (ZF == 0) {
+		EDX = (int) [SS:ESP + 32 /* EFLAGS */];
+		EAX = (int) [SS:ESP + 36 /* EIP */];
+		ECX = (int) [SS:ESP + 40 /* CS */];
+		(int) [SS:ESP + 32] = EAX;
+		(int) [SS:ESP + 36] = ECX;
+		(int) [SS:ESP + 40] = EDX;
+	}
+//	CLI(); // ここでフラグが変わるとややこしいから
+	MOV(EAX, CS);
+	PUSH(DS);
+	EAX += 8;
+	TEST((char) [SS:ESP + 40 /* CS */], 0x03);
+//	asmout("TEST BYTE PTR SS:[ESP+40],03H");
+	DS = AX;
+	(offset) tss = work->TskPointer;
+	if (== 0) {
+		// まだシステムの中にいて、単にインクリメントが間に合わなかったと判定
+		POP(DS);
+		POPAD();
+		IRETD();
+	}
+
+	TEST((char) [SS:0xffffffe1], 0x01);
+//	asmout("TEST BYTE PTR SS:[0FFFFFFE1H],01H"); // 割り込み発生要求
+	if (== 0) {
+		TEST((char) [SS:0xffffffe1], 0x02);
+	//	asmout("TEST BYTE PTR SS:[0FFFFFFE1H],02H"); // soft-iret要求
+		// 帰るつもりだったのに、再度割り込まれた。
+		// そういう場合は、lv1のスタックをいじらない。
+		EDI = (int) tss->softint_CS;
+		EBP = tss->softint_EIP;
+		if (!= 0) {
+			EDX = tss->softint_oldLlv;
+			LDS(EBX, [SS:ESP + 48 /* old-SS:ESP */]);
+		//	if (DL == 0xff) { // ありえない
+		//		INT(0x03);
+			//	EDX = tss->Llv;
+			//	EDX -= tss->Llv_base;
+			//	EDX /= 32;
+		//	}
+			EBX -= 48;
+			// スタックが足りなくなったかどうかは、例外処理に任せる
+			EAX = (int) [SS:ESP +  4 /* EDI */];
+			ECX = (int) [SS:ESP +  8 /* ESI */];
+			(short) [DS:EBX     ] = FS;
+			(int) [DS:EBX +  4] = EAX;
+			(int) [DS:EBX +  8] = ECX;
+			(int) [DS:EBX + 16] = EDX;
+			EAX = (int) [SS:ESP + 12 /* EBP */];
+			ECX = (int) [SS:ESP + 20 /* EBX */];
+			EDX = (int) [SS:ESP + 24 /* EDX */];
+			(int) [DS:EBX + 12] = EAX;
+			(int) [DS:EBX + 20] = ECX;
+			(int) [DS:EBX + 24] = EDX;
+			EAX = (int) [SS:ESP + 28 /* ECX */];
+			ECX = (int) [SS:ESP + 32 /* EAX */];
+			EDX = (int) [SS:ESP + 36 /* EIP */];
+			(int) [DS:EBX + 28] = EAX;
+			(int) [DS:EBX + 32] = ECX;
+			(int) [DS:EBX + 36] = EDX;
+			EAX = (int) [SS:ESP + 40 /* CS */ ];
+			ECX = (int) [SS:ESP + 44 /* EFLAGS */];
+			(int) [DS:EBX + 40] = EAX;
+			(int) [DS:EBX + 44] = ECX;
+reentry:
+			(int) [SS:ESP + 48 /* ESP */] = EBX;
+		}
+		(int) [SS:0xffffffe0] |= 0x00000380;
+		// 分岐先と分岐もとのレベルは同じか？
+		EAX = EDI;
+		CL = (char) [SS:ESP + 40 /* CS */];
+		AL &= 0x03;
+		CL &= 0x03;
+		if (AL != CL)
+			goto error; // 未サポート(レベルが違うのはまだサポートしてない)
+		(int) [SS:ESP + 36] = EBP;
+		(int) [SS:ESP + 40] = EDI;
+		POP(DS);
+		POPAD();
+		IRETD();
+	} else {
+		// 帰る
+		DL = tss->now_Llv;
+	//	EBP = tss->Llv;
+	//	EDI = tss->Llv_base;
+		LDS(EBX, [SS:ESP + 48 /* old-SS:ESP */]);
+		FS = (short) [DS:EBX     ];
+		EAX = (int) [DS:EBX +  4];
+		EBP = (int) [DS:EBX +  8];
+		EDI = (int) [DS:EBX + 12];
+		(int) [SS:ESP +  4 /* EDI */] = EAX;
+		(int) [SS:ESP +  8 /* ESI */] = EBP;
+		(int) [SS:ESP + 12 /* EBP */] = EDI;
+		EAX = (int) [DS:EBX + 20];
+		EBP = (int) [DS:EBX + 24];
+		EDI = (int) [DS:EBX + 28];
+		(int) [SS:ESP + 20 /* EBX */] = EAX;
+		(int) [SS:ESP + 24 /* EDX */] = EBP;
+		(int) [SS:ESP + 28 /* ECX */] = EDI;
+		EAX = (int) [DS:EBX + 32];
+		EBP = (int) [DS:EBX + 36];
+		EDI = (int) [DS:EBX + 40];
+		(int) [SS:ESP + 32 /* EAX */] = EAX;
+		(int) [SS:ESP + 36 /* EIP */] = EBP;
+		(int) [SS:ESP + 40 /* CS */ ] = EDI;
+		EAX = (int) [DS:EBX + 44];
+		CL = (int) [DS:EBX + 16];
+		EBX += 48;
+		(int) [SS:ESP + 44 /* EFLAGS */] = EAX;
+		(int) [SS:ESP + 48 /* ESP */] = EBX;
+		(char) [SS:0xffffffe0] = 0x80;
+		if (CL != DL /* Llv変化 */) {
+			if (CL != 0xff) {
+				MOVZX(EDI, CL);
+				MOV(EAX, CS);
+				// また起きるかもしれないから、システムの中にいることを示しておく
+				(char) [SS:0xffffffe0] = 0x81;
+				EAX += 8;
+				DS = AX;
+				TapiChgLlv();
+				TapiFixTsk();
+				// ここで、また起きているかもしれないのでチェック。
+				(char) [SS:0xffffffe0]--;
+				if (== 0) {
+					// 割り込みルーチンのlv(特権レベル)を
+					// 外部から変更されたら、以下の方法はトラブルの原因になる。
+					// でも、普通はそんな変なことしないぞ。
+					// それに、必ず内部から変更するように規制しても問題にはならない。
+
+					// レジスタイメージは、残っているので変化した部分だけを修正
+					EDX = tss->softint_oldLlv;
+					EDI = (int) tss->softint_CS;
+					EBP = tss->softint_EIP;
+				//	if (DL == 0xff) {  // ありえない
+				//		INT(0x03);
+					//	EDX = tss->Llv;
+					//	EDX -= tss->Llv_base;
+					//	EDX /= 32;
+				//	}
+					LDS(EBX, [SS:ESP + 48 /* old-SS:ESP */]);
+					(int) [DS:EBX + 16 - 48] = EDX;
+					EBX -= 48;
+					goto reentry;
+				}
+			}
+		}
+		(char) [SS:0xffffffe1] |= 0x02;
+		// 特権レベルの不一致はないか？
+		AL = (char) [SS:ESP + 40 /* CS */];
+		CL = (char) [SS:ESP + 52 /* SS */];
+		AL &= 0x03;
+		CL &= 0x03;
+		if (AL != CL)
+			goto error; // 未サポート(レベルが違うのはまだサポートしてない)
+		POP(DS);
+		POPAD();
+		IRETD();
+	}
+error:
+	INT(0x03);
+}
+
+void far TAPI_SoftInt1_lv0()
+{
+	TAPI_WORK *work == DS:0;
+	TAPI_TSS *tss == DS:ESI;
+	STI();
+	PUSHFD();
+	ESP -= 8;
+	PUSHAD();
+	MOV(EAX, CS);
+	PUSH(DS);
+	EAX += 8;
+	DS = AX;
+	(offset) tss = work->TskPointer;
+	EAX = tss->softint_oldEIP;
+	ECX = tss->softint_oldCS;
+	(int) [SS:ESP + 36] = EAX;
+	(int) [SS:ESP + 40] = ECX;
+	AL = tss->msgbox_status;
+	POP(DS);
+	TEST(AL, 0x80);
+	if (!= 0) {
+		(int) [SS:0xffffffe0] &= 0xfffffe7f;
+	}
+	TEST(AL, 0x40);
+	if (!= 0) {
+	//	(int) [SS:0xffffffe0] &= 0xfffffe7f; // ???
+	}
+	POPAD();
+	IRETD();
+}
+
+
+//	DS:ESIからの仕様(タイマー専用シグナル処理ルーチン使用時)。
+//	+00 : bit0-2 : メッセージdw数。最高7(28bytes)。
+//	      bit3   : eax, ecx, edxロード & CF = 1をやるかやらないか(1でやる)。
+//	      bit7   : シグナルを起こすかどうか。
+//	      bit8-  : メッセージの送信先の指定に使う（シグナルポート）。
+//	+04 -	     : メッセージを書く
+
+// new
+// mode 2以外は生きてない可能性がある
+
+void near TAPI_SignalMessage()
+//	汎用シグナル処理ルーチン
+//	このバージョンでは、メッセージ
+//	こいつが、oldLlvに代入する
+//  ES:EBPからメッセージ。EBPはいじられる。
+{
+	TAPI_WORK *work == DS:0;
+
+	PUSHFD();
+	CLI();
+
+//	asmout("INC BYTE PTR SS:[0FFFFFFE0H]"); // これは不要。nearだから
+//	asmout("INC BYTE PTR SS:[0FFFFFFF0H]");
+	(char) [SS:0xfffffff0]++;
+
+	TAPI_TSS *tss == DS:ESI;
+
+	EAX = [ES:EBP];
+	TEST(EAX, 0x40000000);
+	if (!= 0)
+		goto sysmsg;
+	EAX &= 0x3ffffff0;
+	(offset) tss = [DS:EAX];
+	// 追加メッセージの処理
+
+//	reg32 = (offset) tss; // ラッピングのために値を保存...sysmsgにはラッピングはない
+//		sysmsgではラッピングなんかなくても、ベクタを完全にコントロールできるので問題無い
+	(offset) tss &= 0x7fffff00;
+
+	if (tss->softint_nest == 0) {
+		tss->softint_nest = 0xff; // 割り込まれると負の値になる。
+		if ((unsigned) (offset) tss == work->TskPointer) {
+			// system_count(lv0_count)のフラグを立てる
+			(int) [SS:0xffffffe0] &= 0xfffffe7f;
+		} else {
+			// 他人の場合：
+			//	もし、SSのlvが0なら、TAPI_SoftInt0_lv0へCS:EIPを書き換える
+			//	そうじゃなければ、TAPI_SoftInt0_lv1へCS:EIPを書き換える...ありえない
+			EAX = tss->tss386.EIP;
+			ECX = (int) tss->tss386.CS;
+			tss->softint_oldEIP = EAX;
+			tss->softint_oldCS  = ECX;
+			tss->tss386.CS = CS /* TAPI CS */;
+			asmout("MOV ECX,OFFSET TAPI_SoftInt1_lv0");
+			tss->tss386.EIP = ECX;
+		}
+	}
+
+	ECX = [ES:EBP];
+	EBP += 4;
+	ECX &= 0x0f; // かならず、0ではない。
+	EDX = tss->msgbox_write_ptr;
+
+	// メッセージラッピング処理はここに書く(reg32のフラグを参照)
+
+//	asmout("LEA EAX,[EDX+ECX*4]");
+	LEA(EAX, [EDX + ECX * 4]);
+	if ((unsigned) EAX >= tss->msgbox_write_ptr1 /* 書き込み上限アドレス(rewindのために4引いておく) */) {
+		// 先頭に戻す
+		// 捨てるdw数を計算
+		EAX = tss->msgbox_write_ptr1;
+		EAX -= EDX;
+		EAX /= 4; // EAX == 先頭に戻すことによって消費するサイズ(dw単位)
+		tss->msgbox_write_free -= EAX;
+		if ((unsigned) < 0) {
+			tss->msgbox_write_free += EAX;
+			tss->msgbox_status |= 0x01 /* buffer overrun */;
+			goto skip_msgwrite2;
+		} else {
+			[DS:EDX + 4] = EAX;
+			EAX = tss->msgbox_rewind_code;
+			[DS:EDX] = EAX;
+			EDX = tss->msgbox_write_ptr0;
+		}
+	}
+
+	tss->msgbox_write_free -= ECX;
+	if ((unsigned) < 0) {
+		tss->msgbox_write_free += ECX;
+		tss->msgbox_status |= 0x01 /* buffer overrun */;
+		LEA(EBP, [SS:EBP + ECX * 4]);
+		goto skip_msgwrite;
+	}
+
+	do {
+		EAX = [ES:EBP];
+		EBP += 4;
+		[DS:EDX] = EAX;
+		EDX += 4;
+		ECX--;
+	} while (!= 0);
+skip_msgwrite:
+	tss->msgbox_write_ptr = EDX;
+	EAX = tss->msgbox_eom_code;
+	(int) [DS:EDX] = EAX;
+skip_msgwrite2:
+
+	// msgboxフルなどの処理もラッピング扱い
+
+	AL = tss->msgbox_status;
+	AL += 0x80;
+	if (CF == 0) {
+		// この処理は、tss->msgbox_statusの立ち上がり時にのみやる
+		EDX = tss->softint_Llv;
+		tss->msgbox_status = AL /* データーあり */;
+		AL = tss->now_Llv;
+		if (DL != 0xff) {
+			tss->softint_oldLlv = AL;
+			// tss->softint_Llvが0xffの場合、softint_oldLlvも0xffに初期化されている
+			if (AL != DL) {
+				EDI = EDX;
+				TapiChgLlv(); // EDIに0～0xfe
+			}
+		}
+	}
+
+	// メッセージの有無 bit0-3
+	// シグナルエントリ
+	// CF : bit31
+
+	// 追加メッセージ bit0-1
+	// reserve bit2-3
+	// ネスティングカウント増加 bit4
+	// if (nest == 0) softint0を起こす bit5
+	// if (nest == 0) ローカルレベル変更 bit6
+	// if (nest == 0) ローカルレベル待避 bit7
+	// 対象タスク指定 bit30-8
+	// reserve bit31
+
+	// レベルチェンジチェック
+	TapiFixTsk();
+	(char) [SS:0xfffffff0]--;
+	if (== 0)
+		goto cli_call;
+cli_call2:
+	POPFD();
+	return;
+cli_call:
+	PUSH(EBP);
+	asmout("CALL FAR DWORD PTR SS:[0FFFFFFF8H]"); /* DSおよびreg32を破壊 */
+	MOV(EAX, CS);
+	POP(EBP);
+	EAX += 8;
+	POPFD();
+	DS = AX;
+	return;
+
+sysmsg:
+	INT(0x03);
+}
+
+void near TAPI_SignalMessage2()
+//	汎用シグナル処理ルーチン(書き込めるまでwait)
+//	このバージョンでは、メッセージ
+//	こいつが、oldLlvに代入する
+//  ES:EBPからメッセージ。EBPはいじられる。
+{
+	TAPI_WORK *work == DS:0;
+
+	PUSHFD();
+	CLI();
+retry:
+//	asmout("INC BYTE PTR SS:[0FFFFFFE0H]"); // これは不要。nearだから
+//	asmout("INC BYTE PTR SS:[0FFFFFFF0H]");
+	(char) [SS:0xfffffff0]++;
+
+	TAPI_TSS *tss == DS:ESI;
+
+	EAX = [ES:EBP];
+	TEST(EAX, 0x40000000);
+	if (!= 0)
+		goto sysmsg;
+	EAX &= 0x3ffffff0;
+	(offset) tss = [DS:EAX];
+	// 追加メッセージの処理
+
+//	reg32 = (offset) tss; // ラッピングのために値を保存...sysmsgにはラッピングはない
+/*		sysmsgではラッピングなんかなくても、ベクタを完全にコントロールできるので問題無い */
+	(offset) tss &= 0x7fffff00;
+
+	if (tss->softint_nest == 0) {
+		tss->softint_nest = 0xff; // 割り込まれると負の値になる。
+		if ((unsigned) (offset) tss == work->TskPointer) {
+			// system_count(lv0_count)のフラグを立てる
+			(int) [SS:0xffffffe0] &= 0xfffffe7f;
+		} else {
+			// 他人の場合：
+			//	もし、SSのlvが0なら、TAPI_SoftInt0_lv0へCS:EIPを書き換える
+			//	そうじゃなければ、TAPI_SoftInt0_lv1へCS:EIPを書き換える...ありえない
+			EAX = tss->tss386.EIP;
+			ECX = (int) tss->tss386.CS;
+			tss->softint_oldEIP = EAX;
+			tss->softint_oldCS  = ECX;
+			tss->tss386.CS = CS /* TAPI CS */;
+			asmout("MOV ECX,OFFSET TAPI_SoftInt1_lv0");
+			tss->tss386.EIP = ECX;
+		}
+	}
+
+	ECX = [ES:EBP];
+	EBP += 4;
+	ECX &= 0x0f; // かならず、0ではない。
+	EDX = tss->msgbox_write_ptr;
+
+	// メッセージラッピング処理はここに書く(reg32のフラグを参照)
+
+//	asmout("LEA EAX,[EDX+ECX*4]");
+	LEA(EAX, [EDX + ECX * 4]);
+	if ((unsigned) EAX >= tss->msgbox_write_ptr1 /* 書き込み上限アドレス(rewindのために4引いておく) */) {
+		// 先頭に戻す
+		// 捨てるdw数を計算
+		EAX = tss->msgbox_write_ptr1;
+		EAX -= EDX;
+		EAX /= 4; // EAX == 先頭に戻すことによって消費するサイズ(dw単位)
+		tss->msgbox_write_free -= EAX;
+		if ((unsigned) < 0) {
+			tss->msgbox_write_free += EAX;
+			// 次のタスクに切り替える
+	retry2:
+			PUSH(EBP);
+			TapiChangeTsk();
+			TapiFixTsk();
+			(char) [SS:0xfffffff0]--;
+			/* ここは必ず0。そうじゃないなら、TAPI_SignalMessage2なんか呼ぶな */
+			asmout("CALL FAR DWORD PTR SS:[0FFFFFFF8H]"); /* DSおよびreg32を破壊 */
+			MOV(EAX, CS);
+			POP(EBP);
+			EAX += 8;
+			EBP -= 4;
+			DS = AX;
+			goto retry;
+		} else {
+			[DS:EDX + 4] = EAX;
+			EAX = tss->msgbox_rewind_code;
+			[DS:EDX] = EAX;
+			EDX = tss->msgbox_write_ptr0;
+			EAX = tss->msgbox_eom_code;
+			tss->msgbox_write_ptr = EDX;
+			(int) [DS:EDX] = EAX;
+		}
+	}
+
+	tss->msgbox_write_free -= ECX;
+	if ((unsigned) < 0) {
+		tss->msgbox_write_free += ECX;
+		// 次のタスクに切り替える
+		goto retry2;
+	}
+
+	do {
+		EAX = [ES:EBP];
+		EBP += 4;
+		[DS:EDX] = EAX;
+		EDX += 4;
+		ECX--;
+	} while (!= 0);
+	tss->msgbox_write_ptr = EDX;
+	EAX = tss->msgbox_eom_code;
+	(int) [DS:EDX] = EAX;
+
+	// msgboxフルなどの処理もラッピング扱い
+
+	AL = tss->msgbox_status;
+	AL += 0x80;
+	if (CF == 0) {
+		// この処理は、tss->msgbox_statusの立ち上がり時にのみやる
+		EDX = tss->softint_Llv;
+		tss->msgbox_status = AL /* データーあり */;
+		AL = tss->now_Llv;
+		if (DL != 0xff) {
+			tss->softint_oldLlv = AL;
+			// tss->softint_Llvが0xffの場合、softint_oldLlvも0xffに初期化されている
+			if (AL != DL) {
+				EDI = EDX;
+				TapiChgLlv(); // EDIに0～0xfe
+			}
+		}
+	}
+
+	// メッセージの有無 bit0-3
+	// シグナルエントリ
+	// CF : bit31
+
+	// 追加メッセージ bit0-1
+	// reserve bit2-3
+	// ネスティングカウント増加 bit4
+	// if (nest == 0) softint0を起こす bit5
+	// if (nest == 0) ローカルレベル変更 bit6
+	// if (nest == 0) ローカルレベル待避 bit7
+	// 対象タスク指定 bit30-8
+	// reserve bit31
+
+	/* レベルチェンジチェック */
+	TapiFixTsk();
+	(char) [SS:0xfffffff0]--;
+	if (== 0)
+		goto cli_call;
+cli_call2:
+	POPFD();
+	return;
+cli_call:
+	PUSH(EBP);
+	asmout("CALL FAR DWORD PTR SS:[0FFFFFFF8H]"); /* DSおよびreg32を破壊 */
+	MOV(EAX, CS);
+	POP(EBP);
+	EAX += 8;
+	POPFD();
+	DS = AX;
+	return;
+
+sysmsg:
+	INT(0x03);
+}
+
+
+void far TAPI_SignalMessageTimer()
+//	Timerのカウントアウトシグナル専用
+//	このバージョンでは、メッセージ
+//	こいつが、oldLlvに代入する
+{
+	// このアドレスは、システムからしか呼ばれない。ゲートは通らない。
+
+	MOV(ECX, DS);
+	PUSH(ES);
+	MOV(EAX, CS);
+	PUSH(ECX);
+	EAX += 8;
+	PUSH(ESI);
+	DS = AX;
+	ES = CX;
+	EBP = ESI;
+	TAPI_SignalMessage();
+	POP(ESI);
+	POP(DS);
+	POP(ES);
+	EBX = [DS:ESI];
+	EAX = [DS:ESI + 20];
+	ECX = [DS:ESI + 24];
+	EDX = [DS:ESI + 28];
+	EBX <<= 1; /* CFセットのために */
+	return;
+}
+
+// ----------------------------------------------------------------- TAPI Layer-2
+//   第２層：グローバル／インナーレベルのサポート
+
+//	980719	インナーレベルはサポートされていない。Setの値でそのままになる。
+//		それ以外の面では問題なし。
+
+//	000523	short_runのサポート
+
+void near TapiFixGlv();
+
+void near TapiRemoveTsk()
+// 動作     : 指定タスクをGlvから切り離す。
+// 進入条件 : (struct TAPI_TSS *) DS:ESI, IF = 0
+// 破壊     : EAX, ECX, EDX, EBX
+
+//	書き戻さなければいけない情報は、すべて書き戻される。
+//	そして、AddTskされるまで、参照されない。
+{
+	TAPI_WORK *work == DS:0;
+
+	TAPI_TSS *RmvTss  == DS:ESI, *NowTss  == DS:ECX;
+	TAPI_TSS *NextTss == DS:EAX, *BackTss == DS:ECX;
+	TAPI_GlvPrm *RmvGlv == DS:EDX, *NowGlv == DS:EBX;
+
+//	asmout("#work_GlvStart EQU 010H");
+	asmout("#work_TimerSysCmd EQU 030H");
+//	asmout("#work_TimerCommand_GetTime EQU 058H");
+//	asmout("#work_NowTimeCT EQU 05CH");
+//	asmout("#TS_run EQU 128+16");
+//	asmout("#GP_run EQU 0");
+
+	// Fixが必要な条件
+	// (1)自分がRemoveされたとき。
+	// (2)現在動いているGlvの中でinnerの合計が再分配の必要があるほど変化した場合。
+
+	// Fixフラグを上げる際には、
+	// (1)現在時刻を取得。
+	// (2)今走っているタスクの実行時間を調整
+
+	// Fixの状態に関係なく、必要な作業。
+	// (1)Glvが変化するなら、Glvパラメーターも更新（これは、すでにFixされている場合でも、やる）
+/*
+asmout("TEST BYTE PTR SS:[0FFFFFFF1H],02H");
+if (!= 0) {
+	TapiFixOn(); // EAX～EBXを破壊
+}
+*/
+	if ((unsigned) (offset) RmvTss == work->TskPointer) {
+		asmout("TEST BYTE PTR SS:[0FFFFFFF1H],02H");
+		if (!= 0) {
+			TapiFixOn(); // EAX～EBXを破壊
+		}
+	}
+	(offset) RmvGlv = RmvTss->Glv;
+	(offset) NextTss = RmvTss->next;
+	(offset) BackTss = RmvTss->back;
+	NextTss->back = (offset) BackTss;
+	BackTss->next = (offset) NextTss;
+	if ((unsigned) (offset) RmvTss == RmvGlv->pointer) { // 先頭だったら、次に回す
+		RmvGlv->pointer = (offset) NextTss;
+	}
+	EAX = RmvGlv->tasks;
+	ECX = RmvGlv->totalIlv;
+	EAX--;
+	ECX -= RmvTss->Ilv;
+	RmvGlv->totalIlv = ECX; // InnerLevelを差し引く
+	RmvGlv->tasks = EAX;  // 所属タスク数を減らす
+
+	// flags == 2 or 3 ... fixの必要なし
+	// flags == 0 必要性は知っている
+	// flags == 1 ← この場合こそ、処理の必要がある。
+
+	if (RmvGlv->flags != 1) {
+		return;
+	}
+	if (EAX <= 2)
+		goto flags_on;
+	if ((unsigned) ECX >= RmvGlv->MinIlv)
+		return;
+flags_on:
+	RmvGlv->flags = 0;
+	if ((unsigned) (offset) RmvGlv == work->GlvNow) {
+		asmout("TEST BYTE PTR SS:[0FFFFFFF1H],02H");
+	//	if (!= 0) {
+	//	//	TapiFixOn(); // EAX～EBXを破壊
+	//		asmout("JMP TapiFixOn");
+	//	}
+		asmout("JNZ TapiFixOn");
+		// Fixはするが、Glvの変更の準備はしない。実際、変更しているわけではないから。
+	}
+	return;
+}
+
+void near TapiAddTsk()
+/* 動作     : 指定タスクをGlvに加える。
+   進入条件 : (TAPI_TSS *) DS:ESI, IF = 0
+   破壊     : EAX, ECX, EDX, EBX, EDI */
+{
+	TAPI_WORK *work == DS:0;
+
+	TAPI_TSS *AddTss  == DS:ESI;
+	TAPI_TSS *BackTss == DS:EDX, *NextTss == DS:ECX;
+	TAPI_GlvPrm *AddGlv == DS:EDI;
+
+	// 入ってくる場合も、穏やかな進入なら、Fixしない。
+	// 穏やかな進入とは、Ilvに問題がなく、入ってくる前にsetを調節してあるタスクの進入のことをいう。
+
+	// タスク数が1になるから、新しいGlvへの挿入は検出できる。
+
+	// 今走っているタスクと同じレベルに入ってきたら、どうするか
+	// Glv->pointerを更新しなきゃいけない。
+	// もし、short_runを持っていれば、自分の直後。
+	// 自分と自分を比較するようなことになってはいけない。だから、TssNow->Glvと比較すべきではない。
+	// じゃあ、work->GlvNowと比較すればいいのか？
+	// (1)FixOnされていれば、Glv->pointerの書き戻しは不要である。
+	// (2)FixOnされていなければ、work->GlvNowは全く信用できる。TskPointerも信用できる。
+	// ・・・これで、行けそうだ。
+
+/*
+asmout("TEST BYTE PTR SS:[0FFFFFFF1H],02H");
+if (!= 0) {
+	TapiFixOn(); // EAX～EBXを破壊
+}
+*/
+	(offset) AddGlv = AddTss->Glv;
+//	asmout("TEST BYTE PTR SS:[0FFFFFFF1H],02H");
+	TEST((char) [SS:0xfffffff1], 0x02);
+	EAX = AddGlv->tasks;
+	if (!= 0) { // FixOnされていない
+		if ((unsigned) (offset) AddGlv == work->GlvNow) {
+			(offset) NextTss = work->TskPointer;
+			CMP((char) AddTss->short_run[11], 0xff);
+		//	DL = 0xff; CMP((char) AddTss->short_run[11], DL);
+			(offset) BackTss = NextTss->back;
+			if (==)
+				goto connect;
+			(offset) NextTss = NextTss->next;
+			(offset) BackTss = work->TskPointer;
+			goto connect;
+		}
+	}
+
+	/* (true) */ if (EAX != 0) {
+		(offset) NextTss = AddGlv->pointer;
+		(offset) BackTss = NextTss->back;
+		CMP((char) AddTss->short_run[11], 0xff);
+	//	PUSH(EDX); DL = 0xff; CMP((char) AddTss->short_run[11], DL); POP(EDX);
+		if (!=)
+			AddGlv->pointer = (offset) AddTss;
+connect:
+		AddTss->next = (offset) NextTss;
+		AddTss->back = (offset) BackTss;
+		NextTss->back = (offset) AddTss;
+		BackTss->next = (offset) AddTss;
+	} else {
+		AddGlv->pointer = (offset) AddTss;
+		AddTss->next = (offset) AddTss;
+		AddTss->back = (offset) AddTss;
+	}
+
+	ECX = AddGlv->totalIlv;
+	EAX++;
+	ECX += AddTss->Ilv;
+	AddGlv->totalIlv = ECX; // InnerLevelを加算
+	AddGlv->tasks = EAX;  // 所属タスク数を増やす
+
+	// flags == 2 or 3 ... fixの必要なし
+	// flags == 0 必要性は知っている
+	// flags == 1 ← この場合こそ、処理の必要がある。
+
+	if (AddGlv->flags == 1) {
+		if ((unsigned) EAX <= 3)
+			goto flags_on;
+		if ((unsigned) ECX <= AddGlv->MaxIlv)
+			return;
+flags_on:
+		AddGlv->flags = 0;
+	}
+	if ((unsigned) (offset) AddGlv > work->GlvNow)
+		return;
+	asmout("TEST BYTE PTR SS:[0FFFFFFF1H],02H");
+	if (!= 0) {
+		TapiFixOn(); /* ESI != work->TskPointer、EAX～EDXのレジスタは破壊可能 */
+	}
+	CMP((offset) AddGlv, work->GlvNow);
+//	if ((unsigned) < ) {
+//		TapiFixGlv(); // グローバルレベル変更(すでにFixされていてもやる必要がある)
+//	}
+	asmout("JB TapiFixGlv");
+	return;
+//	PUSH(EBX);
+//	TapiFixGlv(); // グローバルレベル変更(すでにFixされていてもやる必要がある)
+//	POP(EBX);
+//	work->GlvNow = AddGlv;
+//	return;
+}
+
+void near TapiChangeTsk()
+// 動作     : 今走っているタスクのタイムアウトを待たずに切り換え
+// 進入条件 : IF = 0
+// 破壊     : EAX, ECX, EDX, EBX, ESI
+{
+	TAPI_WORK *work == DS:0;
+
+	TAPI_TSS *NowTss  == DS:ESI, *NextTss  == DS:ECX;
+	TAPI_GlvPrm *NowGlv == DS:EBX;
+
+	(offset) NowTss = work->TskPointer;
+//	asmout("TEST BYTE PTR SS:[0FFFFFFF1H],02H");
+	TEST((char) [SS:0xfffffff1], 0x02);
+	if (!= 0) {
+		TapiFixOn(); // EAX～EBXを破壊
+	}
+
+	(offset) NowGlv = NowTss->Glv;
+	(offset) NextTss = NowTss->next;
+	NowGlv->pointer = (offset) NextTss; // 次のタスクを先頭に
+	return;
+}
+
+void near TapiFixOn()
+// タイマーのキャンセルもやる
+// EAX～EBXを破壊
+// FixがOnのとき、タスクの実行時間を再計算する方法がいつもと違う。
+// TskPointerの値に関わらず、全てのタスク内の実行時間は正しい。
+{
+	TAPI_WORK *work == DS:0;
+	TAPI_TSS *NowTss  == DS:EBX;
+	TAPI_GlvPrm *NowGlv == DS:EAX;
+
+	asmout("#work_TimerSysCmd EQU 030H");
+
+	(char) [SS:0xfffffff1] &= 0xfd;
+	MOV(EAX, DS);
+	PUSH(FS);
+	FS = AX;
+	if ((unsigned) (char) work->NowTimeCT[11] == 0) {
+	//	EBX = (offset) &(work->TimerCommand_GetTime);
+		LEA(EBX, work->TimerCommand_GetTime);
+		asmout("CALL FAR DWORD PTR DS:[#work_TimerSysCmd]");
+/*
+EDX = work->NowTimeCT[8];
+if (EDX == 0)
+	INT(0x03);
+*/
+	}
+	if (work->TskTimerMode != 0 /* 独占モードではない */) {
+	//	EBX = (offset) &(work->TimerCommand_Cancel); // タスク制御で使っているタイマーをキャンセル
+		LEA(EBX, work->TimerCommand_Cancel);
+		asmout("CALL FAR DWORD PTR DS:[#work_TimerSysCmd]");
+		work->TskTimerMode = 0;
+	}
+	POP(FS);
+	(offset) NowTss = work->TskPointer;
+
+	// 実行した時間の分だけ、runは進める。short_runにも書き込む。
+	// short_runについては、ここでチェックすることはしない。
+	EAX = work->NowTimeCT[0];
+	ECX = work->NowTimeCT[4];
+	EDX = work->NowTimeCT[8];
+	EAX -= work->TskStart[0];
+	SBB(ECX, work->TskStart[4]);
+	SBB(EDX, work->TskStart[8]);
+
+	// この時間をNowTssのrunに加え、short_runに保存する。
+	NowTss->run[0] += EAX;		NowTss->short_run[0] = EAX;
+	ADC(NowTss->run[4], ECX);	NowTss->short_run[4] = ECX;
+	ADC(NowTss->run[8], EDX);	NowTss->short_run[8] = EDX;
+	CMP(EAX, NowTss->set[0]);
+	(offset) NowGlv = NowTss->Glv;
+	SBB(ECX, NowTss->set[4]);
+	SBB(EDX, NowTss->set[8]);
+	NowGlv->pointer = (offset) NowTss; // 自分を先頭に据える
+	if ((unsigned) >= 0) {
+		(char) NowTss->short_run[11] = 0xff;
+	}
+	return;
+	// 非時分割のsetは、必ず0にする。そうすれば、いかなる実行時間でもshort_runは無効になる。
+}
+
+void near TapiFixGlv()
+// EAX～EBXを破壊
+// work->NowTimeCTを有効にしておくこと
+{
+	TAPI_WORK *work == DS:0;
+	TAPI_GlvPrm *NowGlv == DS:EBX, *NewGlv == DS:EDI;
+
+	asmout("#work_TimerSysCmd EQU 030H");
+
+/*	asmout("CMP BYTE PTR DS:[#work_NowTimeCT+11],0");
+	if (==) {
+		AX = DS;
+		PUSH(FS);
+		FS = AX;
+	//	EBX = (offset) &(work->TimerCommand_GetTime);
+		asmout("MOV EBX,#work_TimerCommand_GetTime");
+		asmout("CALL FAR DWORD PTR DS:[#work_TimerSysCmd]");
+		POP(FS);
+	}
+*/	(offset) NowGlv = work->GlvNow;
+	EAX = work->NowTimeCT[0];
+	ECX = work->NowTimeCT[4];	EAX -= work->GlvStart[0];
+	EDX = work->NowTimeCT[8];	SBB(ECX, work->GlvStart[4]);
+	work->GlvNow = (offset) NewGlv;	SBB(EDX, work->GlvStart[8]);
+	NowGlv->run[0] += EAX;		EAX = work->NowTimeCT[0];
+	ADC(NowGlv->run[4], ECX);	ECX = work->NowTimeCT[4];
+	ADC(NowGlv->run[8], EDX);	EDX = work->NowTimeCT[8];
+	work->GlvStart[0] = EAX;
+	work->GlvStart[4] = ECX;
+	work->GlvStart[8] = EDX;
+	return;
+}
+
+void near TapiFixTsk()
+// 動作     : タスクプログラムの正常化/切り替え。
+// 進入条件 : IF = 0
+// 破壊     : EAX, ECX, EDX, EBX, EDI, EBP
+{
+	TAPI_WORK *work == DS:0;
+
+	TAPI_TSS *NextTss == DS:EBX;
+	TAPI_GlvPrm *NowGlv == DS:EDI;
+	int *TskTimer == FS:EDI;
+
+	asmout("#work_TimerSysCmd EQU 030H");
+	asmout("#work_TimerNodeTimePtr EQU 038H");
+//	asmout("#TS_short_run EQU 0F0H");
+	asmout("#GP_flags EQU 020H");
+
+//	asmout("TEST BYTE PTR SS:[0FFFFFFF1H],02H");
+	TEST((char) [SS:0xfffffff1], 0x02);
+	if (!= 0) {
+		(char) work->NowTimeCT[11] = 0;
+	        return;
+	}
+	AL = [SS:0xfffffff0];
+	AL &= 0x7f;
+	/* (false) */ if (!= 0 /* 割り込み処理中である */) {
+		[SS:0xfffffff0] = AL;
+	        return;
+	}
+
+asmout("TAPI_FixMain: EQU $");
+FixMain:
+//if ((unsigned) (char) work->NowTimeCT[11] == 0)
+//	INT(0x03);
+
+	// Glvの検索
+	(offset) NowGlv = work->GlvNow;
+	(char) [SS:0xfffffff1] |= 0x03; // フラグをおろす(TimeOutもおろす)
+	if (NowGlv->tasks == 0) {
+		do {
+			(offset) NowGlv += sizeof(TAPI_GlvPrm);
+		} while (NowGlv->tasks == 0);
+		TapiFixGlv();
+	//	work->GlvNow = (offset) NowGlv; // TapiFixGlv()に内包されている
+	}
+	/* TEST(NowGlv->flags, 0x03); */ asmout("TEST BYTE PTR DS:[EDI+#GP_flags],3");
+	if (== 0 /* このレベルはFixしていないし、Fixの必要がある */) {
+		NowGlv->flags = 1 /* |= 0x01 */;
+		// いろいろやる。
+		// タスクごとにフラグを確認しない仕様になった。
+		// しかし、short_runはその時のIlvで調節されているので、
+	}
+	(offset) NextTss = NowGlv->pointer;
+	EAX = work->NowTimeCT[0];
+	ECX = work->NowTimeCT[4];
+	EDX = work->NowTimeCT[8];
+//if (EDX == 0)		// 思いっきりヒットする。最初から駄目らしい。
+//	INT(0x03);
+	work->TskStart[0] = EAX; // タスク開始時間
+	work->TskStart[4] = ECX;
+	work->TskStart[8] = EDX;
+	(char) work->NowTimeCT[11] = 0;
+//	work->TskTimerMode = 0;
+	EBP = work->TskPointer;
+	TEST(NowGlv->flags, 0x02); /* asmout("TEST BYTE PTR DS:[EDI+#GP_flags],2"); */
+	work->TskPointer = (offset) NextTss;
+	if (== 0 /* 時分割をやる */) {
+		if (NowGlv->tasks != 1 /* タスクは一つだけでない */) {
+			PUSH(FS);
+			work->TskTimerMode = 1;
+		//	TskTimer = work->TimerNodeTimePtr;
+			asmout("LFS EDI,DWORD PTR DS:[#work_TimerNodeTimePtr]");
+			EAX += NextTss->set[0]; // 割り込みを起こす時刻を設定
+			ADC(ECX, NextTss->set[4]);
+			ADC(EDX, NextTss->set[8]);
+//if (== 0)
+//	INT(0x03);
+			CMP((char) NextTss->short_run[11], 0xff);
+		//	PUSH(EDX); DL = 0xff; CMP((char) NextTss->short_run[11], DL); POP(EDX);
+			if (!=) {
+				EAX -= NextTss->short_run[0]; // 割り込みを起こす時刻を設定
+				SBB(ECX, NextTss->short_run[4]);
+				SBB(EDX, NextTss->short_run[8]);
+			}
+			TskTimer[0] = EAX;
+			TskTimer[4] = ECX;
+			TskTimer[8] = EDX;
+			MOV(EAX, DS);
+		//	EBX = (offset) &(work->TimerCommand_Regist); // タスク制御で使っているタイマーをキャンセル
+		//	asmout("MOV EBX,#work_TimerCommand_Regist");
+			LEA(EBX, work->TimerCommand_Regist);
+			FS = AX;
+
+			/* これを呼ぶ前に、work->TskPointerを更新しなければいけない。 */
+			asmout("CALL FAR DWORD PTR DS:[#work_TimerSysCmd]");
+			(offset) NextTss = work->TskPointer;
+			POP(FS);
+		}
+	}
+	if ((unsigned) (offset) NextTss != EBP) {
+	//	goto *((void far *()) NextTss->Tr[-4]);   /* タスク切り替え */
+		asmout("JMP FAR DWORD PTR DS:[EBX+128+8]");
+	}
+	return;
+}
+
+
+// ----------------------------------------------------------------- TAPI Layer-3
+//   第３層：ローカルレベルのサポート
+
+//	980719	完成している。
+
+void near TapiChgLlv()
+/* 動作     : LocalLevelの変更。
+   進入条件 : IF = 0, (struct Tss near *) ESI, (struct LlvPrm near *) EDI
+   破壊     : EAX, ECX, EDX, EBX, EDI */
+{
+	TAPI_WORK *work == DS:0;
+
+	TAPI_TSS *ObjTss == DS:ESI;
+	TAPI_LlvPrm *New == DS:EDI, *Old == DS:EBX;
+
+//	asmout("#work_TskStart EQU 000H");
+//	asmout("#work_TimerSysCmd EQU 030H");
+//	asmout("#work_TimerCommand_GetTime EQU 058H");
+//	asmout("#work_NowTimeCT EQU 05CH");
+//	asmout("#TS_set EQU 080H");
+//	asmout("#LP_short_run EQU 010H");
+
+	TapiRemoveTsk(); /* broken : EAX, ECX, EDX, EBX */
+	(offset) Old = ObjTss->Llv;  /* runの書き戻し */
+	EDX = EDI;
+	EDI *= 32;
+	ObjTss->now_Llv = DL;
+	EDI += ObjTss->Llv_base;
+	EAX = ObjTss->run[0];
+	ECX = ObjTss->run[4];
+	EDX = ObjTss->run[8];
+	Old->run[0] = EAX;
+	Old->run[4] = ECX;
+	Old->run[8] = EDX;
+	EAX = ObjTss->short_run[0];
+	ECX = ObjTss->short_run[4];
+	EDX = ObjTss->short_run[8];
+	Old->short_run[0] = EAX;
+	Old->short_run[4] = ECX;
+	Old->short_run[8] = EDX;
+
+	/* 新レベル情報の書き込み */
+	EAX = New->run[0];
+	ECX = New->run[4];
+	EDX = New->run[8];
+	ObjTss->run[0] = EAX;
+	ObjTss->run[4] = ECX;
+	ObjTss->run[8] = EDX;
+	EAX = New->short_run[0];
+	ECX = New->short_run[4];
+	EDX = New->short_run[8];
+	ObjTss->short_run[0] = EAX;
+	ObjTss->short_run[4] = ECX;
+	ObjTss->short_run[8] = EDX;
+	EAX = New->Glv;
+	ECX = New->Ilv;
+	ObjTss->Glv = EAX;
+	ObjTss->Llv = (offset) New;
+	ObjTss->Ilv = ECX;
+
+	/* setを設定する(本当はGlvを参照して決める) */
+	ObjTss->set[0] = ECX /* == Ilv */;
+
+//	(jmp near) goto TapiAddTskCT; // broken : EAX, ECX, EDX, EBX, EDI
+	asmout("JMP TapiAddTsk");
+}
+
+void near TAPI_AddNestSleep()
+// EAXはnest増加量
+// ECXはmsgbox_write_free増加量
+// このルーチンは、nestが条件を満たさなければ、TapiChgLlvの直後に割り込み処理をする
+// EDXは0～255(Llv) : 0xffは変更しないことを意味する
+{
+	PUSHFD();
+//	PUSHAD();
+//	BX = CS;
+//	PUSH(DS);
+//	BX += 8;
+//	DS = BX;
+	TAPI_WORK *work == DS:0;
+	TAPI_TSS *tss == DS:ESI;
+
+	CLI();
+	(offset) tss = work->TskPointer;
+	EBX = tss->msgbox_write_ptr1;
+	tss->msgbox_write_free += ECX;
+	EBX -= tss->msgbox_write_ptr0;
+	EBX /= 4;
+	EBX--; /* EOMの分 */
+	if (EBX == tss->msgbox_write_free) {
+		tss->msgbox_status &= 0x7f;
+	}
+//	EDX = (int) [SS:ESP + 24 /* old EDX */];
+	tss->softint_nest += AL;
+	if (== 0) {
+		TEST(tss->msgbox_status, 0x80); /* bit7:データ存在bit */
+	//	AL = tss->msgbox_status; TEST(AL, 0x80);
+		if (!= 0) {
+		//	(char) [SS:0xffffffe0]++;
+		//	(char) [SS:0xfffffff0]++;
+
+		//	データーが書き込まれているということは、既にsoftint_Llvに
+		//	なっているということではないのか？
+		//	だとすると、oldLlvを更新するのはいいが、現在のレベルを記録するのは意味が無い
+
+			// oldLlvをEDXとして、割り込み処理をする
+			tss->softint_nest = 0xff;
+			if (DL != 0xff) {
+				tss->softint_oldLlv = DL;
+			}
+		//	EDI = tss->softint_Llv; // 一般に、この時が最も速い（もちろん、タスク切り替えが抑制されていればもっと速いが）。
+		//	EAX = tss->Llv;
+		//	if (EDI != 0) {
+		//		if (EAX != EDI) /* ローカルレベル変更 */ {
+		//			TapiChgLlv();
+		//			TapiFixTsk();
+		//		}
+		//	}
+			// softint処理
+		//	DL = tss->softint_mode;
+		//	TEST(DL, 0x03);
+		//	if (!= 0) {
+			//	TEST(DL, 0x01);
+			//	if (!= 0) {
+			//		// 自分の場合：
+			//		//	cli_countが0なら、すぐに割り込む
+			//		//	cli_countが0じゃないなら（タイマーなら0じゃない）、フラグを立てるだけ
+			//		// フラグを立てる。
+			//		asmout("AND DWORD PTR SS:[0FFFFFFF0H],0FFFFFB7FH");
+			//		INT(0x03); // cli_countを反映できていない
+			//	} else {
+					// system_count(lv0_count)のフラグを立てる
+					(int) [SS:0xffffffe0] &= 0xfffffe7f;
+			//	}
+		//	}
+		//	(char) [SS:0xfffffff0]--;
+		//	if (== 0) {
+		//		asmout("CALL FAR DWORD PTR SS:[0FFFFFFF8H]");
+		//	}
+		//	(char) [SS:0xffffffe0]--;
+		//	if (== 0) {
+		//		POP(DS);
+		//		POPAD();
+		//		PUSHFD();
+		//		(int) [SS:ESP] |= 0x0200; // ZF == 0
+		//		asmout("jmp_system_count0");
+		//	}
+		//	POP(DS);
+		//	POPAD();
+			POPFD();
+			return;
+		}
+
+	}
+
+	// シグナルが溜まっているときは、レベルチェンジを認めない
+	TEST(tss->msgbox_status, 0xc0);
+//	AL = tss->msgbox_status; TEST(AL, 0xc0);
+	if (== 0) {
+		if (DL != 0xff) {
+			EDX &= 0xff;
+			EDI = EDX;
+			TapiChgLlv();
+			TapiFixTsk();
+		}
+	}
+//	POP(DS);
+//	POPAD();
+	POPFD();
+	return;
+}
+
+//	マスクを下げ、もしメッセージボックスにメッセージが溜まっていたら、シグナルを起こす・・・そういうルーチンがほしい。
+
+void near TAPI_Softint1Ret()
+{
+	TAPI_WORK *work == DS:0;
+	TAPI_TSS *tss == DS:ESI;
+
+	CLI();
+	(offset) tss = work->TskPointer;
+	EDI = tss->msgbox_write_ptr1;
+	tss->msgbox_write_free += ECX;
+	EDI -= tss->msgbox_write_ptr0;
+	EDI /= 4;
+	EDI--; /* EOMの分 */
+	if (EDI == tss->msgbox_write_free) {
+		tss->msgbox_status &= 0x7f;
+	}
+	tss->softint_nest += AL;
+	if (== 0) {
+	//	AL = tss->msgbox_status; TEST(AL, 0x80);
+		TEST(tss->msgbox_status, 0x80);
+		if (!= 0) {
+			tss->softint_nest = 0xff;
+			(int) [SS:0xffffffe0] &= 0xfffffc7f; // リターン & 分岐
+			STI();
+			return;
+		}
+	}
+
+	(int) [SS:0xffffffe0] &= 0xfffffd7f; // リターンする
+	STI();
+	return;
+}
+
+void far TAPI_INT07()
+{
+	TAPI_WORK *work == DS:0;
+	TAPI_TSS *tss == DS:EAX;
+
+	PUSH(EAX);
+	MOV(EAX, CS);
+	PUSH(DS);
+	EAX += 8;
+	PUSH(ECX);
+	DS = AX;
+	(offset) tss = work->TskPointer;
+	CLTS();
+	ECX = work->taskFPU;
+	EAX = tss->fpu_reg_img;
+	if (EAX != ECX) {
+		if (ECX != 0) {
+			asmout("FNSAVE DS:[ECX]");
+		}
+		work->taskFPU = EAX;
+		asmout("FRSTOR DS:[EAX]");
+	}
+
+	POP(ECX);
+	POP(DS);
+	POP(EAX);
+	IRETD();
+}
+

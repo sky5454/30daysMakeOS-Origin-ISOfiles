@@ -1,0 +1,22 @@
+This ASKA Verion is Modified as to be compiled
+with both MSVC6.0 and GNU compiler g++.
+Now it's very easy to build ASKA from the source.
+Just Click, that's all.
+
+gmake.bat
+First Open this file with memopad 
+And set the MINGW path in the file. 
+
+makefile
+This file is ASKA Makefile for use with GNU Make g++.  
+There are also some tips to setup mingw on your computer.
+
+aska.dsw/aska.dsp
+MSVC6.0 Project file.
+Click aska.dsw and Bill Gates will tell you how to compile.
+
+sample/sample.bat
+Just Click and you can see how ASKA works.
+
+By Sakamoto, Naruyoshi (RisaPapa)
+ringring@zb4.so-net.ne.jp

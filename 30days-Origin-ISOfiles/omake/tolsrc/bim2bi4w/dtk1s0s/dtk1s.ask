@@ -1,0 +1,198 @@
+segment CODE(USE32, PARA);
+default(code == CODE);
+
+asmout("[FILE 'dtk1s.ask']");
+asmout("GLOBAL _tek_checkformat");
+asmout("GLOBAL _tek_decode");
+
+/* int tek_checkformat(int siz, UCHAR *p) */
+
+/* 最高で0.15[sec](osaskgo)をマーク */
+
+void getnum_s7s();
+
+void _tek_checkformat()
+{
+	PUSH(ESI);
+	PUSH(ECX);
+	EAX |= -1;
+	if ((signed) (int) [SS:ESP + 12] < 17)
+		goto err;
+	ESI = (int) [SS:ESP + 16];
+	ECX = 15;
+	do {
+		AL = [DS:ESI + ECX];
+		asmout("CMP AL,[CS:.sign+ECX]");
+		if (!= 0) {
+			AL = -1;
+			if (ECX != 0)
+				goto err;
+			EAX--;
+			goto err;
+		}
+		ECX--;
+	} while ((signed) >= 0);
+	ESI += 16;
+	getnum_s7s();
+err:
+	POP(ECX);
+	POP(ESI);
+	return;
+sign:
+	DB(0x83, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00);
+	DB(0x4f, 0x53, 0x41, 0x53, 0x4b, 0x43, 0x4d, 0x50);
+}
+
+/* int tek_decode(int siz, UCHAR *p, UCHAR *q) */
+
+void _tek_decode()
+{
+	EAX = 0;
+	PUSHAD();
+	ESI = [SS:ESP + 40];
+	EDI = [SS:ESP + 44];
+	ESI += 16;
+	getnum_s7s();
+	XCHG(EAX, EBP);
+	getnum_s7s();
+	/* EAX: bit0:must1, bit1-4:bsiz, bit5: bit6: bit7-10:MD bit11-14:MDS */
+	if (EAX >= 0x8000)
+		goto err1;
+	TEST(AL, 0x01);
+	if (== 0)
+		goto err1;
+	TEST(AL, 0x20);
+	if (!= 0)
+		goto err1;
+	PUSH(EAX);
+	CL = AL;
+	(unsigned char) CL >>= 1;
+	EAX = 0;
+	ECX &= 0x0f;
+	EAX++;
+	CL += 8;
+	SHL(EAX, CL);
+	CMP(EAX, EBP);
+	POP(EAX);
+	if ((unsigned) <)
+		goto err1;
+	TEST(AL, 0x40);
+	if (!= 0)
+		getnum_s7s(); /* オプション情報へのポインタを読み飛ばす */
+	getnum_s7s(); /* 補助バッファ使用？ */
+	if (!= 0) {
+err1:
+		POPAD();
+		EAX = 0;
+		EAX++;
+		return;
+	}
+	if (EBP == 0)
+		goto fin;
+
+	/* stk1のデコード本体 */
+
+	PUSH(ES);
+	PUSHFD();
+	PUSH(DS);
+	POP(ES);
+	CLD();
+	EBP += EDI;
+	PUSH(EDI);
+	do {
+		CL = (unsigned char) [DS:ESI];
+		ESI++;
+		EBX = ECX; /* by */
+		ECX &= 0x0f;
+		if (== 0)
+			goto getlong_by;
+getlong_by0:
+		(unsigned int) EBX >>= 4;
+		if (== 0)
+			goto getlong_lz;
+getlong_lz0:
+		asmout("REP MOVSB");
+		if ((unsigned) EDI >= EBP)
+			break;
+		do {
+			EDX = (unsigned char) [DS:ESI];
+			ESI++;
+			ECX = EDX;
+			EDX &= 0x0f;
+			(unsigned int) EDX >>= 1;
+			if (CF == 0) {
+				do {
+					EDX <<= 8;
+					DL = [DS:ESI];
+					ESI++;
+					(unsigned int) EDX >>= 1;
+				} while (CF == 0);
+			}
+			ECX >>= 4;
+			if (== 0)
+				goto long_cp;
+long_cp0:
+			ECX++;
+			NOT(EDX);
+			PUSH(ESI);
+			LEA(EAX, [EDI + ECX]);
+			LEA(ESI, [EDI + EDX]);
+			if ((unsigned) EAX > EBP)
+				goto fix_ECX;
+fix_ECX1:
+			if ((unsigned) ESI < [SS:ESP + 4])
+				goto err;
+			asmout("REP MOVSB");
+		//	asmout("REP ES MOVSB");
+			POP(ESI);
+			EBX--;
+		} while (!= 0);
+	} while ((unsigned) EDI < EBP);
+	POP(EDI);
+	POPFD();
+	POP(ES);
+fin:
+	POPAD();
+	return;
+
+getlong_lz:
+	getnum_s7s();
+	XCHG(EAX, EBX);
+	goto getlong_lz0;
+
+getlong_by:
+	getnum_s7s();
+	XCHG(EAX, ECX);
+	goto getlong_by0;
+
+long_cp:
+	getnum_s7s();
+	XCHG(EAX, ECX);
+	goto long_cp0;
+
+fix_ECX:
+	ECX = EBP;
+	ECX -= EDI;
+	goto fix_ECX1;
+
+err:
+	POP(EAX);
+	POP(EAX);
+	POPFD();
+	POP(ES);
+	POPAD();
+	EAX++;
+	return;
+}
+
+void getnum_s7s()
+/* DS:ESIからリード */
+{
+	EAX = 0;
+	do {
+		EAX <<= 8;
+		LODSB();
+		(unsigned int) EAX >>= 1;
+	} while (CF == 0);
+	return; /* CF = 1, TEST(EAX, EAX); */
+}

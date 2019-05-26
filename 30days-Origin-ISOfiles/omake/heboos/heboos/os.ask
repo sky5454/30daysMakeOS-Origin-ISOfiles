@@ -1,0 +1,560 @@
+/* へぼOS copyright(C) 2003 川合秀実, KL-01 */
+
+/* ASKAがいろいろうるさいので、とりあえず書いておく */
+segment CODE(USE32, PARA);
+default(code == CODE);
+
+/* .COMファイルにするための記述 */
+void COMFILE()
+{
+	asmout("[BITS 16]");
+	ORG(0x0100);
+}
+
+void cls();
+void putstr();
+void scroll();
+void readsec();
+void loaddir();
+void syscall();
+void charfont();
+
+#define SEG_DIR		0x1000
+#define SEG_APP		0x2000
+
+void main()
+{
+	/* IPLのための記述 */
+	goto skip;
+	DW(3072 / 512); /* このOSの大きさ(512バイト単位) */
+skip:
+
+	/* 画面モード設定 */
+	AX = 0x0013;
+	INT(0x10);
+
+	/* パレット設定 */
+	/* とりあえず、黒(0)と白(15)しか使わないので、それしか設定してない */
+	AX = 0x1010;
+	BX = 0;
+	DH = 0;
+	CX = 0;
+	INT(0x10);
+	AX = 0x1010;
+	BX = 15;
+	DH = 0x3f;
+	CX = 0x3f3f;
+	INT(0x10);
+
+	/* 画面初期化 */
+	cls();
+	asmout("MOV SI,.msg");
+	putstr();
+
+	/* システムコール用INTベクタ設定 */
+	PUSH(DS);
+	AX = 0;
+	DS = AX;
+	asmout("MOV WORD [DS:0x0200],syscall");
+	[DS:0x0202] = CS;
+	POP(DS);
+
+	loaddir();
+
+command:
+	/* コマンドラインループ */
+	for (;;) {
+		AX = 0;
+		asmout("MOV BX,.cmdlin");
+		CX = 40 / 2;
+		do {
+			[DS:BX] = AX;
+			BX += 2;
+			CX--;
+		} while (!= 0);
+		asmout("MOV SI,.prompt");
+		putstr();
+		asmout("MOV SI,.cursor");
+		putstr();
+		for (;;) {
+			AH = 0x00;
+			INT(0x16);
+			BX = 0;
+			asmout("MOV BL,[putstr.curx]");
+			if ((unsigned) AL >= 0x20) {
+				if ((unsigned) AL < 0x7e) {
+					if ((unsigned) BL < 39) {
+						asmout("MOV SI,.char_cur");
+						[DS:SI + 1] = AL;
+						asmout("MOV [BX-2+.cmdlin],AL");
+						putstr();
+						continue;
+					}
+				}
+			}
+			if (AL == 0x08) { /* Backspace */
+				if ((unsigned) BL >= 3) {
+					asmout("MOV BYTE [BX-3+.cmdlin],0");
+					asmout("MOV SI,.backspace");
+					putstr();
+					continue;
+				}
+			}
+			if (AL == 0x0d)
+				break; /* Enter */
+		}
+		asmout("MOV SI,.delcur_lf");
+		putstr();
+		asmout("MOV BX,.cmdlin");
+		AX = [DS:BX + 0];
+		CX = [DS:BX + 2];
+		DX = [DS:BX + 4];
+		if (AX == 0)
+			continue;
+		/* cls */
+		if (AX == 0x6c63) {
+			if (CX == 0x0073) {
+				cls();
+				continue;
+			}
+		}
+		/* reset */
+		if (AX == 0x6572) {
+			if (CX == 0x6573) {
+				if (DX == 0x0074) {
+					INT(0x19);
+					continue;
+				}
+			}
+		}
+		/* BASIC(どうなるか分からない隠しコマンド・・・笑) */
+		if (AX == 0x4142) {
+			if (CX == 0x4953) {
+				if (DX == 0x0043) {
+					INT(0x18);
+					continue;
+				}
+			}
+		}
+		/* dir */
+		if (AX == 0x6964) {
+			if (CX == 0x0072) {
+				PUSH(ES);
+				AX = CS;
+				AX += SEG_DIR;
+				ES = AX;
+				DI = 0;
+				for (;;) {
+					AX = [ES:DI];
+					if (AL == 0)
+						break;
+					if (AL != 0xe5) {
+						TEST((char) [ES:DI + 11], 0x18);
+						if (== 0) {
+							asmout("MOV SI,.cmdlin");
+							[DS:SI + 0] = AX;
+							AX = [ES:DI + 2];
+							[DS:SI + 2] = AX;
+							AX = [ES:DI + 4];
+							[DS:SI + 4] = AX;
+							AX = [ES:DI + 6];
+							[DS:SI + 6] = AX;
+							AL = 0x20;
+							AH = [ES:DI + 8];
+							[DS:SI + 8] = AX;
+							AL = [ES:DI + 9];
+							AH = [ES:DI + 10];
+							[DS:SI + 10] = AX;
+							(short) [DS:SI + 12] = 0x000a;
+							putstr();
+						}
+					}
+					DI += 32;
+				}
+				POP(ES);
+				continue;
+			}
+		}
+
+		/* コマンド名とみなして、????????.hoaを探す */
+		CL = 8;
+		do {
+			AL = [DS:BX];
+			if (AL == 0x00)
+				AL = 0x20;
+			if ((unsigned) AL >= 0x61) {
+				if ((unsigned) AL <= 0x7a)
+					AL -= 0x20;
+			}
+			[DS:BX] = AL;
+			BX++;
+			CL--;
+		} while (!= 0);
+		BX -= 8;
+		PUSH(ES);
+		AX = CS;
+		AX += SEG_DIR;
+		ES = AX;
+		DI = 0;
+		for (;;) {
+			AX = [ES:DI];
+			if (AL == 0)
+				break;
+			TEST((char) [ES:DI + 11], 0x18);
+			if (== 0) {
+				if ((unsigned) (short) [ES:DI + 8] == 0x4f48) {
+					if ((unsigned) (char) [ES:DI + 10] == 0x41) {
+						if (AX == [DS:BX]) {
+							AX = [ES:DI + 2];
+							if (AX == [DS:BX + 2]) {
+								AX = [ES:DI + 4];
+								if (AX == [DS:BX + 4]) {
+									AX = [ES:DI + 6];
+									if (AX == [DS:BX + 6]) {
+										/* ファイル発見！ */
+										AX = [ES:DI + 26];
+										AX -= 2;
+										asmout("MUL WORD [loaddir.SIZ_CLU]");
+										asmout("ADD AX,[loaddir.LBA_CLU2]");
+										SI = AX;
+										CL = 1;
+										AX = CS;
+										AX += SEG_APP;
+										ES = AX;
+										BX = 0x0100;
+										readsec();
+										if (CF != 0) {
+											asmout("MOV SI,.diskerr");
+											putstr();
+											goto command;
+										}
+										AX = ES;
+										SS = AX;
+										SP = 0xfffe;
+										DS = AX;
+										PUSH(AX);
+										PUSH(0x0100);
+										RETF(); /* アプリケーションに分岐 */
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			DI += 32;
+		}
+		POP(ES);
+
+		asmout("MOV SI,.badcmd");
+		putstr();
+	}
+
+msg:
+	asmout("DB 'heboOS dayoon!',10");
+lf:
+	DB(10, 0);
+prompt:
+	asmout("DB '>',0");
+char_cur:
+	DB(8, 0);
+cursor:
+	asmout("DB '_',0");
+backspace:
+	DB(8, 0x20, 8, 8);
+	asmout("DB '_',0");
+delcur_lf:
+	DB(8, 0x20, 10, 0);
+badcmd:
+	asmout("DB 'Bad command o','r file name',10,0");
+		/* naskcnv0が馬鹿なので、'or'と素直に書くと変な反応をしてしまう */
+diskerr:
+	asmout("DB 'Disk error',10,0");
+	ALIGNB(2);
+cmdlin:
+	RESB(40);
+}
+
+void cls()
+{
+	PUSH(DS);
+	AX = 0xa000;
+	DS = AX;
+	BX = 0;
+	AX = 0;
+	do {
+		[DS:BX] = AX;
+		BX += 2;
+	} while (!= 0);
+	POP(DS);
+	asmout("MOV [CS:putstr.curx],AX"); /* 表示座標を0に */
+	return;
+}
+
+void putstr()
+/* DS:SIにテキスト */
+/* 理解できるコントロールコードは0x08,0x0aだけ(＝ただの手抜き) */
+/* 0x00に遭遇したら終わる */
+{
+	PUSH(ES);
+	PUSH(DI);
+	PUSH(SI);
+	PUSH(BX);
+	PUSH(CX);
+	PUSH(AX);
+	AX = 0xa000;
+	ES = AX;
+	for (;;) {
+		BX = 0;
+		BL = [DS:SI];
+		SI++;
+		if (BL == 0x0a)
+			goto newline;
+		if (BL == 0x08) {
+			asmout("DEC BYTE [CS:.curx]");
+			continue;
+		}
+		BX *= 16;
+		if (== 0)
+			break;
+		asmout("ADD BX,-0x20*16+charfont");
+		/* DI = curx * 8 + cury * 16 * 320; */
+		AX = 0;
+		asmout("MOV AL,[CS:.curx]");
+		AX *= 8;
+		CX = 0;
+		asmout("MOV CX,[CS:.cury]");
+		DI = CX;
+		DI *= 4;
+		DI += CX; /* これで、DI = CX * 5; */
+		DI *= 1024;
+		DI += AX;
+		CH = 16;
+		do {
+			CL = 8;
+			AL = [CS:BX];
+			BX++;
+			do {
+				AL <<= 1;
+				SBB(AH, AH); /* if (CF == 0) AH = 0; else AH = 0xff; */
+				AH &= 0x0f;
+				[ES:DI] = AH;
+				DI++;
+				CL--;
+			} while (!= 0);
+			DI += 320 - 8;
+			CH--;
+		} while (!= 0);
+		asmout("MOV AL,BYTE [CS:.curx]");
+		AL++;
+		asmout("MOV BYTE [CS:.curx],AL");
+		if (AL == 40) {
+newline:
+			asmout("MOV BYTE [CS:.curx],0");
+			asmout("MOV AL,BYTE [CS:.cury]");
+			AL++;
+			asmout("MOV BYTE [CS:.cury],AL");
+			if (AL == 12)
+				scroll();
+		}
+	}
+	POP(AX);
+	POP(BX);
+	POP(CX);
+	POP(SI);
+	POP(DI);
+	POP(ES);
+	return;
+
+	ALIGNB(2);
+curx:	DB(0);
+cury:	DB(0);
+}
+
+void scroll()
+{
+	PUSH(DS);
+	AX = 0xa000;
+	DS = AX;
+	SI = 320 * 16;
+	DI = 0;
+	do {
+		AX = [DS:SI];
+		SI += 2;
+		[DS:DI] = AX;
+		DI += 2;
+	} while ((unsigned) SI < 320 * 200);
+	AX = 0;
+	do {
+		[DS:DI] = AX;
+		DI += 2;
+	} while ((unsigned) DI < 320 * 200);
+	POP(DS);
+	asmout("DEC BYTE [CS:putstr.cury]");
+	return;
+}
+
+void readsec()
+{
+	CH = 3;
+	do {
+		PUSH(ES);
+		PUSH(SI);
+		PUSH(BX);
+		PUSH(DX);
+		PUSH(CX);
+		PUSH(AX);
+		AX = SI;
+		CL = 18;
+		DIV(CL);
+		CH = AL;
+		DH = AL;
+		CL = AH;
+		(unsigned char) CH /= 2;
+		DH &= 0x01;
+		CL++;
+		AX = 0x0201;
+		DL = 0;
+		INT(0x13);
+		POP(AX);
+		POP(CX);
+		POP(DX);
+		POP(BX);
+		POP(SI);
+		POP(ES);
+		if (CF != 0) {
+			CH--;
+			if (== 0)
+				break;
+			PUSH(ES);
+			PUSH(SI);
+			PUSH(BX);
+			PUSH(DX);
+			PUSH(CX);
+			PUSH(AX);
+			AH = 0x11;
+			DL = 0;
+			INT(0x13);
+			POP(AX);
+			POP(CX);
+			POP(DX);
+			POP(BX);
+			POP(SI);
+			POP(ES);
+			continue;
+		}
+		BX += 512;
+		SI++;
+		CLC();
+		CL--;
+	} while (!= 0);
+	return;
+}
+
+void loaddir()
+/* ディスクからディレクトリを読み込む */
+{
+	PUSH(ES);
+	AX = CS;
+	AX += SEG_DIR;
+	ES = AX;
+	(char) [ES:0] = 0x00; /* エラーのときは、ファイルなし、になる */
+	AX = CS;
+	AX += SEG_APP;
+	ES = AX;
+	BX = 0;
+	SI = 0;
+	CL = 1;
+	readsec();
+	if (CF != 0)
+		goto err;
+	AL = [ES:0x000d];
+	asmout("MOV [.SIZ_CLU],AL");
+	AX = [ES:0x000e];
+	asmout("MOV [.LBA_FAT],AX");
+	CX = [ES:0x0016];
+	AX += CX;
+	asmout("MOV [.LBA_FAT2],AX");
+	AX += CX;
+	asmout("MOV [.LBA_DIR],AX");
+	CX = [ES:0x0011];
+	asmout("MOV [.SIZ_DIR],CX");
+	CX *= 32;
+	CX += 511;
+	(unsigned short) CX /= 512;
+	AX += CX;
+	asmout("MOV [.LBA_CLU2],AX");
+	AX = CS;
+	AX += SEG_DIR;
+	ES = AX;
+	BX = 0;
+	asmout("MOV SI,[.LBA_DIR]");
+	readsec();
+	asmout("MOV BX,[.SIZ_DIR]");
+	BX--;
+	BX *= 32;
+	(char) [ES:BX] = 0x00; /* もしものためのターミネータ */
+err:
+	POP(ES);
+	return;
+
+	ALIGNB(2);
+LBA_FAT:
+	DW(1);
+LBA_FAT2:
+	DW(10);
+LBA_DIR:
+	DW(19);
+LBA_CLU2:
+	DW(33);
+SIZ_DIR:
+	DW(0x00e0);
+SIZ_CLU:
+	DW(1);
+}
+
+void syscall()
+/* アプリケーションから呼ばれる */
+{
+	PUSH(DI);
+	PUSH(SI);
+	PUSH(BP);
+	PUSH(BX);
+	PUSH(DX);
+	PUSH(CX);
+	PUSH(AX);
+	BP = SP;
+	if (AX == 0) { /* アプリ終了, CXに戻り値でも入れればいいね */
+		AX = CS;
+		SS = AX;
+		SP = 0xfffe;
+		DS = AX;
+		ES = AX;
+		asmout("JMP main.command");
+	}
+	if (AX == 1) { /* 文字表示ファンクション */
+		putstr();
+		goto fin;
+	}
+	if (AX == 2) { /* 画面クリアファンクション */
+		cls();
+		goto fin;
+	}
+err:
+	(char) [SS:BP + 18] |= 0x01; /* STC */
+	goto fin2;
+fin:
+	(char) [SS:BP + 18] &= 0xfe; /* CLC */
+fin2:
+	POP(AX);
+	POP(CX);
+	POP(DX);
+	POP(BX);
+	POP(BP);
+	POP(SI);
+	POP(DI);
+	IRET();
+}
+
+void charfont() {}
+/* makeos.batがここにフォントバイナリをくっつける */

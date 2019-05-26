@@ -1,0 +1,791 @@
+[FORMAT "WCOFF"]
+[INSTRSET "i486p"]
+[OPTIMIZE 1]
+[OPTION 1]
+[BITS 32]
+	EXTERN	_cpp_create_reader
+	EXTERN	_cpp_get_options
+	EXTERN	_cpp_destroy
+	EXTERN	_GO_strlen
+	EXTERN	_hex_init
+	EXTERN	_cpp_handle_options
+	EXTERN	_cpp_errors
+	EXTERN	_cpp_fatal
+	EXTERN	_cpp_post_options
+	EXTERN	_GO_stdout
+	EXTERN	_cpp_read_main_file
+	EXTERN	_GO_fclose
+	EXTERN	_cpp_notice_from_errno
+	EXTERN	_GO_fputc
+	EXTERN	_cpp_finish_options
+	EXTERN	_cpp_scan_nooutput
+	EXTERN	_cpp_finish
+	EXTERN	_cpp_forall_identifiers
+	EXTERN	_GO_fopen
+	EXTERN	_cpp_get_callbacks
+	EXTERN	_cpp_get_token
+	EXTERN	_cpp_output_token
+	EXTERN	_cpp_avoid_paste
+	EXTERN	__alloca
+	EXTERN	_cpp_quote_string
+	EXTERN	_GO_fprintf
+	EXTERN	_GO_fputs
+	EXTERN	_cpp_macro_definition
+	EXTERN	_cpp_token_as_text
+	EXTERN	_cpp_output_line
+[FILE "cppmain.c"]
+[SECTION .text]
+	GLOBAL	_main1
+_main1:
+	PUSH	EBP
+	MOV	EBP,ESP
+	PUSH	EBX
+	MOV	EBX,DWORD [12+EBP]
+	PUSH	DWORD [EBX]
+	CALL	_general_init
+	PUSH	0
+	CALL	_cpp_create_reader
+	MOV	DWORD [_pfile],EAX
+	PUSH	EAX
+	CALL	_cpp_get_options
+	PUSH	EBX
+	PUSH	DWORD [8+EBP]
+	MOV	DWORD [_options],EAX
+	CALL	_do_preprocessing
+	PUSH	DWORD [_pfile]
+	CALL	_cpp_destroy
+	MOV	EBX,DWORD [-4+EBP]
+	ADD	ESP,24
+	TEST	EAX,EAX
+	SETNE	AL
+	MOVZX	EAX,AL
+	LEAVE
+	RET
+_general_init:
+	PUSH	EBP
+	MOV	EBP,ESP
+	PUSH	EBX
+	MOV	EBX,DWORD [8+EBP]
+	PUSH	EBX
+	CALL	_GO_strlen
+	LEA	EAX,DWORD [EAX+EBX*1]
+	MOV	DWORD [_progname],EAX
+	CMP	EAX,EBX
+	POP	EDX
+	JE	L5
+	MOV	AL,BYTE [-1+EAX]
+	CMP	AL,47
+	JE	L5
+	CMP	AL,92
+	JE	L5
+L8:
+	MOV	EAX,DWORD [_progname]
+	DEC	EAX
+	MOV	DWORD [_progname],EAX
+	CMP	EAX,EBX
+	JE	L5
+	MOV	AL,BYTE [-1+EAX]
+	CMP	AL,47
+	JE	L5
+	CMP	AL,92
+	JNE	L8
+L5:
+	MOV	EBX,DWORD [-4+EBP]
+	LEAVE
+	JMP	_hex_init
+[SECTION .data]
+LC0:
+	DB	"invalid option %s",0x00
+LC1:
+	DB	"w",0x00
+[SECTION .text]
+_do_preprocessing:
+	PUSH	EBP
+	MOV	EBP,ESP
+	PUSH	EDI
+	PUSH	ESI
+	PUSH	EBX
+	MOV	EDI,DWORD [12+EBP]
+	MOV	ESI,DWORD [8+EBP]
+	LEA	EAX,DWORD [4+EDI]
+	PUSH	EAX
+	LEA	EAX,DWORD [-1+ESI]
+	PUSH	EAX
+	PUSH	DWORD [_pfile]
+	CALL	_cpp_handle_options
+	PUSH	DWORD [_pfile]
+	LEA	EBX,DWORD [1+EAX]
+	CALL	_cpp_errors
+	ADD	ESP,16
+	CMP	EAX,999
+	JA	L10
+	CMP	EBX,ESI
+	JGE	L12
+	PUSH	DWORD [EDI+EBX*4]
+	PUSH	LC0
+	PUSH	DWORD [_pfile]
+	CALL	_cpp_fatal
+L10:
+	LEA	ESP,DWORD [-12+EBP]
+	POP	EBX
+	POP	ESI
+	POP	EDI
+	POP	EBP
+	RET
+L12:
+	PUSH	DWORD [_pfile]
+	CALL	_cpp_post_options
+	PUSH	DWORD [_pfile]
+	CALL	_cpp_errors
+	POP	EBX
+	POP	ESI
+	CMP	EAX,999
+	JA	L10
+	MOV	EDX,DWORD [_options]
+	CMP	BYTE [86+EDX],0
+	JNE	L10
+	MOV	BYTE [_print+20],0
+	MOV	EAX,DWORD [4+EDX]
+	MOV	DWORD [_print+16],-1
+	MOV	DWORD [_print+8],0
+	MOV	DWORD [_print+4],0
+	CMP	BYTE [EAX],0
+	JNE	L15
+	MOV	DWORD [_print],_GO_stdout
+L16:
+	CALL	_setup_callbacks
+	PUSH	0
+	MOV	EAX,DWORD [_options]
+	PUSH	DWORD [EAX]
+	PUSH	DWORD [_pfile]
+	CALL	_cpp_read_main_file
+	ADD	ESP,12
+	TEST	EAX,EAX
+	JNE	L26
+L18:
+	CMP	BYTE [_print+20],0
+	JNE	L27
+L22:
+	PUSH	DWORD [_print]
+	CALL	_GO_fclose
+	POP	ECX
+	TEST	EAX,EAX
+	JE	L10
+L25:
+	MOV	EAX,DWORD [_options]
+	MOV	EAX,DWORD [4+EAX]
+	MOV	DWORD [12+EBP],EAX
+	MOV	EAX,DWORD [_pfile]
+	MOV	DWORD [8+EBP],EAX
+	LEA	ESP,DWORD [-12+EBP]
+	POP	EBX
+	POP	ESI
+	POP	EDI
+	POP	EBP
+	JMP	_cpp_notice_from_errno
+L27:
+	PUSH	DWORD [_print]
+	PUSH	10
+	CALL	_GO_fputc
+	POP	EBX
+	POP	ESI
+	JMP	L22
+L26:
+	PUSH	DWORD [_pfile]
+	CALL	_cpp_finish_options
+	POP	EAX
+	MOV	EAX,DWORD [_options]
+	CMP	BYTE [71+EAX],0
+	JE	L19
+	PUSH	DWORD [_pfile]
+	CALL	_cpp_scan_nooutput
+L24:
+	POP	EAX
+	MOV	EAX,DWORD [_options]
+	CMP	BYTE [82+EAX],1
+	JE	L28
+L21:
+	PUSH	DWORD [_pfile]
+	CALL	_cpp_finish
+	POP	EDI
+	JMP	L18
+L28:
+	PUSH	0
+	PUSH	_dump_macro
+	PUSH	DWORD [_pfile]
+	CALL	_cpp_forall_identifiers
+	ADD	ESP,12
+	JMP	L21
+L19:
+	PUSH	DWORD [_pfile]
+	CALL	_scan_translation_unit
+	JMP	L24
+L15:
+	PUSH	LC1
+	PUSH	DWORD [4+EDX]
+	CALL	_GO_fopen
+	MOV	DWORD [_print],EAX
+	TEST	EAX,EAX
+	POP	EDX
+	POP	ECX
+	JNE	L16
+	JMP	L25
+_setup_callbacks:
+	PUSH	EBP
+	MOV	EBP,ESP
+	PUSH	DWORD [_pfile]
+	CALL	_cpp_get_callbacks
+	POP	ECX
+	MOV	EDX,EAX
+	MOV	EAX,DWORD [_options]
+	CMP	BYTE [71+EAX],0
+	JNE	L30
+	MOV	DWORD [EDX],_cb_line_change
+	CMP	DWORD [44+EAX],9
+	JE	L31
+	MOV	DWORD [20+EDX],_cb_ident
+	MOV	DWORD [24+EDX],_cb_def_pragma
+L31:
+	CMP	BYTE [73+EAX],0
+	JNE	L30
+	MOV	DWORD [4+EDX],_cb_file_change
+L30:
+	MOV	EAX,DWORD [_options]
+	CMP	BYTE [83+EAX],0
+	JE	L33
+	MOV	DWORD [8+EDX],_cb_include
+L33:
+	MOV	AL,BYTE [82+EAX]
+	SUB	EAX,2
+	CMP	AL,1
+	JA	L29
+	MOV	DWORD [12+EDX],_cb_define
+	MOV	DWORD [16+EDX],_cb_undef
+L29:
+	LEAVE
+	RET
+_scan_translation_unit:
+	PUSH	EBP
+	MOV	EBP,ESP
+	PUSH	EDI
+	PUSH	ESI
+	XOR	ESI,ESI
+	PUSH	EBX
+	MOV	EDI,DWORD [8+EBP]
+	MOV	DWORD [_print+12],0
+L36:
+	PUSH	EDI
+	CALL	_cpp_get_token
+	POP	EDX
+	MOV	EBX,EAX
+	MOV	AL,BYTE [6+EAX]
+	CMP	AL,66
+	JE	L53
+	CMP	AL,67
+	JE	L35
+	MOV	EAX,ESI
+	TEST	AL,AL
+	JE	L43
+	CMP	DWORD [_print+12],0
+	JNE	L44
+	MOV	DWORD [_print+12],EBX
+L44:
+	MOV	EAX,DWORD [_print+12]
+	MOV	AL,BYTE [7+EAX]
+	AND	EAX,1
+	TEST	AL,AL
+	JNE	L52
+	MOV	EAX,DWORD [_print+8]
+	TEST	EAX,EAX
+	JNE	L54
+L47:
+	CMP	DWORD [_print+8],0
+	JNE	L48
+	CMP	BYTE [6+EBX],40
+	JE	L52
+L48:
+	PUSH	DWORD [_print]
+	PUSH	EBX
+	MOV	DWORD [_print+8],EBX
+	MOV	DWORD [_print+12],0
+	XOR	ESI,ESI
+	CALL	_cpp_output_token
+	MOV	DL,BYTE [6+EBX]
+	POP	ECX
+	POP	ECX
+	LEA	EAX,DWORD [-61+EDX]
+	CMP	AL,1
+	JBE	L51
+	CMP	DL,64
+	JNE	L36
+L51:
+	LEA	EAX,DWORD [8+EBX]
+	PUSH	EAX
+	CALL	_check_multiline_token
+	POP	EBX
+	JMP	L36
+L52:
+	PUSH	DWORD [_print]
+	PUSH	32
+	CALL	_GO_fputc
+	POP	ESI
+	POP	EAX
+	JMP	L48
+L54:
+	PUSH	EBX
+	PUSH	EAX
+	PUSH	EDI
+	CALL	_cpp_avoid_paste
+	ADD	ESP,12
+	TEST	EAX,EAX
+	JNE	L52
+	JMP	L47
+L43:
+	MOV	AL,BYTE [7+EBX]
+	AND	EAX,1
+	TEST	AL,AL
+	JE	L48
+	JMP	L52
+L35:
+	LEA	ESP,DWORD [-12+EBP]
+	POP	EBX
+	POP	ESI
+	POP	EDI
+	POP	EBP
+	RET
+L53:
+	MOV	EAX,DWORD [_print+12]
+	MOV	ESI,1
+	TEST	EAX,EAX
+	JE	L41
+	MOV	AL,BYTE [7+EAX]
+	AND	EAX,1
+	TEST	AL,AL
+	JNE	L36
+	CMP	DWORD [8+EBX],0
+	JNE	L36
+L41:
+	MOV	EAX,DWORD [8+EBX]
+	MOV	DWORD [_print+12],EAX
+	JMP	L36
+_check_multiline_token:
+	PUSH	EBP
+	XOR	EDX,EDX
+	MOV	EBP,ESP
+	MOV	ECX,DWORD [8+EBP]
+	CMP	EDX,DWORD [ECX]
+	JAE	L64
+L62:
+	MOV	EAX,DWORD [4+ECX]
+	CMP	BYTE [EDX+EAX*1],10
+	JE	L65
+L59:
+	INC	EDX
+	CMP	EDX,DWORD [ECX]
+	JB	L62
+L64:
+	POP	EBP
+	RET
+L65:
+	INC	DWORD [_print+16]
+	JMP	L59
+[SECTION .data]
+LC2:
+	DB	0x00
+[SECTION .text]
+_maybe_print_line:
+	PUSH	EBP
+	MOV	EBP,ESP
+	PUSH	EBX
+	CMP	BYTE [_print+20],0
+	MOV	EBX,DWORD [12+EBP]
+	JNE	L75
+L67:
+	MOV	EDX,DWORD [_print+16]
+	CMP	EBX,EDX
+	JB	L68
+	LEA	EAX,DWORD [8+EDX]
+	CMP	EBX,EAX
+	JAE	L68
+	CMP	EBX,EDX
+	JA	L72
+L66:
+	MOV	EBX,DWORD [-4+EBP]
+	LEAVE
+	RET
+L72:
+	PUSH	DWORD [_print]
+	PUSH	10
+	CALL	_GO_fputc
+	POP	ECX
+	MOV	EAX,DWORD [_print+16]
+	POP	EDX
+	INC	EAX
+	MOV	DWORD [_print+16],EAX
+	CMP	EBX,EAX
+	JA	L72
+	JMP	L66
+L68:
+	PUSH	LC2
+	PUSH	EBX
+	PUSH	DWORD [8+EBP]
+	CALL	_print_line
+	ADD	ESP,12
+	JMP	L66
+L75:
+	PUSH	DWORD [_print]
+	PUSH	10
+	CALL	_GO_fputc
+	POP	ECX
+	POP	EAX
+	INC	DWORD [_print+16]
+	MOV	BYTE [_print+20],0
+	JMP	L67
+[SECTION .data]
+LC3:
+	DB	"# %u ",0x22,"%s",0x22,"%s",0x00
+LC5:
+	DB	" 3",0x00
+LC4:
+	DB	" 3 4",0x00
+[SECTION .text]
+_print_line:
+	PUSH	EBP
+	MOV	EBP,ESP
+	PUSH	ESI
+	PUSH	EBX
+	MOV	ESI,DWORD [8+EBP]
+	CMP	BYTE [_print+20],0
+	JNE	L83
+L77:
+	MOV	EAX,DWORD [12+EBP]
+	MOV	DWORD [_print+16],EAX
+	MOV	EAX,DWORD [_options]
+	MOV	BYTE [_print+20],0
+	CMP	BYTE [73+EAX],0
+	JE	L84
+L76:
+	LEA	ESP,DWORD [-8+EBP]
+	POP	EBX
+	POP	ESI
+	POP	EBP
+	RET
+L84:
+	PUSH	DWORD [ESI]
+	CALL	_GO_strlen
+	MOV	ECX,EAX
+	POP	EAX
+	LEA	EDX,DWORD [16+ECX*4]
+	MOV	EAX,EDX
+	CALL	__alloca
+	LEA	EBX,DWORD [15+ESP]
+	PUSH	ECX
+	PUSH	DWORD [ESI]
+	AND	EBX,-16
+	PUSH	EBX
+	CALL	_cpp_quote_string
+	MOV	BYTE [EAX],0
+	PUSH	DWORD [16+EBP]
+	PUSH	EBX
+	MOV	EAX,DWORD [4+ESI]
+	ADD	EAX,DWORD [_print+16]
+	SUB	EAX,DWORD [8+ESI]
+	PUSH	EAX
+	PUSH	LC3
+	PUSH	DWORD [_print]
+	CALL	_GO_fprintf
+	ADD	ESP,32
+	MOV	AL,BYTE [17+ESI]
+	CMP	AL,2
+	JE	L85
+	DEC	AL
+	JE	L86
+L80:
+	PUSH	DWORD [_print]
+	PUSH	10
+	CALL	_GO_fputc
+	POP	EAX
+	POP	EDX
+	JMP	L76
+L86:
+	PUSH	DWORD [_print]
+	PUSH	LC5
+L82:
+	CALL	_GO_fputs
+	POP	ECX
+	POP	EBX
+	JMP	L80
+L85:
+	PUSH	DWORD [_print]
+	PUSH	LC4
+	JMP	L82
+L83:
+	PUSH	DWORD [_print]
+	PUSH	10
+	CALL	_GO_fputc
+	POP	EAX
+	POP	EDX
+	JMP	L77
+_cb_line_change:
+	PUSH	EBP
+	MOV	EBP,ESP
+	PUSH	EBX
+	MOV	EBX,DWORD [12+EBP]
+	CMP	BYTE [6+EBX],67
+	JE	L87
+	CMP	DWORD [16+EBP],0
+	JE	L96
+L87:
+	MOV	EBX,DWORD [-4+EBP]
+	LEAVE
+	RET
+L96:
+	PUSH	DWORD [EBX]
+	PUSH	DWORD [_print+4]
+	CALL	_maybe_print_line
+	POP	EDX
+	MOV	BYTE [_print+20],1
+	MOV	AX,WORD [4+EBX]
+	POP	ECX
+	MOV	DWORD [_print+8],0
+	MOV	DWORD [_print+12],0
+	CMP	AX,2
+	JBE	L87
+	MOVZX	EAX,AX
+	LEA	EBX,DWORD [-3+EAX]
+	CMP	EBX,-1
+	JE	L87
+L94:
+	PUSH	DWORD [_print]
+	PUSH	32
+	DEC	EBX
+	CALL	_GO_fputc
+	CMP	EBX,-1
+	POP	ECX
+	POP	EAX
+	JNE	L94
+	JMP	L87
+[SECTION .data]
+LC6:
+	DB	"#ident ",0x22,"%s",0x22,0x0A,0x00
+[SECTION .text]
+_cb_ident:
+	PUSH	EBP
+	MOV	EBP,ESP
+	PUSH	DWORD [12+EBP]
+	PUSH	DWORD [_print+4]
+	CALL	_maybe_print_line
+	MOV	EAX,DWORD [16+EBP]
+	PUSH	DWORD [4+EAX]
+	PUSH	LC6
+	PUSH	DWORD [_print]
+	CALL	_GO_fprintf
+	INC	DWORD [_print+16]
+	LEAVE
+	RET
+[SECTION .data]
+LC7:
+	DB	"#define ",0x00
+[SECTION .text]
+_cb_define:
+	PUSH	EBP
+	MOV	EBP,ESP
+	PUSH	EBX
+	PUSH	DWORD [12+EBP]
+	PUSH	DWORD [_print+4]
+	MOV	EBX,DWORD [16+EBP]
+	CALL	_maybe_print_line
+	PUSH	DWORD [_print]
+	PUSH	LC7
+	CALL	_GO_fputs
+	MOV	EAX,DWORD [_options]
+	ADD	ESP,16
+	CMP	BYTE [82+EAX],3
+	JE	L102
+	PUSH	DWORD [_print]
+	PUSH	DWORD [4+EBX]
+L101:
+	CALL	_GO_fputs
+	POP	EBX
+	POP	EAX
+	PUSH	DWORD [_print]
+	PUSH	10
+	CALL	_GO_fputc
+	MOV	EBX,DWORD [-4+EBP]
+	INC	DWORD [_print+16]
+	LEAVE
+	RET
+L102:
+	PUSH	DWORD [_print]
+	PUSH	EBX
+	PUSH	DWORD [8+EBP]
+	CALL	_cpp_macro_definition
+	POP	EDX
+	POP	ECX
+	PUSH	EAX
+	JMP	L101
+[SECTION .data]
+LC8:
+	DB	"#undef %s",0x0A,0x00
+[SECTION .text]
+_cb_undef:
+	PUSH	EBP
+	MOV	EBP,ESP
+	PUSH	DWORD [12+EBP]
+	PUSH	DWORD [_print+4]
+	CALL	_maybe_print_line
+	MOV	EAX,DWORD [16+EBP]
+	PUSH	DWORD [4+EAX]
+	PUSH	LC8
+	PUSH	DWORD [_print]
+	CALL	_GO_fprintf
+	INC	DWORD [_print+16]
+	LEAVE
+	RET
+[SECTION .data]
+LC9:
+	DB	"#%s %s",0x0A,0x00
+[SECTION .text]
+_cb_include:
+	PUSH	EBP
+	MOV	EBP,ESP
+	PUSH	DWORD [12+EBP]
+	PUSH	DWORD [_print+4]
+	CALL	_maybe_print_line
+	PUSH	DWORD [20+EBP]
+	PUSH	DWORD [8+EBP]
+	CALL	_cpp_token_as_text
+	POP	EDX
+	POP	ECX
+	PUSH	EAX
+	PUSH	DWORD [16+EBP]
+	PUSH	LC9
+	PUSH	DWORD [_print]
+	CALL	_GO_fprintf
+	INC	DWORD [_print+16]
+	LEAVE
+	RET
+[SECTION .data]
+LC10:
+	DB	" 1",0x00
+LC11:
+	DB	" 2",0x00
+[SECTION .text]
+_cb_file_change:
+	PUSH	EBP
+	MOV	EBP,ESP
+	PUSH	ESI
+	PUSH	EBX
+	MOV	ESI,LC2
+	MOV	EBX,DWORD [12+EBP]
+	CMP	DWORD [_print+4],0
+	JNE	L106
+	MOV	EAX,DWORD [_options]
+	CMP	BYTE [79+EAX],0
+	JE	L111
+L108:
+	MOV	DWORD [_print+4],EBX
+	LEA	ESP,DWORD [-8+EBP]
+	POP	EBX
+	POP	ESI
+	POP	EBP
+	RET
+L111:
+	PUSH	ESI
+	PUSH	DWORD [8+EBX]
+	PUSH	EBX
+	CALL	_print_line
+	ADD	ESP,12
+	JMP	L108
+L106:
+	CMP	BYTE [16+EBX],0
+	JE	L114
+L109:
+	MOV	AL,BYTE [16+EBX]
+	TEST	AL,AL
+	JNE	L110
+	MOV	ESI,LC10
+	JMP	L111
+L110:
+	DEC	AL
+	JNE	L111
+	MOV	ESI,LC11
+	JMP	L111
+L114:
+	MOV	EAX,DWORD [8+EBX]
+	DEC	EAX
+	PUSH	EAX
+	LEA	EAX,DWORD [-20+EBX]
+	PUSH	EAX
+	CALL	_maybe_print_line
+	POP	EAX
+	POP	EDX
+	JMP	L109
+[SECTION .data]
+LC12:
+	DB	"#pragma ",0x00
+[SECTION .text]
+_cb_def_pragma:
+	PUSH	EBP
+	MOV	EBP,ESP
+	PUSH	DWORD [12+EBP]
+	PUSH	DWORD [_print+4]
+	CALL	_maybe_print_line
+	PUSH	DWORD [_print]
+	PUSH	LC12
+	CALL	_GO_fputs
+	PUSH	DWORD [_print]
+	PUSH	DWORD [8+EBP]
+	CALL	_cpp_output_line
+	INC	DWORD [_print+16]
+	LEAVE
+	RET
+_dump_macro:
+	PUSH	EBP
+	MOV	EBP,ESP
+	PUSH	EBX
+	MOV	EBX,DWORD [12+EBP]
+	MOV	AX,WORD [12+EBX]
+	AND	AX,1279
+	DEC	AX
+	JE	L118
+L117:
+	MOV	EAX,1
+	MOV	EBX,DWORD [-4+EBP]
+	LEAVE
+	RET
+L118:
+	PUSH	DWORD [_print]
+	PUSH	LC7
+	CALL	_GO_fputs
+	PUSH	DWORD [_print]
+	PUSH	EBX
+	PUSH	DWORD [8+EBP]
+	CALL	_cpp_macro_definition
+	POP	ECX
+	POP	EBX
+	PUSH	EAX
+	CALL	_GO_fputs
+	PUSH	DWORD [_print]
+	PUSH	10
+	CALL	_GO_fputc
+	ADD	ESP,24
+	INC	DWORD [_print+16]
+	JMP	L117
+	GLOBAL	_progname
+[SECTION .data]
+	ALIGNB	4
+_progname:
+	RESB	4
+[SECTION .data]
+	ALIGNB	4
+_pfile:
+	RESB	4
+[SECTION .data]
+	ALIGNB	4
+_options:
+	RESB	4
+[SECTION .data]
+	ALIGNB	16
+_print:
+	RESB	24

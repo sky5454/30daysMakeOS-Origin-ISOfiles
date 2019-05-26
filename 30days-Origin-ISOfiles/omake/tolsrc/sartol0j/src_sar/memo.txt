@@ -1,0 +1,3 @@
+sargow32.libは、LGPL。
+mingwのライブラリからwin32APIに必要そうなものを抜き出したもので、
+その中身はgolib00でlst表示させればすぐに確認できます。

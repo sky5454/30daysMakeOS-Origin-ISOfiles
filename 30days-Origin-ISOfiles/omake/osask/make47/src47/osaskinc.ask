@@ -1,0 +1,94 @@
+/* "osaskinc.ask" */
+
+#define	ALIGN2	asmout("RESB (2 - ($ % 2)) % 2")
+#define	ALIGN4	asmout("RESB (4 - ($ % 4)) % 4")
+#define	ALIGN8	asmout("RESB (8 - ($ % 8)) % 8")
+#define	ALIGN16	asmout("RESB (16 - ($ % 16)) % 16")
+#define	ALIGN(bytes)	ALIGN ## bytes
+
+#define	jmp_system_count0()		asmout("JMP FAR DWORD SS:[0xFFFFFFE8]")
+
+struct STR_SYSWORK {
+	int [16];
+	int VGA_mode, to_winman0, CFport, eflags;
+	int modulelist[288]; /* 18 * 16 */
+	int alloclist[176]; /* 11 * 16 */
+	int [4]; /* terminator */
+	unsigned int bootmalloc_adr0, bootmalloc_fre0;
+	unsigned int bootmalloc_adr1, bootmalloc_fre1;
+	char FD_motor_init, FD_cache_init, DiskCacheReady, boot_keylock;
+	int FD_debug;
+	unsigned int bootmalloc_adr2, bootmalloc_fre2;
+	unsigned int bootmalloc_adr3, bootmalloc_fre3;
+	int bootlinear, bootlinear_EDI;
+	int bmodule_size, bmodule_paddr, bmodule_laddr;
+	int DiskCacheLength;
+	int gdt0[8];
+	unsigned int mscount[8];
+};
+
+#define ENT_SYSWORK		0x0000 /* Ç±ÇÍÇÕïKÇ∏ 0x0000 */
+#define	ENT_INIT		0x0010
+#define	ENT_VGADRV0		0x0020
+#define	ENT_KEYMOS0		0x0030
+#define	ENT_TIMERDRV	0x0040
+#define	ENT_TAPI0		0x0050
+#define	ENT_DECODE0		0x0060
+#define	ENT_FDCDRV0		0x0070
+#define	ENT_PIONEER0	0x0080
+#define	ENT_WINMAN0		0x0090
+#define	ENT_POKON0		0x00a0
+#define	ENT_VESA8		0x00b0
+#define	ENT_ANKFONT0	0x00c0
+#define	ENT_PAPI0		0x00d0
+#define	ENT_VESA16		0x00e0
+#define	ENT_VESA32		0x00f0
+#define	ENT_BOOT32		0x0100	/* Ç±ÇÍÇÕîÒà≥èk (Ç±ÇÍÇÕí èÌì]ëóÇ≥ÇÍÇ»Ç¢) */
+#define	ENT_FDIMAGE		0x0110	/* ì¡ï ì]ëó (Ç±ÇÍÇÕí èÌì]ëóÇ≥ÇÍÇ»Ç¢) */
+
+#define ENT_PDEPTE		0x0000
+#define	ENT_IDTGDT		0x0010
+#define	ENT_FREESLOT	0x0020
+#define	ENT_STACK		0x0030
+#define	ENT_KEYDATA		0x0040
+#define	ENT_GAPIDATA	0x0050
+#define	ENT_TIMERDAT	0x0060
+#define	ENT_TAPIWORK	0x0070
+#define	ENT_DECODATA	0x0080
+#define	ENT_FDCWORK		0x0090
+#define	ENT_PAPIWORK	0x00a0
+
+/* ASKAÇÃÉoÉOâÒîÇÃÇΩÇﬂÇ‚ÇﬁÇ»Ç≠égÇ§(boot32.ask) */
+#define	SYSWORK_MLIST	0x0020
+#define	SYSWORK_ALIST	0x0140
+
+#define	SEL_ALL			0x0008
+#define	SEL_INIT		0x0010
+#define	SEL_SYSWORK		0x0018
+#define	SEL_GAPI		0x0020
+#define	SEL_GAPIWORK	0x0028
+#define	SEL_STACK		0x0030
+#define	SEL_ANKFONT		0x0038
+#define	SEL_KEYINT		0x0040
+#define	SEL_KEYDATA		0x0048
+#define	SEL_TIMERINT	0x0050
+#define	SEL_TIMERDAT	0x0058
+#define	SEL_TAPI		0x0060
+#define	SEL_TAPIWORK	0x0068
+#define	SEL_PDEPTE		0x0070
+#define	SEL_IDTGDT		0x0078
+#define	SEL_ROOT		0x0080
+#define	SEL_TMP			0x0088
+#define	SEL_PAPI		0x0090
+#define SEL_PAPIWORK	0x0098
+#define SEL_VRAM		0x00a0
+#define SEL_BOOT32		0x00a8
+#define	SEL_DECODE		0x00b0
+#define SEL_DECOWORK	0x00b8
+#define	SEL_FDCDRIVE	0x00e0
+#define	SEL_FDCWORK		0x00e8
+#define	SEL_DISKBUF		0x00f0
+#define	SEL_TEXTBUF		0x00f8
+#define	SEL_FREEGDT		0x0100
+
+#define TSS_V86			0x5000

@@ -1,0 +1,24 @@
+romimage: file=bios.bin, address=0xf0000
+cpu: count=1, ips=1000000
+megs: 32
+vgaromimage: file=vgabios.bin
+vga: extension=vbe
+floppya: 1_44=fdimage0.bin, status=inserted
+boot: floppy
+clock: sync=realtime, time0=local
+floppy_bootsig_check: disabled=0
+log: bochsout.txt
+panic: action=ask
+error: action=report
+info: action=report
+debug: action=ignore
+debugger_log: debugger.out
+parport1: enabled=1, file="parport.out"
+vga_update_interval: 300000
+keyboard_serial_delay: 250
+keyboard_paste_delay: 100000
+mouse: enabled=0
+private_colormap: enabled=0
+keyboard_mapping: enabled=0, map=
+i440fxsupport: enabled=1
+display_library: win32, options="legacyF12" # use F12 to toggle mouse

@@ -1,0 +1,8 @@
+/* "TOWNS15.ASK" for TOWNS ver.0.0 copyright(C) 2004 I.Tak */
+
+/* ¡‚Ì‚Æ‚±‚ë, towns/vesa16.ask ‚Æ‹¤—p‚Å‚·
+ * HWcursor ‚È‚Ç‚Ì–ì–]‚à‚ ‚é‚µ (©‘åŒ¾‘sŒê)
+ * makefile‚ğ‘‚­‚Ì‚à‚ß‚ñ‚Ç‚¢‚Ì‚Å‚±‚ñ‚È‚ñ‚Å */
+
+#define TOWNS15
+#include "vesa16.ask"

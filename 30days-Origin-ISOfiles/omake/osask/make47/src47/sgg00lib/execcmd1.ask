@@ -1,0 +1,19 @@
+segment CODE(USE32, PARA);
+default(code == CODE);
+
+asmout("[FILE 'execcmd1.ask']");
+asmout("GLOBAL _sgg_execcmd1");
+
+/*	const int sgg_execcmd1(const int ret, const int cmd, ...)
+	ret = n * 4 + 12	*/
+
+void _sgg_execcmd1()
+{
+	PUSH(EBX);
+	LEA(EBX, [SS:ESP+12] /* cmd */);
+	CALL(0xcf,0);
+	EAX = [SS:ESP+8] /* ret */;
+	EAX = [SS:ESP+EAX];
+	POP(EBX);
+	return;
+}

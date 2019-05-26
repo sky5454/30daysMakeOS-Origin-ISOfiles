@@ -1,0 +1,85 @@
+―GNU Make for Win32 を使用した OSASK.EXE のビルドの方法について―
+2004.4.18 by 小柳 雅明(Koyanagi.Masaaki@nifty.com)
+
+◎ビルド方法
+Linux/Free BSDでのコンパイル方法は、OsaskWikiを御覧下さい。
+http://remo.s10.xrea.com/osawiki/pukiwiki.php
+
+0. document.txt の２．コンパイル＆アセンブル方法を参照して
+必要なファイルをPATH の通ったディレクトリに置きます。
+http://www.imasy.org/~kawai/osask/developers.html
+の tolset05 をダウンロードして使って下さい。
+
+1. 対象とするアーキテクチャに従って make にパラメータを与えて実行します。
+(1) PC/AT 互換機
+make at
+(2) VMware
+make vm
+(3) QEMU
+make mu
+(4) Bochs ver 1.3
+make bochs
+(5) Bochs ver 1.2.1
+make bochs12
+(6) FM-TOWNS
+make towns
+(7) NEC PC-98x1
+make nec98
+
+するとOSASK.EXE が生成されます。
+一度対象を決定した後は make のみで生成できます。
+対象を変更する場合は、変更前に make -i clean を実行して下さい。
+
+2. make clean とすると全ての生成物が削除されます。
+また make dist_clean で中間生成物が削除されます。
+
+◎画面デザイン
+画面デザインを変更するには以下の二通りの方法があります。
+
+(1)  depend.mak を編集する
+
+#DESIGN = WIN9X
+#DESIGN = WIN31
+#DESIGN = TMENU
+#DESIGN = CHO_OSASK
+#DESIGN = NEWSTYLE
+
+のいずれかの先頭の # を削除して下さい。それぞれ
+
+WIN9X      Win9x風
+WIN31      Win3.1風
+TMENU      T-OSASK
+CHO_OSASK  超OSASK
+NEWSTYLE   NWSOS風
+
+に対応します。default は Win9x風です。
+
+(2) make 実行時に直接指定する
+make pcat DESIGN=WIN9X
+のように make 実行時に直接指定できます。
+
+◎FM-TOWNS 版の設定パラメータ
+  FM-TOWNS 版の生成において depend.mak を編集することで設定を換える
+ことができます。
+・TWSCRL1 = y とすると 1ドットスクロールが有効になります。
+・TWVSW = n (768 <= n <= 1024 の 8の倍数) の数値を設定すると
+仮想画面の幅を変更できます。高さは自動的に決まります。
+・VMODE = y とすると、ビデオモードが有効になります。
+・CLGD543X = y とすると、Fresh-E,ES,ET,FS,FT HA HB HC (全てアクセラ未換装)
+シリーズでビデオアクセラレータCLGD543Xを使用した画面モードが使用可能に
+なります。
+
+◎その他
+・一部の生成ファイルが無い状態で make clean あるいは make dist_cleanす
+ると、del に失敗して処理が停止してしまいます。この場合には -i オプショ
+ンを付けて make -i clean あるいはmake -i dist_clean して下さい。
+
+・make towns を行った後 make bootimg を実行すると OSASK.EXEを 0x8000～用に
+リロケートした OSASK.SYS を生成します。生成には imgtol.com が必要です。
+imgtol.com は tolset05 の中にあります。Windows 2000/XP では、imgtol.com
+実行時に画面がクリアされますが実行には問題はありません。
+
+
+◎著作権
+  makefile の著作権は、小柳 雅明にあり、川合堂ライセンス-01を適用しま
+す。

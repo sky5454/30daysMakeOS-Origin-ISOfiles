@@ -1,0 +1,16 @@
+segment CODE(USE32, PARA);
+default(code == CODE);
+
+asmout("[FILE 'execcmd.ask']");
+asmout("GLOBAL _sgg_execcmd");
+
+/* void sgg_execcmd(void *EBX); */
+
+void _sgg_execcmd()
+{
+	PUSH(EBX);
+	EBX = [SS:ESP+8];
+	CALL(0xcf,0);
+	POP(EBX);
+	return;
+}

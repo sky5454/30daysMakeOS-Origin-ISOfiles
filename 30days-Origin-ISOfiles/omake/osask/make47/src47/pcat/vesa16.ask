@@ -1,0 +1,2543 @@
+/* "VESA16.ASK" for PC/AT ver.0.5 copyright(C) 2004 川合秀実 */
+
+segment CODE(USE32, PARA);
+default(code == CODE);
+
+struct GAPI_WORK {
+	signed int mx, my, mx0, my0, mx1, my1;
+	int cursor_addr, pattern_addr;
+	unsigned int lockcount, mouselock; /* +32 */
+	char mouseflag, maskflag, mouseline, V86flag;
+	int VGA_mode;
+	short V86CS, V86SS;
+	int linebytes, x2, y2;
+	unsigned char mouse_width, mouse_height, [2];
+	void [636];
+	int backup_buf[576]; /* +704 */
+	int mouse_pattern[2304]; /* 1280 */
+	void [512]; /* フォント管理用ワーク */
+	/* 以上4KB */
+};
+
+void far GAPI_entry()
+/* 必ず、EFLAGS.IF == 1で呼ぶこと */
+{
+	goto syscmd;
+//	ORG(0x0008);
+//	ORG(0x0010);
+	asmout("RESB 0x10-$");
+	asmout("DD OFFSET #syscmd, 0, 0, 0");
+	DD(4096); /* 初期化時に必要なワークエリアサイズ */
+	DD(0); /* 最大ローカルスタック消費量 */
+//	ORG(0x0040);
+	asmout("RESB 0x40-$");
+syscmd:
+	GAPI_WORK *work == ES:0x0000;
+
+	int all_sel == 1 * 8;
+	int *cmd == FS:EBX;
+
+	asmout("#GAPI_accesslock EQU GAPI_accesslock");
+	asmout("#GAPI_mouse EQU GAPI_mouse");
+	asmout("#GAPI_line EQU GAPI_line");
+	asmout("#GAPI_fontwrite EQU GAPI_fontwrite");
+	asmout("#GAPI_init EQU GAPI_init");
+	asmout("#GAPI_resetdevice EQU GAPI_resetdevice");
+	asmout("#GAPI_error EQU GAPI_error");
+	asmout("#GAPI_putbox EQU GAPI_putbox");
+	asmout("#GAPI_lineardots EQU GAPI_lineardots");
+	asmout("#GAPI_points EQU GAPI_points");
+
+	PUSH(DS);
+	PUSH(ES);
+	PUSHAD();
+	PUSH(all_sel);
+	POP(DS);
+	MOV(ECX, CS);
+	ECX += 8;
+	ES = ECX;
+
+asmout("next_command: EQU $");
+
+	EAX = cmd[0];
+	if (EAX == 0x0184)
+		goto GAPI_accesslock;
+	if (EAX == 0x0101)
+		goto GAPI_fontwrite;
+	if (EAX == 0x0108)
+		goto GAPI_putbox;
+	if (EAX == 0x0100)
+		goto GAPI_line;
+	if (EAX == 0x010c)
+		goto GAPI_lineardots;
+	if (EAX == 0x0110)
+		goto GAPI_points;
+	if (EAX == 0x0180)
+		goto GAPI_mouse;
+	if (EAX == 0x0010)
+		goto GAPI_init;
+	if (EAX == 0x001c)
+		goto GAPI_resetdevice;
+	if (EAX == 0x0104)
+		goto fontload;
+//	if (EAX == 0x0108)
+//		goto allocarea; /* cmd, opt, size, (addr) */
+	if (EAX == 0x0140)
+		goto font_attr; /* cmd, opt, type, (param0), (param1), (param2), (param3) */
+
+	if (EAX != 0)
+		goto GAPI_error;
+
+	[SS:ESP + 16] = EBX;
+	POPAD();
+	POP(ES);
+	POP(DS);
+	return;
+
+fontload:
+	/* cmd, opt, type, len, to, from */
+	PUSH(DS);
+	asmout("LDS ESI,DWORD FS:[EBX+20]");
+	EAX = cmd[ 8]; /* type */
+	ECX = cmd[12]; /* len */
+	EDI = cmd[16]; /* to */
+	(offset) cmd += 28;
+	if (EAX <= 2) {
+		/* mono, full/half */
+		LEA(ECX, [ECX * 2]);
+		if (!=)
+			ECX *= 2;
+		do {
+			EAX = [DS:ESI];
+			ESI += 4;
+			[ES:EDI] = EAX;
+			EDI += 4;
+			ECX--;
+		} while (!= 0);
+		POP(DS);
+		asmout("JMP next_command");
+	}
+	if (EAX <= 4) {
+		/* EAX == 3:4bit color 8x16 */
+		/* EAX == 4:4bit color 8x8 */
+		LEA(ECX, [ECX * 8]);
+		if (!=)
+			ECX *= 2;
+		do {
+			EDX = [DS:ESI]; /* 8dots */
+			ESI += 4;
+			AH = DH;
+			AL = DH;
+			(unsigned char) AH >>= 4;
+			EAX <<= 16;
+			AH = DL;
+			AL = DL;
+			(unsigned char) AH >>= 4;
+			EAX &= 0x0f0f0f0f;
+			[ES:EDI] = EAX;
+			(unsigned int) EDX >>= 16;
+			AH = DH;
+			AL = DH;
+			(unsigned char) AH >>= 4;
+			EAX <<= 16;
+			AH = DL;
+			AL = DL;
+			(unsigned char) AH >>= 4;
+			EAX &= 0x0f0f0f0f;
+			[ES:EDI + 4] = EAX;
+			EDI += 8;
+			ECX--;
+		} while (!= 0);
+		POP(DS);
+		asmout("JMP next_command");
+	}
+	INT(0x03);
+
+font_attr:
+	/* cmd, opt, type, (param0), (param1), (param2), (param3) */
+	EAX = cmd[ 8]; /* type */
+	asmout("MOV AL,BYTE PTR CS:[#font_attr_table+EAX-1]");
+	(char) cmd[12] = AL;
+	(offset) cmd += 28;
+	asmout("JMP next_command");
+font_attr_table:
+	DB(4 /*  16bytes/font (8x16 mono) */);
+	DB(3 /*   8bytes/font (8x 8 mono half height) */);
+	DB(7 /* 128bytes/font (8x16 4bit color) */);
+	DB(6 /*  64bytes/font (8x 8 4bit color half height) */);
+
+//	DB(8 /* 128bytes/font (8x16 4bit color) */);
+//	DB(7 /*  64bytes/font (8x 8 4bit color half height) */);
+}
+
+void colortable16()
+{
+	DD(0x00000000, 0x80008000, 0x04200420, 0x84208420);
+	DD(0x00100010, 0x80108010, 0x04300430, 0x84308430);
+	DD(0xc638c638, 0xf800f800, 0x07e007e0, 0xffe0ffe0);
+	DD(0x001f001f, 0xf81ff81f, 0x07ff07ff, 0xffffffff);
+}
+
+void GAPI_fontwrite()
+{
+	/* 8x16のフォントを描画(背景色付き) */
+	int *cmd == FS:EBX;
+	GAPI_WORK *work == ES:0x0000;
+
+	/* opt	bit0:full higth/half height
+			bit1-7:	0000000 mono font col&bcol
+					0000001 4bit color font
+	*/
+
+	EAX = cmd[4];
+	if (AH != 0)
+		goto opt_high;
+	if ((unsigned) EAX >= 2)
+		goto opt2;
+	EAX = cmd[ 8]; /* x */
+	ESI = cmd[12]; /* y */
+	TEST(AL, 0x01);
+	if (!= 0)
+		goto error; /* 2の倍数以外はまだサポートしてない */
+
+	IMUL(ESI, work->linebytes);
+	LEA(ESI, [ESI + EAX * 2 + 0xe0000000]);
+
+	int *font == ES:EDI;
+	EAX = (unsigned char) cmd[20]; /* bgcolor */
+	asmout("MOV EDX,[CS:colortable16+EAX*4]");
+	EAX = (unsigned char) cmd[16]; /* color */
+	asmout("MOV EBP,[CS:colortable16+EAX*4]");
+
+	/* EBP:col, EDX:bgcol */
+	PUSH(EBP); // 11
+	EAX = EBP; ECX = EDX; EAX &= 0x0000ffff; ECX &= 0xffff0000; EAX |= ECX; PUSH(EAX); // 10
+	EAX = EBP; ECX = EDX; EAX &= 0xffff0000; ECX &= 0x0000ffff; EAX |= ECX; PUSH(EAX); // 01
+	PUSH(EDX); // 00
+
+	int *string == FS:EBP;
+	ECX = cmd[32]; // length
+
+	if (cmd[4] != 0)
+		goto opt1;
+
+	LEA((offset) string, [EBX + 36]);
+//	LEA(EBX, [EBX + ECX * 4 + 36]);
+
+	do {
+		PUSH(ECX);
+		(offset) font = *string;
+		(offset) string += 4;
+		ECX = 4;
+		PUSH(ESI);
+		do {
+			EBX = *font; /* 4lines */
+			(offset) font += 4;
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI + 12] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  8] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  4] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  0] = EAX;
+			ESI += work->linebytes;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI + 12] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  8] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  4] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  0] = EAX;
+			ESI += work->linebytes;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI + 12] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  8] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  4] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  0] = EAX;
+			ESI += work->linebytes;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI + 12] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  8] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  4] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			[DS:ESI +  0] = EAX;
+			ESI += work->linebytes;
+			ECX--;
+		} while (!= 0);
+		POP(ESI);
+		POP(ECX);
+		ESI += 2 * 8;
+		ECX--;
+	} while (!= 0);
+	ESP += 16;
+	(offset) cmd = (offset) string;
+	asmout("JMP next_command");
+
+opt1:
+	/* half height */
+	LEA((offset) string, [EBX + 36]);
+//	LEA(EBX, [EBX + ECX * 4 + 36]);
+
+	do {
+		PUSH(ECX);
+		(offset) font = *string;
+		(offset) string += 4;
+		ECX = 2;
+		PUSH(ESI);
+		do {
+			EBX = *font; /* 4lines */
+			(offset) font += 4;
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI + 12] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  8] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  4] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  0] = EAX;
+			ESI += work->linebytes;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI + 12] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  8] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  4] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  0] = EAX;
+			ESI += work->linebytes;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI + 12] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  8] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  4] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  0] = EAX;
+			ESI += work->linebytes;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI + 12] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  8] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			EDX = EBX;
+			(unsigned int) EBX /= 4;
+			EDX &= 0x03;
+			[DS:ESI +  4] = EAX;
+
+			EAX = [SS:ESP + EDX * 4 + 8];
+			[DS:ESI +  0] = EAX;
+			ESI += work->linebytes;
+			ECX--;
+		} while (!= 0);
+		POP(ESI);
+		POP(ECX);
+		ESI += 2 * 8;
+		ECX--;
+	} while (!= 0);
+	ESP += 16;
+	(offset) cmd = (offset) string;
+	asmout("JMP next_command");
+
+opt2:
+	EAX = cmd[ 8]; /* x */
+	ESI = cmd[12]; /* y */
+//	TEST(AL, 0x03);
+//	if (!= 0)
+//		goto error; /* 4の倍数以外はまだサポートしてない */
+
+	IMUL(ESI, work->linebytes);
+	LEA(ESI, [ESI + EAX * 2 + 0xe0000000]);
+
+//	int *font == ES:EDI;
+//	int *string == FS:EBP;
+	ECX = cmd[32]; // length
+
+	if (cmd[4] != 2)
+		goto opt3;
+	INT(0x03);
+
+	LEA((offset) string, [EBX + 36]);
+//	LEA(EBX, [EBX + ECX * 4 + 36]);
+
+	do {
+		PUSH(ECX);
+		(offset) font = *string;
+		(offset) string += 4;
+		ECX = 4;
+		PUSH(ESI);
+		do {
+			EAX = font[ 0]; /* 4dots */
+			EDX = font[ 4];
+			[DS:ESI + 0] = EAX;
+			[DS:ESI + 4] = EDX;
+			ESI += work->linebytes;
+			EAX = font[ 8]; /* 4dots */
+			EDX = font[12];
+			[DS:ESI + 0] = EAX;
+			[DS:ESI + 4] = EDX;
+			ESI += work->linebytes;
+			EAX = font[16]; /* 4dots */
+			EDX = font[20];
+			[DS:ESI + 0] = EAX;
+			[DS:ESI + 4] = EDX;
+			ESI += work->linebytes;
+			EAX = font[24]; /* 4dots */
+			EDX = font[28];
+			(offset) font += 32;
+			[DS:ESI + 0] = EAX;
+			[DS:ESI + 4] = EDX;
+			ESI += work->linebytes;
+			ECX--;
+		} while (!= 0);
+		POP(ESI);
+		POP(ECX);
+		ESI += 2 * 8;
+		ECX--;
+	} while (!= 0);
+	(offset) cmd = (offset) string;
+	asmout("JMP next_command");
+
+opt3:
+	/* half height */
+	LEA((offset) string, [EBX + 36]);
+//	LEA(EBX, [EBX + ECX * 4 + 36]);
+
+	do {
+		PUSH(ECX);
+		(offset) font = *string;
+		(offset) string += 4;
+		ECX = 8;
+		PUSH(ESI);
+		do {
+			EDX = font[ 0]; /* 2dots */
+			EAX = EDX;
+			(unsigned int) EDX >>= 8;
+			EAX &= 0x0f;
+			EDX &= 0x0f;
+			asmout("MOV EAX,[CS:colortable16+EAX*4]");
+			asmout("MOV EDX,[CS:colortable16+EDX*4]");
+			[DS:ESI +  0] = AX;
+			EAX = font[ 0]; /* 2dots */
+			[DS:ESI +  2] = DX;
+			EDX = EAX;
+			(unsigned int) EAX >>= 16;
+			(unsigned int) EDX >>= 24;
+			EAX &= 0x0f;
+			EDX &= 0x0f;
+			asmout("MOV EAX,[CS:colortable16+EAX*4]");
+			asmout("MOV EDX,[CS:colortable16+EDX*4]");
+			[DS:ESI +  4] = AX;
+			[DS:ESI +  6] = DX;
+			EDX = font[ 4]; /* 2dots */
+			EAX = EDX;
+			(unsigned int) EDX >>= 8;
+			EAX &= 0x0f;
+			EDX &= 0x0f;
+			asmout("MOV EAX,[CS:colortable16+EAX*4]");
+			asmout("MOV EDX,[CS:colortable16+EDX*4]");
+			[DS:ESI +  8] = AX;
+			EAX = font[ 4]; /* 2dots */
+			[DS:ESI + 10] = DX;
+			EDX = EAX;
+			(unsigned int) EAX >>= 16;
+			(unsigned int) EDX >>= 24;
+			EAX &= 0x0f;
+			EDX &= 0x0f;
+			asmout("MOV EAX,[CS:colortable16+EAX*4]");
+			asmout("MOV EDX,[CS:colortable16+EDX*4]");
+			[DS:ESI + 12] = AX;
+			[DS:ESI + 14] = DX;
+			(offset) font += 8;
+			ESI += work->linebytes;
+			ECX--;
+		} while (!= 0);
+		POP(ESI);
+		POP(ECX);
+		ESI += 2 * 8;
+		ECX--;
+	} while (!= 0);
+	(offset) cmd = (offset) string;
+	asmout("JMP next_command");
+
+opt_high:
+/*
+	0x0101, opt, x, y, col, bcol[20], dummy[24], dummy[28], len, str...
+	optによって、x, yがofs:selになる
+	opt8-10 : 0, 1, 2, 4(3) (0以外はRAM描画, dmy[24]がラインバイト)
+	opt11 : extフラグ, strをfar-ptrにする(でも価値無しだな)
+	opt12 : col無効化フラグに
+	opt13 : bcol無効化フラグ
+	opt14-15 : pset, and, or, xor
+	とりあえず、opt:0x0100のみのサポートを追加しよう。
+	optで関数のアドレスが決まり、それをループごとに呼ぶ。jmpでもよい。
+*/
+	if (EAX != 0x0100)
+		goto error;
+	PUSH(DS);
+	EBP = cmd[24];
+	LDS(ESI, cmd[8]);
+	ECX = cmd[32]; /* len */
+	DL = cmd[16]; /* col */
+	DH = cmd[20]; /* bcol */
+	(offset) cmd += 36;
+	do {
+		PUSH(ECX);
+		PUSH(ESI);
+		EDI = *cmd;
+		(offset) cmd += 4;
+		CL = 16;
+		do {
+			CH = [ES:EDI];
+			EDI++;
+			TEST(CH, 0x80);
+			AL = DL;
+			if (== 0)
+				AL = DH;
+			[DS:ESI] = AL;
+			TEST(CH, 0x40);
+			AL = DL;
+			if (== 0)
+				AL = DH;
+			[DS:ESI + 1] = AL;
+			TEST(CH, 0x20);
+			AL = DL;
+			if (== 0)
+				AL = DH;
+			[DS:ESI + 2] = AL;
+			TEST(CH, 0x10);
+			AL = DL;
+			if (== 0)
+				AL = DH;
+			[DS:ESI + 3] = AL;
+			TEST(CH, 0x08);
+			AL = DL;
+			if (== 0)
+				AL = DH;
+			[DS:ESI + 4] = AL;
+			TEST(CH, 0x04);
+			AL = DL;
+			if (== 0)
+				AL = DH;
+			[DS:ESI + 5] = AL;
+			TEST(CH, 0x02);
+			AL = DL;
+			if (== 0)
+				AL = DH;
+			[DS:ESI + 6] = AL;
+			TEST(CH, 0x01);
+			AL = DL;
+			if (== 0)
+				AL = DH;
+			[DS:ESI + 7] = AL;
+			ESI += EBP;
+			CL--;
+		} while (!= 0);
+		POP(ESI);
+		POP(ECX);
+		ESI += 8;
+		ECX--;
+	} while (!= 0);
+	POP(DS);
+	asmout("JMP next_command");
+
+error:
+	INT(0x03);
+}
+
+void init_mousecursor()
+{
+	unsigned char *cursor0 == GS:ESI; /* [y][x] */
+	int *cursor_buf == DS:EDI;
+	GAPI_WORK *work == DS:0x0000;
+
+	PUSH(DS);
+	PUSH(ES);
+	POP(DS); /* DS == work */
+
+	LEA((offset) cursor_buf, work->mouse_pattern[0]);
+
+	CH = 16;
+	do {
+		/* 1loop当たり、1line */
+		CL = 0x80;
+		do {
+			EAX = 0x0000ffff;
+			EDX = 0;
+			TEST(cursor0[ 0], CL); /* black */
+			if (!= 0)
+				EAX = 0;
+			TEST(cursor0[32], CL); /* white */
+			if (!= 0) {
+				EAX = 0;
+				EDX = 0x0000ffff;
+			}
+			(short) cursor_buf[0] = AX;
+			(short) cursor_buf[4] = DX;
+			(unsigned char) CL /= 2;
+			EAX = 0x0000ffff;
+			EDX = 0;
+			TEST(cursor0[ 0], CL); /* black */
+			if (!= 0)
+				EAX = 0;
+			TEST(cursor0[32], CL); /* white */
+			if (!= 0) {
+				EAX = 0;
+				EDX = 0x0000ffff;
+			}
+			(short) cursor_buf[2] = AX;
+			(short) cursor_buf[6] = DX;
+			(offset) cursor_buf += 8;
+			(unsigned char) CL /= 2;
+		} while (!= 0);
+		CL = 0x80;
+		do {
+			EAX = 0x0000ffff;
+			EDX = 0;
+			TEST(cursor0[ 1], CL); /* black */
+			if (!= 0)
+				EAX = 0;
+			TEST(cursor0[33], CL); /* white */
+			if (!= 0) {
+				EAX = 0;
+				EDX = 0x0000ffff;
+			}
+			(short) cursor_buf[0] = AX;
+			(short) cursor_buf[4] = DX;
+			(unsigned char) CL /= 2;
+			EAX = 0x0000ffff;
+			EDX = 0;
+			TEST(cursor0[ 1], CL); /* black */
+			if (!= 0)
+				EAX = 0;
+			TEST(cursor0[33], CL); /* white */
+			if (!= 0) {
+				EAX = 0;
+				EDX = 0x0000ffff;
+			}
+			(short) cursor_buf[2] = AX;
+			(short) cursor_buf[6] = DX;
+			(offset) cursor_buf += 8;
+			(unsigned char) CL /= 2;
+		} while (!= 0);
+		(offset) cursor0 += 2;
+		cursor_buf[0] = 0xffffffff;
+		cursor_buf[4] = 0x00000000;
+		(offset) cursor_buf += 8;
+		CH--;
+	} while (!= 0);
+
+	/* ずらしパターンの用意 */
+//	LEA((offset) cursor_buf, work->mouse_pattern[1152]);
+	CH = 16;
+	do {
+		EAX = cursor_buf[-1152 + 0]; EDX = cursor_buf[-1152 + 4];
+		EAX <<= 16; EDX <<= 16;
+		EAX |= 0x0000ffff;
+		cursor_buf[0] = EAX;
+		cursor_buf[4] = EDX;
+		(offset) cursor_buf += 8;
+		CL = 8;
+		do {
+			EAX = cursor_buf[-1152 + 0]; EDX = cursor_buf[-1152 + 4];
+			EAX <<= 16; EDX <<= 16;
+			AX  = cursor_buf[-1152 - 6]; DX  = cursor_buf[-1152 - 2];
+			cursor_buf[0] = EAX;
+			cursor_buf[4] = EDX;
+			(offset) cursor_buf += 8;
+			CL--;
+		} while (!= 0);
+		CH--;
+	} while (!= 0);
+
+	POP(DS);
+	return;
+}
+
+void GAPI_init()
+{
+	int all_sel == 1 * 8;
+	int *cmd == FS:EBX;
+
+	cmd[4] = 0xffffffff; /* 終了 */
+	(offset) cmd += 12;
+
+	GAPI_WORK *workES == ES:0x0000;
+
+	ECX = 0;
+	workES->mx1 = 0x80000000; /* 非表示 */
+	workES->lockcount = /* 0 */ ECX;
+	workES->mouselock = /* 0 */ ECX;
+	workES->VGA_mode = /* 0 */ ECX;
+	workES->mouseflag = /* 0 */ CL;
+
+	asmout("JMP next_command");
+}
+
+void GAPI_resetdevice()
+{
+	GAPI_WORK *work == ES:0x0000;
+	int *cmd == FS:EBX;
+
+	if (cmd[8] == 0x0020) {
+		/* 解像度伝達 */
+		EAX = cmd[12];
+		ECX = cmd[16];
+		work->x2 = EAX;
+		work->y2 = ECX;
+		EAX *= 2;
+		work->linebytes = EAX;
+		(offset) cmd += 20;
+		asmout("JMP next_command");
+	}
+
+	// パレット初期化
+
+	cmd[4] = 0xffffffff; // 終了
+	(offset) cmd += 12;
+	asmout("JMP next_command");
+
+#if 0
+palette_table: // Red, Green, Blue
+	// 0:黒, 7:暗い灰色, 8:明るい灰色, 6:バックの色, 15:白
+
+	asmout("DB 000H, 000H, 000H,   084H, 000H, 000H,   000H, 084H, 000H,   084H, 084H, 000H");
+	asmout("DB 000H, 000H, 084H,   084H, 000H, 084H,   000H, 084H, 084H,   084H, 084H, 084H");
+	asmout("DB 0C6H, 0C6H, 0C6H,   0FFH, 000H, 000H,   000H, 0FFH, 000H,   0FFH, 0FFH, 000H");
+	asmout("DB 000H, 000H, 0FFH,   0FFH, 000H, 0FFH,   000H, 0FFH, 0FFH,   0FFH, 0FFH, 0FFH");
+
+	color 0-3 : 0x0000, 0x8000, 0x0420, 0x8420
+	color 4-7 : 0x0010, 0x8010, 0x0430, 0x8430
+	color 8-b : 0xc638, 0xf800, 0x07e0, 0xffe0
+	color c-f : 0x001f, 0xf81f, 0x07ff, 0xffff
+
+#endif
+}
+
+void GAPI_putmouse()
+/* 破壊レジスタ：EAX, ECX, EDX, ESI, EDI */
+{
+	GAPI_WORK *work == ES:0x0000;
+	int *b /* backup */ == ES:EDX, *p /* cursor */ == DS:ESI, *q /* pattern */ == ES:EDI;
+	short *b2 /* backup */ == ES:EDX, *p2 /* cursor */ == DS:ESI, *q2 /* pattern */ == ES:EDI;
+
+	LEA((offset) b, work->backup_buf[0]);
+	(offset) p = work->cursor_addr;
+	(offset) q = work->pattern_addr;
+	PUSH(EBP);
+	CH = work->mouse_height;
+	EBP = work->linebytes;
+	work->mouseflag = 1;
+	if (CH == 0)
+		goto skip;
+	if (work->mouse_width == 18) {
+		PUSH(EBX);
+		do {
+			EAX =  p[ 0]; EBX =  p[ 4]; /*  0- 3 */
+			b[ 0] =  EAX; b[ 4] =  EBX;
+			EAX &= q[ 0]; EBX &= q[ 8];
+			EAX ^= q[ 4]; EBX ^= q[12];
+			p[ 0] =  EAX; p[ 4] =  EBX;
+
+			EAX =  p[ 8]; EBX =  p[12]; /*  4- 7 */
+			b[ 8] =  EAX; b[12] =  EBX;
+			EAX &= q[16]; EBX &= q[24];
+			EAX ^= q[20]; EBX ^= q[28];
+			p[ 8] =  EAX; p[12] =  EBX;
+
+			EAX =  p[16]; EBX =  p[20]; /*  8-11 */
+			b[16] =  EAX; b[20] =  EBX;
+			EAX &= q[32]; EBX &= q[40];
+			EAX ^= q[36]; EBX ^= q[44];
+			p[16] =  EAX; p[20] =  EBX;
+
+			EAX =  p[24]; EBX =  p[28]; /* 12-15 */
+			b[24] =  EAX; b[28] =  EBX;
+			EAX &= q[48]; EBX &= q[56];
+			EAX ^= q[52]; EBX ^= q[60];
+			p[24] =  EAX; p[28] =  EBX;
+
+			EAX =  p[32];
+			b[32] =  EAX;
+			EAX &= q[64];
+			(offset) b += 36;
+			EAX ^= q[68];
+			(offset) q += 72;
+			p[32] =  EAX;
+			(offset) p += EBP;
+			CH--;
+		} while (!= 0);
+		POP(EBX);
+		POP(EBP);
+		return;
+	}
+	do {
+		CL = work->mouse_width;
+		PUSH((offset) q);
+		PUSH((offset) p);
+		do {
+			AX = *p2;
+			*b2 = AX;
+			AX &= q2[0];
+			(offset) b += 2;
+			AX ^= q2[4];
+			*p2 = AX;
+			CL--;
+			if (== 0)
+				break;
+			AX = p2[2];
+			*b2 = AX;
+			AX &= q2[2];
+			(offset) b += 2;
+			AX ^= q2[6];
+			(offset) q += 8;
+			p2[2] = AX;
+			(offset) p += 4;
+			CL--;
+		} while (!= 0);
+		POP((offset) p);
+		POP((offset) q);
+		(offset) p += EBP;
+		(offset) q += 72;
+		CH--;
+	} while (!= 0);
+skip:
+	POP(EBP);
+	return;
+}
+
+void GAPI_removemouse()
+/* 破壊レジスタ：EAX, ECX, EDX, ESI, EDI */
+{
+	GAPI_WORK *work == ES:0x0000;
+	int *b /* backup */ == ES:EDI, *p /* cursor */ == DS:ESI;
+	short *b2 /* backup */ == ES:EDI, *p2 /* cursor */ == DS:ESI;
+
+	LEA((offset) b, work->backup_buf[0]);
+	(offset) p = work->cursor_addr;
+	PUSH(EBP);
+	CH = work->mouse_height;
+	EBP = work->linebytes;
+	work->mouseflag = 0;
+	if (CH == 0)
+		goto skip;
+	if (work->mouse_width == 18) {
+		do {
+			EAX = b[ 0]; EDX = b[ 4];
+			p[ 0] = EAX; p[ 4] = EDX;
+			EAX = b[ 8]; EDX = b[12];
+			p[ 8] = EAX; p[12] = EDX;
+			EAX = b[16]; EDX = b[20];
+			p[16] = EAX; p[20] = EDX;
+			EAX = b[24]; EDX = b[28];
+			p[24] = EAX; p[28] = EDX;
+			EAX = b[32];
+			(offset) b += 36;
+			p[32] = EAX;
+			(offset) p += EBP;
+			CH--;
+		} while (!= 0);
+		POP(EBP);
+		return;
+	}
+	do {
+		EDX = (offset) p;
+		CL = work->mouse_width;
+		do {
+			AX = *b2;
+			(offset) b += 2;
+			*p2 = AX;
+			(offset) p += 2;
+			CL--;
+		} while (!= 0);
+		LEA((offset) p, [EDX + EBP]);
+		CH--;
+	} while (!= 0);
+skip:
+	POP(EBP);
+	return;
+}
+
+void GAPI_clippingmouse()
+/* 何も制限しない */
+/* (mx, my) : 共に符号付き整数 */
+/* EBX以外を破壊 */
+{
+	GAPI_WORK *work == ES:0x0000;
+	char *p == DS:EDI /* カーソルアドレス */, *q == ES:EAX;
+	signed int x == ESI, y == EBP;
+
+	ECX = 0; /* start */
+	EDX = 0x1012; /* len */
+	x = work->mx;
+	y = work->my;
+	x &= /* ~0x01 */ 0xfffffffe;
+	EAX = x;
+	/* (false) */ if (x < 0) {
+		/* (false) */ if (x <= -18)
+			goto full_outside;
+		x = 0;
+		DL = 16;
+		CL = AL;
+		DL += AL;
+		CL = - CL;
+	}
+	EAX += 18;
+	/* (false) */ if (EAX > work->x2) {
+		EAX = work->mx;
+		x = EAX;
+		EAX -= work->x2;
+		/* (false) */ if ((signed) >= 0)
+			goto full_outside;
+		x = work->mx;
+		DL = AL;
+		DL =- DL;
+		EAX = work->x2;
+	}
+	work->mx0 = x;
+	work->mx1 = EAX;
+	EAX = y;
+	/* (false) */ if (y < 0) {
+		/* (false) */ if (y <= -16)
+			goto full_outside;
+		y = 0;
+		CH = AL;
+		DH += AL;
+		CH = - CH;
+	}
+	EAX += 16;
+	/* (false) */ if (EAX >= work->y2) {
+		EAX -= work->y2;
+		/* (false) */ if ((signed) EAX >= 16)
+			goto full_outside;
+		DH -= AL;
+		EAX = work->y2;
+	}
+	work->my0 = y;
+	work->my1 = EAX;
+	(offset) q = 0;
+	work->mouse_width = DL;
+	work->mouse_height = DH;
+	if (CH != 0) {
+		do {
+			(offset) q += 72;
+			CH--;
+		} while (!= 0);
+	}
+	(offset) p = y;
+	IMUL((offset) p, work->linebytes);
+	LEA((offset) p, [EDI /* p */ + ESI * 2 + 0xe0000000]);
+	TEST((char) work->mx, 0x01);
+//	LEA((offset) q, work->mouse_pattern[EAX /* q */ + ECX * 4]);
+	LEA((offset) q, [EAX /* q */ + ECX * 4 + 1280]);
+	if (!= 0) {
+		if (DL == 18)
+			(offset) q += 1152;
+	}
+	LEA((offset) p, [EDI /* p */ + ECX * 2]);
+	work->pattern_addr = (offset) q;
+	work->cursor_addr = (offset) p;
+	return;
+full_outside:
+	work->mouse_height = 0;
+	return;
+}
+
+void GAPI_accesslock()
+/* opt bit0  0:Lock 1:Unlock
+       bit1  Lock時のオプション   0:nearポインタあり 1:なし
+             Unlock時のオプション 0:範囲指定なし 1:あり
+       bit8-31  Unlock-opt */
+{
+	int *cmd == FS:EBX;
+	GAPI_WORK *work == ES:0x0000;
+
+	EAX = cmd[8]; // opt
+	if (AL == 0)
+		goto lock_bitset;
+	if (AL == 0x02)
+		goto lock_bitnoset;
+	if (AL == 0x01)
+		goto unlock_optbit;
+	if (AL == 0x03)
+		goto unlock_area;
+	INT(0x03);
+
+lock_bitset:
+	EAX = cmd[12]; // x0
+	ECX = cmd[16]; // y0
+	ESI = cmd[20]; // x1
+	EDI = cmd[24]; // y1
+	EBP = cmd[28]; // ofs
+	cmd[4] = 0xffffffff; /* 終了 */
+	(offset) cmd += 32;
+	CLI();
+	work->lockcount++;
+	if ((signed) EAX /* x0 */ < work->mx1) {
+		if ((signed) ECX /* y0 */ < work->my1) {
+			if ((signed) ESI /* x1 */ > work->mx0) {
+				if ((signed) EDI /* y1 */ > work->my0) {
+					if (work->mouseflag != 0) {
+						GAPI_removemouse(); // remove mouse (mouseflag = 0)
+					}
+					work->mouselock++;
+					(char) [FS:EBP + 1] |= 0x01; // mouse
+				}
+			}
+		}
+	}
+	STI();
+	asmout("JMP next_command");
+
+lock_bitnoset:
+	EAX = cmd[12]; // x0
+	ECX = cmd[16]; // y0
+	ESI = cmd[20]; // x1
+	EDI = cmd[24]; // y1
+	cmd[4] = 0xffffffff; /* 終了 */
+	(offset) cmd += 28;
+	CLI();
+	work->lockcount++;
+	if ((signed) EAX /* x0 */ < work->mx1) {
+		if ((signed) ECX /* y0 */ < work->my1) {
+			if ((signed) ESI /* x1 */ > work->mx0) {
+				if ((signed) EDI /* y1 */ > work->my0) {
+					if (work->mouseflag != 0) {
+						GAPI_removemouse(); // remove mouse (mouseflag = 0)
+					}
+					work->mouselock++;
+				}
+			}
+		}
+	}
+	STI();
+	asmout("JMP next_command");
+
+unlock_optbit:
+	CLI();
+	work->lockcount--;
+	if (!= 0) {
+		TEST(AH, 0x01);
+		if (!= 0) {
+			work->mouselock--;
+			if (== 0) {
+				/* マウスを移動させる時に、mouselockが0x80000000にされるので、
+				   マウスが非表示中に移動すると、これは成立しなくなる。 */
+				GAPI_putmouse(); /* put mouse (mouseflag = 1) */
+				/* mx1をチェックしなくていいのか？ */
+			}
+		}
+		STI();
+		cmd[4] = 0xffffffff; /* 終了 */
+		(offset) cmd += 12;
+		asmout("JMP next_command");
+	}
+	work->mouselock = 0;
+	if (work->mx1 != 0x80000000 /* mx1がこの値の時は、非表示を意味する */) {
+		if (work->mouseflag == 0 /* mouse erased */) {
+			GAPI_clippingmouse(); /* mx0, my0, mx1, my1を設定 */
+			GAPI_putmouse(); /* put mouse (mouseflag = 1) */
+		}
+	}
+	STI();
+	cmd[4] = 0xffffffff; /* 終了 */
+	(offset) cmd += 12;
+	asmout("JMP next_command");
+
+unlock_area:
+	EAX = cmd[12]; // x0
+	ECX = cmd[16]; // y0
+	ESI = cmd[20]; // x1
+	EDI = cmd[24]; // y1
+	CLI();
+	work->lockcount--;
+	if (!= 0) {
+		if ((signed) EAX /* x0 */ < work->mx1) {
+			if ((signed) ECX /* y0 */ < work->my1) {
+				if ((signed) ESI /* x1 */ > work->mx0) {
+					if ((signed) EDI /* y1 */ > work->my0) {
+						work->mouselock--;
+						if (== 0) {
+							/* マウスを移動させる時に、mouselockが0にされるので、
+							   マウスが一時消去中に移動すると、これは成立しなくなる。
+							   マウスが非表示中は最初のmx1の比較が成立しない */
+							GAPI_putmouse(); /* put mouse (mouseflag = 1) */
+						}
+					}
+				}
+			}
+		}
+		STI();
+		cmd[4] = 0xffffffff; /* 終了 */
+		(offset) cmd += 28;
+		asmout("JMP next_command");
+	}
+	work->mouselock = 0;
+	if (work->mx1 != 0x80000000 /* mx1がこの値の時は、非表示を意味する */) {
+		if (work->mouseflag == 0 /* mouse erased */) {
+			GAPI_clippingmouse(); /* mx0, my0, mx1, my1を設定 */
+			GAPI_putmouse(); /* put mouse (mouseflag = 1) */
+		}
+	}
+	STI();
+	cmd[4] = 0xffffffff; /* 終了 */
+	(offset) cmd += 28;
+	asmout("JMP next_command");
+}
+
+void GAPI_mouse()
+/* option:bit0  直接指定(0)/間接指定(1)
+   option:bit5,4  16x16(00)/32x31(01)
+   option:bit7,6  マスクパターンありのモノクロ(00),マスクパターンありのカラー(10)
+   option:bit9,8  カーソルパターンストア(00),カーソル表示(01),カーソル消去(10),カーソル移動(11)
+     01,11では、カーソル座標を指定する。このコマンドでは、マウスカーソルは一つしか制御できない。
+     デフォルトでは、マウスカーソルと他のグラフィックコマンドとの関係を解消したりもしない。 */
+{
+	int *cmd == FS:EBX;
+	GAPI_WORK *work == ES:0x0000;
+
+	cmd[4] = 0xffffffff; /* コマンド終了 */
+	EAX = cmd[8];
+	CLI();
+	TEST(AH, 0x03);
+	if (== 0) {
+		PUSH(GS);
+		PUSH(EBX);
+		LGS(ESI, [FS:EBX + 12]);
+		init_mousecursor();
+		POP(EBX);
+		POP(GS);
+		STI();
+		(offset) cmd += 20;
+		asmout("JMP next_command");
+	}
+	TEST(AH, 0x02);
+	if (!= 0) {
+		/* カーソルを消す */
+		if (work->mouseflag != 0) {
+			GAPI_removemouse(); /* remove mouse (mouseflag = 0) */
+			EAX = cmd[8];
+		}
+		TEST(AH, 0x01);
+		if (== 0)
+			work->mx1 = 0x80000000; /* 非表示モード */
+	}
+	TEST(AH, 0x01);
+	if (!= 0) {
+		/* カーソルを描く */
+		ECX = cmd[12];
+		EDX = cmd[16];
+		work->mx = ECX;
+		work->my = EDX;
+		if (work->lockcount == 0) {
+			GAPI_clippingmouse(); /* mx0, my0, mx1, my1を設定 */
+			GAPI_putmouse(); /* put mouse (mouseflag = 1) */
+		} else {
+			work->mouselock = 0x80000000;
+		}
+		STI();
+		(offset) cmd += 20;
+		asmout("JMP next_command");
+	}
+	STI();
+	(offset) cmd += 12;
+	asmout("JMP next_command");
+}
+
+void GAPI_error()
+{
+	INT(0x03);
+}
+
+void GAPI_putbox()
+{
+	/* 256色ブロック転送 */
+	/* cmd, opt, x0, y0, xsize, ysize, yskip, ofs, sel */
+	/* optのbit0-3はモード : 1, 2, 4 */
+
+	/* アラインにはまだほとんど配慮していない */
+
+	GAPI_WORK *work == ES:0x0000;
+	int *cmd == FS:EBX;
+	unsigned char *p == ES:EDI;
+	unsigned short *q == DS:ESI;
+	unsigned int *pi == ES:EDI, *qi == DS:ESI;
+	unsigned short *ps == ES:EDI;
+
+	PUSH(ES);
+	PUSH(EBP);
+	EBP = work->linebytes;
+	ESI = cmd[12]; /* y */
+	asmout("LES EDI,DWORD FS:[EBX+28]");
+	IMUL(ESI, EBP);
+	ESI += cmd[ 8]; /* x */
+	EBP -= cmd[16]; /* xsize */
+	EDX = cmd[20]; /* ysize */
+	ESI += cmd[ 8]; /* x */
+	EBP -= cmd[16]; /* xsize */
+	ESI += 0xe0000000;
+	AL = (char) cmd[4];
+	TEST(AL, 0x10);
+	if (!= 0)
+		goto putbox1;
+	AL &= 0x2f;
+	if (AL == 0x01) {
+		do {
+			ECX = cmd[16]; /* xsize */
+			do {
+				EAX = *p;
+				(offset) p++;
+				EAX &= 0x0f; /* バグ回避のため */
+				asmout("MOV EAX,[CS:colortable16+EAX*4]");
+				*q = AX;
+				(offset) q += 2;
+				ECX--;
+			} while (!= 0);
+			(offset) p += cmd[24]; /* yskip */
+			(offset) q += EBP;
+			EDX--;
+		} while (!= 0);
+		(offset) cmd += 36;
+		POP(EBP);
+		POP(ES);
+		asmout("JMP next_command");
+	}
+	if (AL == 0x22) {
+mode22:
+		/* ダイレクトカラー16bit, RRRRRGGG_GGGBBBBB */
+		do {
+			ECX = cmd[16]; /* xsize */
+			ECX -= 16;
+			if ((unsigned) >= 0) {
+				TEST((offset) ps, 0x03);
+				if (== 0) {
+					TEST((offset) qi, 0x03);
+					if (== 0) {
+						PUSH(EDX);
+						do {
+							EAX = pi[ 0]; EDX = pi[ 4];
+							qi[ 0] = EAX; qi[ 4] = EDX;
+							EAX = pi[ 8]; EDX = pi[12];
+							qi[ 8] = EAX; qi[12] = EDX;
+							EAX = pi[16]; EDX = pi[20];
+							qi[16] = EAX; qi[20] = EDX;
+							EAX = pi[24]; EDX = pi[28];
+							(offset) pi += 32;
+							qi[24] = EAX; qi[28] = EDX;
+							(offset) qi += 32;
+							ECX -= 16;
+						} while ((unsigned) >= 0);
+						POP(EDX);
+					}
+				}
+			}
+			ECX += 16;
+			if (!= 0) {
+				do {
+					AX = *ps;
+					(offset) ps += 2;
+					*q = AX;
+					(offset) q += 2;
+					ECX--;
+				} while (!= 0);
+			}
+			(offset) p += cmd[24]; /* yskip */
+			(offset) q += EBP;
+			EDX--;
+		} while (!= 0);
+		(offset) cmd += 36;
+		POP(EBP);
+		POP(ES);
+		asmout("JMP next_command");
+	}
+	if (AL == 0x02)
+		goto mode22;
+	if (AL == 0x24) {
+		/* ダイレクトカラー32bit(24bit) */
+		do {
+			ECX = cmd[16]; /* xsize */
+			PUSH(EBP);
+			PUSH(EDX);
+			do {
+				EAX = *pi;
+				(offset) pi += 4;
+				EBP = EAX;
+				EDX = EAX;
+				EAX >>= 3;
+				EBP >>= 5;
+				EDX >>= 8;
+				EAX &= 0x001f;
+				EBP &= 0x07e0;
+				EDX &= 0xf800;
+				EAX |= EBP;
+				EAX |= EDX;
+				*q = AX;
+				(offset) q += 2;
+				ECX--;
+			} while (!= 0);
+			POP(EDX);
+			POP(EBP);
+			(offset) p += cmd[24]; /* yskip */
+			(offset) q += EBP;
+			EDX--;
+		} while (!= 0);
+		(offset) cmd += 36;
+		POP(EBP);
+		POP(ES);
+		asmout("JMP next_command");
+	}
+	if (AL == 0x04) {
+		/* ダイレクトカラー32bit(24bit) */
+		/* タイリングあり */
+		ECX = cmd[12];
+		ECX *= 2;
+		ECX &= 0x02;
+		PUSH(ECX);
+		do {
+			ECX = cmd[16]; /* xsize */
+			PUSH(EBP);
+			PUSH(EDX);
+			PUSH(EBX);
+			do {
+				EBP = *pi;
+				(offset) pi += 4;
+				PUSH(ECX);
+				ECX = (offset) q;
+				ECX &= 0x01;
+				ECX |= [SS:ESP + 16];
+				asmout("MOV BH,[CS:.table+ECX]"); /* { 0, 3, 7, 1 }[ECX] */
+
+				/* AX : カラー番号 */
+				ECX = EBP; /* red */
+				EAX = EBP;
+				ECX >>= 17;
+				EAX >>= 19;
+				CL &= 0x03;
+				EAX &= 0x1f;
+				CH = BH;
+				if (!= 0) {
+					CL++;
+					CH >>= CL;
+					SBB(EAX, 0); /* if (CF != 0) EAX--; */
+				}
+				EAX <<= 11;
+				ECX = EBP; /* green */
+				EDX = EBP;
+				ECX >>= 8;
+				EDX >>= 10;
+				CL &= 0x03;
+				EDX &= 0x3f;
+				CH = BH;
+				if (!= 0) {
+					CL++;
+					CH >>= CL;
+					SBB(EDX, 0); /* if (CF != 0) EDX--; */
+				}
+				EDX <<= 5;
+				ECX = EBP; /* blue */
+				EAX |= EDX;
+				EDX = EBP;
+				ECX >>= 1;
+				EDX >>= 3;
+				CL &= 0x03;
+				EDX &= 0x1f;
+				if (!= 0) {
+					CL++;
+					BH >>= CL;
+					SBB(EDX, 0); /* if (CF != 0) EDX--; */
+				}
+				POP(ECX);
+				EAX |= EDX;
+				*q = AX;
+				(offset) q += 2;
+				ECX--;
+			} while (!= 0);
+			POP(EBX);
+			POP(EDX);
+			POP(EBP);
+			(offset) p += cmd[24]; /* yskip */
+			(offset) q += EBP;
+			(char) [SS:ESP] ^= 0x02;
+			EDX--;
+		} while (!= 0); /* 45行削減 */
+		POP(EAX);
+		(offset) cmd += 36;
+		POP(EBP);
+		POP(ES);
+		asmout("JMP next_command");
+	}
+	INT(0x03);
+table:
+	DB(0, 3, 7, 1);
+putbox1:
+	do {
+		ECX = cmd[16]; /* xsize */
+		do {
+			EAX = *p;
+			(offset) p++;
+			if (EAX != cmd[36]) {
+				asmout("MOV EAX,[CS:colortable16+EAX*4]");
+				*q = AX;
+			}
+			(offset) q += 2;
+			ECX--;
+		} while (!= 0);
+		(offset) p += cmd[24]; /* yskip */
+		(offset) q += EBP;
+		EDX--;
+	} while (!= 0);
+	(offset) cmd += 40;
+	POP(EBP);
+	POP(ES);
+	asmout("JMP next_command");
+}
+
+void GAPI_linesub_pset()
+/*
+	ESI : 初期x
+	EDI : 初期y
+	EDX : 増分値x
+	EBX : 増分値y
+	EBP : ループ回数
+	EAX : カラー
+*/
+{
+	GAPI_WORK *work == ES:0x0000;
+#if 0
+	PUSH(EBP);
+	PUSH(EAX);
+	ECX = EDI;
+	EAX = ESI;
+	(unsigned int) ECX >>= 16;
+	(unsigned int) EAX >>= 16;
+	IMUL(ECX, work->linebytes);
+	LEA(EBP, [EAX + ECX * 4 + 0xe0000000]);
+	EAX = 0x00010000;
+	ECX = 0xffff0000;
+	if (EBX == EAX) {
+		if (EDX == EAX)
+			goto line_xp1_yp1;
+		if ((signed) > )
+			goto general;
+		if (EDX >= 0)
+			goto line_xpd_yp1;
+		if (EDX == ECX)
+			goto line_xm1_yp1;
+		if ((signed) < )
+			goto line_xmd_yp1;
+	} else if (EBX == ECX) {
+		if (EDX == EAX)
+			goto line_xp1_ym1;
+		if ((signed) > )
+			goto general;
+		if (EDX >= 0)
+			goto line_xpd_ym1;
+		if (EDX == ECX)
+			goto line_xm1_ym1;
+		if ((signed) < )
+			goto line_xmd_ym1;
+	} else if (EDX == EAX) {
+	//	if (EBX == EAX)
+	//		goto line_xp1_yp1;
+		if ((signed) EBX > EAX)
+			goto general;
+		if (EBX >= 0)
+			goto line_xp1_ypd;
+	//	if (EBX == ECX)
+	//		goto line_xp1_ym1;
+		if ((signed) EBX < ECX)
+			goto line_xp1_ymd;
+	} else if (EDX == ECX) {
+	//	if (EBX == EAX)
+	//		goto line_xm1_yp1;
+		if ((signed) EBX > EAX)
+			goto general;
+		if (EBX >= 0)
+			goto line_xm1_ypd;
+	//	if (EBX == ECX)
+	//		goto line_xm1_ym1;
+		if ((signed) EBX < ECX)
+			goto line_xm1_ymd;
+	}
+
+general:
+	POP(EAX);
+	POP(EBP);
+#endif
+
+	PUSH(EDX);
+	do {
+		EDX = EDI;
+		ECX = ESI;
+		(unsigned int) EDX >>= 16;
+		(unsigned int) ECX >>= 16;
+		IMUL(EDX, work->linebytes);
+		ESI += [SS:ESP];
+		EDI += EBX;
+		(short) [DS:EDX + ECX * 2 + 0xe0000000] = AX;
+		EBP--;
+	} while (!= 0);
+	POP(EDX);
+	return;
+
+#if 0
+line_xpd_yp1:
+	EDI = EBP;
+	POP(EAX);
+	EBP = work->linebytes;
+line_xpmd_yp1:
+	ESI <<= 16;
+	POP(ECX);
+	EDX <<= 16;
+	do {
+		(char) [DS:EDI] = AL;
+		ESI += EDX;
+		ADC(EDI, EBP);
+		ECX--;
+	} while (!= 0);
+	return;
+
+line_xmd_yp1:
+	EDI = EBP;
+	POP(EAX);
+	EBP = work->linebytes;
+	EBP--;
+	goto line_xpmd_yp1;
+
+#if 0
+	ESI <<= 16;
+	POP(ECX);
+	EDX <<= 16;
+	do {
+		(char) [DS:EDI] = AL;
+		ESI += EDX;
+		ADC(EDI, TWVSW - 1); /* CF == 1なら+TWVSW, CF == 0なら+TWVSW - 1 */
+		ECX--;
+	} while (!= 0);
+	return;
+#endif
+
+line_xpd_ym1:
+	EDI = EBP;
+	POP(EAX);
+	EBP = 0;
+	EBP -= work->linebytes;
+	goto line_xpmd_yp1;
+
+#if 0
+	ESI <<= 16;
+	POP(ECX);
+	EDX <<= 16;
+	do {
+		(char) [DS:EDI] = AL;
+		ESI += EDX;
+		ADC(EDI, 0 - TWVSW);
+		ECX--;
+	} while (!= 0);
+	return;
+#endif
+
+line_xmd_ym1:
+	EDI = EBP;
+	POP(EAX);
+	EBP = -1;
+	EBP -= work->linebytes;
+	goto line_xpmd_yp1;
+
+#if 0
+	ESI <<= 16;
+	POP(ECX);
+	EDX <<= 16;
+	do {
+		(char) [DS:EDI] = AL;
+		ESI += EDX;
+		ADC(EDI, 0 - TWVSW - 1); /* CF == 1なら-TWVSW, CF == 0なら-TWVSW - 1 */
+		ECX--;
+	} while (!= 0);
+	return;
+#endif
+
+line_xp1_ypd:
+	ESI = EBP;
+	POP(EAX);
+	EDI <<= 16;
+	POP(ECX);
+	EBX <<= 16;
+	do {
+		EDI += EBX;
+		SBB(EDX, EDX); /* CF == 0ならEDX = 0, CF == 1ならEDX = -1 */
+		(char) [DS:ESI] = AL;
+		EDX &= work->linebytes;
+	//	ESI++;
+	//	ESI += EDX;
+		ECX--;
+		LEA(ESI, [ESI + EDX + 1]);
+	} while (!= 0);
+	return;
+
+line_xp1_ymd:
+	ESI = EBP;
+	POP(EAX);
+	EDI <<= 16;
+	POP(ECX);
+	EBX <<= 16;
+	do {
+		EDX = 0;
+		EDI += EBX;
+		ADC(EDX, 0xffffffff); /* CF == 0ならEDX = -1, CF == 1ならEDX = 0 */
+		(char) [DS:ESI] = AL;
+		EDX &= work->linebytes;
+		NEG(EDX);
+	//	ESI++;
+	//	ESI += EDX;
+		ECX--;
+		LEA(ESI, [ESI + EDX + 1]);
+	} while (!= 0);
+	return;
+
+line_xm1_ypd:
+	ESI = EBP;
+	POP(EAX);
+	EDI <<= 16;
+	POP(ECX);
+	EBX <<= 16;
+	do {
+		EDI += EBX;
+		SBB(EDX, EDX); /* CF == 0ならEDX = 0, CF == 1ならEDX = -1 */
+		(char) [DS:ESI] = AL;
+		EDX &= work->linebytes;
+	//	ESI--;
+	//	ESI += EDX;
+		ECX--;
+		LEA(ESI, [ESI + EDX - 1]);
+	} while (!= 0);
+	return;
+
+line_xm1_ymd:
+	ESI = EBP;
+	POP(EAX);
+	EDI <<= 16;
+	POP(ECX);
+	EBX <<= 16;
+	do {
+		EDX = 0;
+		EDI += EBX;
+		ADC(EDX, 0xffffffff); /* CF == 0ならEDX = -1, CF == 1ならEDX = 0 */
+		(char) [DS:ESI] = AL;
+		EDX &= work->linebytes;
+		NEG(EDX);
+	//	ESI--;
+	//	ESI += EDX;
+		ECX--;
+		LEA(ESI, [ESI + EDX - 1]);
+	} while (!= 0);
+	return;
+
+line_xp1_yp1:
+	EDX = work->linebytes;
+	EDX++;
+line_x1_y1:
+	POP(EAX);
+	ESI = EBP;
+	POP(ECX);
+	do {
+		(char) [DS:ESI] = AL;
+		ESI += EDX;
+		ECX--;
+	} while (!= 0);
+	return;
+
+line_xp1_ym1:
+	EDX = 1;
+	EDX -= work->linebytes;
+	goto line_x1_y1;
+
+line_xm1_yp1:
+	EDX = work->linebytes;
+	EDX--;
+	goto line_x1_y1;
+
+line_xm1_ym1:
+	EDX = -1;
+	EDX -= work->linebytes;
+	goto line_x1_y1;
+#endif
+}
+
+void GAPI_linesub_xor()
+/*
+	ESI : 初期x
+	EDI : 初期y
+	EDX : 増分値x
+	EBX : 増分値y
+	EBP : ループ回数
+	EAX : カラー
+*/
+{
+	GAPI_WORK *work == ES:0x0000;
+	PUSH(EDX);
+	do {
+		EDX = EDI;
+		ECX = ESI;
+		(unsigned int) EDX >>= 16;
+		(unsigned int) ECX >>= 16;
+		IMUL(EDX, work->linebytes);
+		ESI += [SS:ESP];
+		EDI += EBX;
+		(short) [DS:EDX + ECX * 2 + 0xe0000000] ^= AX;
+		EBP--;
+	} while (!= 0);
+	POP(EDX);
+	return;
+}
+
+void GAPI_linesub_or()
+/*
+	ESI : 初期x
+	EDI : 初期y
+	EDX : 増分値x
+	EBX : 増分値y
+	EBP : ループ回数
+	EAX : カラー
+*/
+{
+	GAPI_WORK *work == ES:0x0000;
+	PUSH(EDX);
+	do {
+		EDX = EDI;
+		ECX = ESI;
+		(unsigned int) EDX >>= 16;
+		(unsigned int) ECX >>= 16;
+		IMUL(EDX, work->linebytes);
+		ESI += [SS:ESP];
+		EDI += EBX;
+		(short) [DS:EDX + ECX * 2 + 0xe0000000] |= AX;
+		EBP--;
+	} while (!= 0);
+	POP(EDX);
+	return;
+}
+
+void GAPI_linesub_and()
+/*
+	ESI : 初期x
+	EDI : 初期y
+	EDX : 増分値x
+	EBX : 増分値y
+	EBP : ループ回数
+	EAX : カラー
+*/
+{
+	GAPI_WORK *work == ES:0x0000;
+	PUSH(EDX);
+	do {
+		EDX = EDI;
+		ECX = ESI;
+		(unsigned int) EDX >>= 16;
+		(unsigned int) ECX >>= 16;
+		IMUL(EDX, work->linebytes);
+		ESI += [SS:ESP];
+		EDI += EBX;
+		(short) [DS:EDX + ECX * 2 + 0xe0000000] &= AX;
+		EBP--;
+	} while (!= 0);
+	POP(EDX);
+	return;
+}
+
+void GAPI_lineardots()
+{
+	/* 斜め線を引くためなどに使う(等間隔で点を打つこともできる) */
+	/* cmd, opt, x0, y0, sx, sy, lines, ofs, sel */
+	/* sxとsyは利用していない */
+
+	/* データーの形式 */
+	/* x0, y0, dx, dy, dots, color */
+	/* x0, y0, dx, dyは固定少数点 */
+
+	int *cmd == FS:EBX;
+	int *dat == GS:EAX;
+
+	PUSH(GS);
+	PUSH(EBP);
+	ECX = cmd[ 4];
+	EBP = cmd[24];
+	ECX >>= 6;
+	asmout("LGS EAX,DWORD FS:[EBX+28]");
+	PUSH((offset) cmd);
+	ESI = cmd[ 8];
+	EDI = cmd[12];
+	if (== 0) {
+		do {
+			PUSH(ESI);
+			EDX = dat[ 8]; /* dx */
+			PUSH(EDI);
+			EBX = dat[12]; /* dy */
+			PUSH(EBP);
+			ESI <<= 16;
+			EDI <<= 16;
+			PUSH((offset) dat);
+			ESI += dat[ 0]; /* x0 */
+			EDI += dat[ 4]; /* y0 */
+			EBP = dat[16]; /* dots */
+			EAX = dat[20]; /* color */
+			asmout("MOV EAX,[CS:colortable16+EAX*4]");
+			GAPI_linesub_pset();
+			POP((offset) dat);
+			POP(EBP);
+			(offset) dat += 24;
+			POP(EDI);
+			EBP--;
+			POP(ESI);
+		} while (!= 0);
+		POP((offset) cmd);
+		POP(EBP);
+		(offset) cmd += 36;
+		POP(GS);
+		asmout("JMP next_command");
+	}
+	ECX--;
+	if (== 0) {
+		do {
+			PUSH(ESI);
+			EDX = dat[ 8]; /* dx */
+			PUSH(EDI);
+			EBX = dat[12]; /* dy */
+			PUSH(EBP);
+			ESI <<= 16;
+			EDI <<= 16;
+			PUSH((offset) dat);
+			ESI += dat[ 0]; /* x0 */
+			EDI += dat[ 4]; /* y0 */
+			EBP = dat[16]; /* dots */
+			EAX = dat[20]; /* color */
+			asmout("MOV EAX,[CS:colortable16+EAX*4]");
+			GAPI_linesub_and();
+			POP((offset) dat);
+			POP(EBP);
+			(offset) dat += 24;
+			POP(EDI);
+			EBP--;
+			POP(ESI);
+		} while (!= 0);
+		POP((offset) cmd);
+		POP(EBP);
+		(offset) cmd += 36;
+		POP(GS);
+		asmout("JMP next_command");
+	}
+	ECX--;
+	if (== 0) {
+		do {
+			PUSH(ESI);
+			EDX = dat[ 8]; /* dx */
+			PUSH(EDI);
+			EBX = dat[12]; /* dy */
+			PUSH(EBP);
+			ESI <<= 16;
+			EDI <<= 16;
+			PUSH((offset) dat);
+			ESI += dat[ 0]; /* x0 */
+			EDI += dat[ 4]; /* y0 */
+			EBP = dat[16]; /* dots */
+			EAX = dat[20]; /* color */
+			asmout("MOV EAX,[CS:colortable16+EAX*4]");
+			GAPI_linesub_or();
+			POP((offset) dat);
+			POP(EBP);
+			(offset) dat += 24;
+			POP(EDI);
+			EBP--;
+			POP(ESI);
+		} while (!= 0);
+		POP((offset) cmd);
+		POP(EBP);
+		(offset) cmd += 36;
+		POP(GS);
+		asmout("JMP next_command");
+	}
+//	ECX--;
+//	if (== 0) {
+		do {
+			PUSH(ESI);
+			EDX = dat[ 8]; /* dx */
+			PUSH(EDI);
+			EBX = dat[12]; /* dy */
+			PUSH(EBP);
+			ESI <<= 16;
+			EDI <<= 16;
+			PUSH((offset) dat);
+			ESI += dat[ 0]; /* x0 */
+			EDI += dat[ 4]; /* y0 */
+			EBP = dat[16]; /* dots */
+			EAX = dat[20]; /* color */
+			asmout("MOV EAX,[CS:colortable16+EAX*4]");
+			GAPI_linesub_xor();
+			POP((offset) dat);
+			POP(EBP);
+			(offset) dat += 24;
+			POP(EDI);
+			EBP--;
+			POP(ESI);
+		} while (!= 0);
+		POP((offset) cmd);
+		POP(EBP);
+		(offset) cmd += 36;
+		POP(GS);
+		asmout("JMP next_command");
+//	}
+}
+
+void GAPI_points()
+{
+	/* 点を打つ */
+	/* cmd, opt, x0, y0, sx, sy, lines, ofs, sel */
+	/* sxとsyは利用していない */
+
+	/* データーの形式 */
+	/* x0, y0, color */
+
+	GAPI_WORK *work == ES:0x0000;
+	int *cmd == FS:EBX;
+	int *dat == GS:EDX;
+
+	PUSH(GS);
+	EAX = cmd[ 4];
+	ECX = cmd[24];
+	asmout("LGS EDX,DWORD FS:[EBX+28]");
+	ESI = cmd[ 8];
+	EDI = cmd[12];
+	(offset) cmd += 36;
+	PUSH(ESI);
+	EAX >>= 6;
+	PUSH(EDI);
+	if (== 0) {
+		do {
+			EAX = dat[8]; /* color */
+			ESI += dat[0]; /* x0 */
+			EDI += dat[4]; /* y0 */
+			asmout("MOV EAX,[CS:colortable16+EAX*4]");
+			IMUL(EDI, work->linebytes);
+			(offset) dat += 12;
+			(short) [DS:EDI + ESI * 2 + 0xe0000000] = AX;
+			ECX--;
+			ESI = [SS:ESP + 4];
+			EDI = [SS:ESP + 0];
+		} while (!= 0);
+		POP(EAX);
+		POP(ECX);
+		POP(GS);
+		asmout("JMP next_command");
+	}
+	EAX--;
+	if (== 0) {
+		do {
+			EAX = dat[8]; /* color */
+			ESI += dat[0]; /* x0 */
+			EDI += dat[4]; /* y0 */
+			asmout("MOV EAX,[CS:colortable16+EAX*4]");
+			IMUL(EDI, work->linebytes);
+			(offset) dat += 12;
+			(short) [DS:EDI + ESI * 2 + 0xe0000000] &= AX;
+			ECX--;
+			ESI = [SS:ESP + 4];
+			EDI = [SS:ESP + 0];
+		} while (!= 0);
+		POP(EAX);
+		POP(ECX);
+		POP(GS);
+		asmout("JMP next_command");
+	}
+	EAX--;
+	if (== 0) {
+		do {
+			EAX = dat[8]; /* color */
+			ESI += dat[0]; /* x0 */
+			EDI += dat[4]; /* y0 */
+			asmout("MOV EAX,[CS:colortable16+EAX*4]");
+			IMUL(EDI, work->linebytes);
+			(offset) dat += 12;
+			(short) [DS:EDI + ESI * 2 + 0xe0000000] |= AX;
+			ECX--;
+			ESI = [SS:ESP + 4];
+			EDI = [SS:ESP + 0];
+		} while (!= 0);
+		POP(EAX);
+		POP(ECX);
+		POP(GS);
+		asmout("JMP next_command");
+	}
+//	EAX--;
+//	if (== 0) {
+		do {
+			EAX = dat[8]; /* color */
+			ESI += dat[0]; /* x0 */
+			EDI += dat[4]; /* y0 */
+			asmout("MOV EAX,[CS:colortable16+EAX*4]");
+			IMUL(EDI, work->linebytes);
+			(offset) dat += 12;
+			(short) [DS:EDI + ESI * 2 + 0xe0000000] ^= AX;
+			ECX--;
+			ESI = [SS:ESP + 4];
+			EDI = [SS:ESP + 0];
+		} while (!= 0);
+		POP(EAX);
+		POP(ECX);
+		POP(GS);
+		asmout("JMP next_command");
+//	}
+}
+
+void GAPI_line()
+{
+	int *cmd == FS:EBX;
+	GAPI_WORK *work == ES:0x0000;
+
+	EAX = cmd[4]; /* opt */
+	TEST(EAX, 0xffffff0f);
+	if (!= 0)
+		goto error;
+
+	EAX &= 0x0030;
+	if (== 0)
+		goto line;
+
+	if (EAX == 0x0020) {
+		/* boxfill */
+		EBP = cmd[20]; /* y1 */
+		ESI = cmd[12]; /* y0 */
+		EBP -= ESI;
+		IMUL(ESI, work->linebytes);
+boxfill:
+		EDX = cmd[ 8]; /* x0 */
+		EDI = cmd[16]; /* x1 */
+	//	ESI += EDX + 0xe0000000;
+		LEA(ESI, [ESI + EDX * 2 + 0xe0000000]);
+		EDI++;
+		CL = cmd[ 4]; /* opt */
+		EAX = cmd[24]; /* color */
+		CL &= 0xc0;
+		asmout("MOV EAX,[CS:colortable16+EAX*4]");
+		EDI -= EDX;
+		EBP++;
+		/* EDI : x方向のサイズ(ドット数) */
+		/* EBP : y方向のサイズ(ドット数) */
+		/* ESI : VRAM上のアドレス */
+		/* EAX : カラー */
+		/* 少し工夫した描画ルーチン */
+		/* 横に書くだけ */
+		PUSH((offset) cmd);
+		if (CL == 0) {
+			TEST(ESI, 0x02);
+			if (!= 0) {
+				ECX = EBP;
+				EBX = ESI;
+				do {
+					[DS:ESI       ] = AX;
+					ESI += work->linebytes;
+					ECX--;
+				} while (!= 0);
+				EDI--;
+				LEA(ESI, [EBX + 2]);
+				if (== 0)
+					goto line_fin;
+			}
+			do {
+				PUSH(EDI);
+				EBX = ESI;
+				EDI -= 16;
+				if ((unsigned) >= 0) {
+					do {
+						[DS:ESI     ] = EAX;
+						[DS:ESI +  4] = EAX;
+						[DS:ESI +  8] = EAX;
+						[DS:ESI + 12] = EAX;
+						[DS:ESI + 16] = EAX;
+						[DS:ESI + 20] = EAX;
+						[DS:ESI + 24] = EAX;
+						[DS:ESI + 28] = EAX;
+						ESI += 32;
+						EDI -= 16;
+					} while ((unsigned) >= 0);
+				}
+				EDI += 16 - 2;
+				if ((signed) >= 0) {
+					do {
+						[DS:ESI] = EAX;
+						ESI += 4;
+						EDI -= 2;
+					} while ((unsigned) >= 0);
+				}
+				EDI += 2;
+				if (!= 0) {
+				//	do {
+						[DS:ESI] = AX;
+				//		ESI += 2;
+				//		EDI--;
+				//	} while (!= 0);
+				}
+				ESI = EBX;
+				POP(EDI);
+				ESI += work->linebytes;
+				EBP--;
+			} while (!= 0);
+line_fin:
+			POP((offset) cmd);
+			(offset) cmd += 28;
+			asmout("JMP next_command");
+		}
+		if (CL == 0xc0) { /* xor */
+			TEST(ESI, 0x02);
+			if (!= 0) {
+				ECX = EBP;
+				EBX = ESI;
+				do {
+					[DS:ESI       ] ^= AX;
+					ESI += work->linebytes;
+					ECX--;
+				} while (!= 0);
+				EDI--;
+				LEA(ESI, [EBX + 2]);
+				if (== 0)
+					goto line_fin;
+			}
+			do {
+				PUSH(EDI);
+				EBX = ESI;
+				EDI -= 16;
+				if ((unsigned) >= 0) {
+					do {
+						ECX = [DS:ESI     ]; EDX = [DS:ESI +  4];
+						ECX ^= EAX; EDX ^= EAX;
+						[DS:ESI     ] = ECX; [DS:ESI +  4] = EDX;
+						ECX = [DS:ESI +  8]; EDX = [DS:ESI + 12];
+						ECX ^= EAX; EDX ^= EAX;
+						[DS:ESI +  8] = ECX; [DS:ESI + 12] = EDX;
+						ECX = [DS:ESI + 16]; EDX = [DS:ESI + 20];
+						ECX ^= EAX; EDX ^= EAX;
+						[DS:ESI + 16] = ECX; [DS:ESI + 20] = EDX;
+						ECX = [DS:ESI + 24]; EDX = [DS:ESI + 28];
+						ECX ^= EAX; EDX ^= EAX;
+						[DS:ESI + 24] = ECX; [DS:ESI + 28] = EDX;
+						ESI += 32;
+						EDI -= 16;
+					} while ((unsigned) >= 0);
+				}
+				EDI += 16 - 2;
+				if ((signed) >= 0) {
+					do {
+						[DS:ESI] ^= EAX;
+						ESI += 4;
+						EDI -= 2;
+					} while ((unsigned) >= 0);
+				}
+				EDI += 2;
+				if (!= 0) {
+				//	do {
+						[DS:ESI] ^= AX;
+				//		ESI += 2;
+				//		EDI--;
+				//	} while (!= 0);
+				}
+				ESI = EBX;
+				POP(EDI);
+				ESI += work->linebytes;
+				EBP--;
+			} while (!= 0);
+			POP((offset) cmd);
+			(offset) cmd += 28;
+			asmout("JMP next_command");
+		}
+		if (CL == 0x40) { /* and */
+			TEST(ESI, 0x02);
+			if (!= 0) {
+				ECX = EBP;
+				EBX = ESI;
+				do {
+					[DS:ESI       ] &= AX;
+					ESI += work->linebytes;
+					ECX--;
+				} while (!= 0);
+				EDI--;
+				LEA(ESI, [EBX + 2]);
+				if (== 0)
+					goto line_fin;
+			}
+			do {
+				PUSH(EDI);
+				EBX = ESI;
+				EDI -= 16;
+				if ((unsigned) >= 0) {
+					do {
+						ECX = [DS:ESI     ]; EDX = [DS:ESI +  4];
+						ECX &= EAX; EDX &= EAX;
+						[DS:ESI     ] = ECX; [DS:ESI +  4] = EDX;
+						ECX = [DS:ESI +  8]; EDX = [DS:ESI + 12];
+						ECX &= EAX; EDX &= EAX;
+						[DS:ESI +  8] = ECX; [DS:ESI + 12] = EDX;
+						ECX = [DS:ESI + 16]; EDX = [DS:ESI + 20];
+						ECX &= EAX; EDX &= EAX;
+						[DS:ESI + 16] = ECX; [DS:ESI + 20] = EDX;
+						ECX = [DS:ESI + 24]; EDX = [DS:ESI + 28];
+						ECX &= EAX; EDX &= EAX;
+						[DS:ESI + 24] = ECX; [DS:ESI + 28] = EDX;
+						ESI += 32;
+						EDI -= 16;
+					} while ((unsigned) >= 0);
+				}
+				EDI += 16 - 2;
+				if ((signed) >= 0) {
+					do {
+						[DS:ESI] &= EAX;
+						ESI += 4;
+						EDI -= 2;
+					} while ((unsigned) >= 0);
+				}
+				EDI += 2;
+				if (!= 0) {
+				//	do {
+						[DS:ESI] &= AX;
+				//		ESI += 2;
+				//		EDI--;
+				//	} while (!= 0);
+				}
+				ESI = EBX;
+				POP(EDI);
+				ESI += work->linebytes;
+				EBP--;
+			} while (!= 0);
+			POP((offset) cmd);
+			(offset) cmd += 28;
+			asmout("JMP next_command");
+		}
+	//	if (CL == 0x80) { /* or */
+			TEST(ESI, 0x02);
+			if (!= 0) {
+				ECX = EBP;
+				EBX = ESI;
+				do {
+					[DS:ESI       ] |= AX;
+					ESI += work->linebytes;
+					ECX--;
+				} while (!= 0);
+				EDI--;
+				LEA(ESI, [EBX + 2]);
+				if (== 0)
+					goto line_fin;
+			}
+			do {
+				PUSH(EDI);
+				EBX = ESI;
+				EDI -= 16;
+				if ((unsigned) >= 0) {
+					do {
+						ECX = [DS:ESI     ]; EDX = [DS:ESI +  4];
+						ECX |= EAX; EDX |= EAX;
+						[DS:ESI     ] = ECX; [DS:ESI +  4] = EDX;
+						ECX = [DS:ESI +  8]; EDX = [DS:ESI + 12];
+						ECX |= EAX; EDX |= EAX;
+						[DS:ESI +  8] = ECX; [DS:ESI + 12] = EDX;
+						ECX = [DS:ESI + 16]; EDX = [DS:ESI + 20];
+						ECX |= EAX; EDX |= EAX;
+						[DS:ESI + 16] = ECX; [DS:ESI + 20] = EDX;
+						ECX = [DS:ESI + 24]; EDX = [DS:ESI + 28];
+						ECX |= EAX; EDX |= EAX;
+						[DS:ESI + 24] = ECX; [DS:ESI + 28] = EDX;
+						ESI += 32;
+						EDI -= 16;
+					} while ((unsigned) >= 0);
+				}
+				EDI += 16 - 2;
+				if ((signed) >= 0) {
+					do {
+						[DS:ESI] |= EAX;
+						ESI += 4;
+						EDI -= 2;
+					} while ((unsigned) >= 0);
+				}
+				EDI += 2;
+				if (!= 0) {
+				//	do {
+						[DS:ESI] |= AX;
+				//		ESI += 2;
+				//		EDI--;
+				//	} while (!= 0);
+				}
+				ESI = EBX;
+				POP(EDI);
+				ESI += work->linebytes;
+				EBP--;
+			} while (!= 0);
+			POP((offset) cmd);
+			(offset) cmd += 28;
+			asmout("JMP next_command");
+	//	}
+	}
+
+	/* box */
+	EBP = cmd[20]; // y1
+	ESI = cmd[12]; // y0
+	EBP -= ESI;
+	IMUL(ESI, work->linebytes);
+	if ((unsigned) EBP <= 1)
+		goto boxfill;
+	PUSH(ESI);
+	EDX = cmd[ 8]; // x0
+	EDI = cmd[16]; // x1
+//	ESI += EDX * 2 + 0xe0000000;
+	LEA(ESI, [ESI + EDX * 2 + 0xe0000000]);
+	EDI++;
+	CL = cmd[ 4]; // opt
+	EAX = cmd[24]; // color
+	CL &= 0xc0;
+	EDI -= EDX;
+	asmout("MOV EAX,[CS:colortable16+EAX*4]");
+	/* EDI : x方向のサイズ(バイト数) */
+	/* EBP : y方向のサイズ(ドット数 - 1) */
+	/* ESI : VRAM上のアドレス */
+	EBP--;
+	EDX = cmd[20];
+	IMUL(EDX, work->linebytes);
+	EDX += cmd[ 8];
+	EDX += 0xe0000000;
+	EDX += cmd[ 8];
+	if (CL == 0) { /* pset */
+		/* 全く工夫のない描画ルーチン */
+		ECX = ESI;
+		do {
+			[DS:ESI] = AX;
+			ESI += 2;
+			[DS:EDX] = AX;
+			EDX += 2;
+			EDI--;
+		} while (!= 0);
+		POP(EDI);
+		ECX += work->linebytes;
+		EDI += cmd[16];
+		EDI += 0xe0000000;
+		EDI += cmd[16];
+		EDI += work->linebytes;
+		do {
+			[DS:ECX] = AX;
+			ECX += work->linebytes;
+			[DS:EDI] = AX;
+			EDI += work->linebytes;
+			EBP--;
+		} while (!= 0);
+		(offset) cmd += 28;
+		asmout("JMP next_command");
+	}
+	if (CL == 0xc0) { /* xor */
+		/* 全く工夫のない描画ルーチン */
+		ECX = ESI;
+		do {
+			[DS:ESI] ^= AX;
+			ESI += 2;
+			[DS:EDX] ^= AX;
+			EDX += 2;
+			EDI--;
+		} while (!= 0);
+		POP(EDI);
+		ECX += work->linebytes;
+		EDI += cmd[16];
+		EDI += 0xe0000000;
+		EDI += cmd[16];
+		EDI += work->linebytes;
+		do {
+			[DS:ECX] ^= AX;
+			ECX += work->linebytes;
+			[DS:EDI] ^= AX;
+			EDI += work->linebytes;
+			EBP--;
+		} while (!= 0);
+		(offset) cmd += 28;
+		asmout("JMP next_command");
+	}
+	if (CL == 0x40) { /* and */
+		/* 全く工夫のない描画ルーチン */
+		ECX = ESI;
+		do {
+			[DS:ESI] &= AX;
+			ESI += 2;
+			[DS:EDX] &= AX;
+			EDX += 2;
+			EDI--;
+		} while (!= 0);
+		POP(EDI);
+		ECX += work->linebytes;
+		EDI += cmd[16];
+		EDI += 0xe0000000;
+		EDI += cmd[16];
+		EDI += work->linebytes;
+		do {
+			[DS:ECX] &= AX;
+			ECX += work->linebytes;
+			[DS:EDI] &= AX;
+			EDI += work->linebytes;
+			EBP--;
+		} while (!= 0);
+		(offset) cmd += 28;
+		asmout("JMP next_command");
+	}
+//	if (CL == 0x80) { /* or */
+		/* 全く工夫のない描画ルーチン */
+		ECX = ESI;
+		do {
+			[DS:ESI] |= AX;
+			ESI += 2;
+			[DS:EDX] |= AX;
+			EDX += 2;
+			EDI--;
+		} while (!= 0);
+		POP(EDI);
+		ECX += work->linebytes;
+		EDI += cmd[16];
+		EDI += 0xe0000000;
+		EDI += cmd[16];
+		EDI += work->linebytes;
+		do {
+			[DS:ECX] |= AX;
+			ECX += work->linebytes;
+			[DS:EDI] |= AX;
+			EDI += work->linebytes;
+			EBP--;
+		} while (!= 0);
+		(offset) cmd += 28;
+		asmout("JMP next_command");
+//	}
+
+line:
+	(offset) cmd += 28;
+	asmout("JMP next_command");
+
+error:
+	INT(0x03);
+}

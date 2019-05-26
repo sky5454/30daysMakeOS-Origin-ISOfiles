@@ -1,0 +1,443 @@
+/* "decode0":キーコード・デコーダー for NEC98 ver.1.0 */
+
+segment CODE(USE32, PARA);
+default(code == CODE);
+
+#include "osaskinc.ask"
+
+void near Keydecode_Init();
+//void near Keydecode_led();
+
+struct WORK {
+	int last;
+	short shiftmap, [2];
+	int declist[1028 /* 257 * 4 */];
+	/* +1036 */
+	int subcmdbuf[0x5bf4];
+};
+
+void far Keydecode_syscmd()
+{
+	int *cmd == FS:EBX;
+	WORK *work == DS:0;
+
+	PUSHAD();
+	MOV(EAX, CS);
+	PUSH(DS);
+	EAX += 8;
+	DS = EAX;
+nextcmd:
+	EAX = *cmd;
+	if (EAX == 0)
+		goto cmd0000;
+	if (EAX == 0x010c)
+		goto cmd010c; /* decodeルール定義 */
+	if (EAX == 0x0104)
+		goto cmd0104; // Keydecode_setlock
+	if (EAX == 0x0110)
+		goto cmd0110; /* decodeルール初期化 */
+	if (EAX == 0x0108)
+		goto cmd0108; // Keydecode_Mainへのベクタ通知
+	if (EAX == 0x0100)
+		goto cmd0100; // 初期化
+	INT(0x03);
+
+cmd0000:
+	POP(DS);
+	[SS:ESP + 16] = EBX;
+	POPAD();
+	return;
+
+cmd0100:
+	// 初期化
+	PUSH((offset) cmd);
+	Keydecode_Init();
+	POP((offset) cmd);
+	(offset) cmd += 4;
+	goto nextcmd;
+
+cmd0104:
+	/* Keydecode_setlock */
+	EAX = cmd[4];
+	PUSH((offset) cmd);
+	ROR(EAX, 16);
+	work->shiftmap &= AX;
+	ROR(EAX, 16);
+	work->shiftmap |= AX;
+//	Keydecode_led();
+	POP((offset) cmd);
+	(offset) cmd += 8;
+	goto nextcmd;
+
+cmd0108:
+	// Keydecode_Mainへのベクタ通知
+	asmout("MOV DWORD PTR FS:[EBX+4],OFFSET Keydecode_Main");
+	(short) cmd[8] = CS;
+	(offset) cmd += 12;
+	goto nextcmd;
+
+cmd010c:
+	/* decodeルール定義(CLIしたほうがいいかも) */
+	/* cmd, opt(len), rawコード, shift-lock-bitmap(mask, equal), subcmd,... */
+	/* subcmdの一覧 */
+	/*	01 : sendsignal(mode-1), call vector, cmd(01), len(max:1KB), signal,...
+		02 : sendsignal(mode-2), 
+		03 : sendsignal(mode-3),
+		04 : or shift-lock-bitmap, 0(dw), bitmap, cmd(04), 0(byte)
+		05 : and shift-lock-bitmap,
+		06 : xor shift-lock-bitmap,
+	//	07 : control LED, hardware-param, bitmap(andしてノンゼロならon), cmd(07), hardware-param
+	*/
+	/* shift-lock-bitmapの割付例 */
+	/*	bit0 : scroll...自動反映
+		bit1 : numlock...自動反映
+		bit2 : caps...自動反映
+		bit3 : reserve...自動反映
+		bit4 : shift
+		bit5 : ctrl
+		bit6 : alt
+		bit7 : reserve
+		bit14, 15は、make/break/remake/overbreak
+	*/
+
+	/*
+		数字の"1":
+			no-shift & no-ctrl & no-altでキーを押した時
+			numlock & no-shift & no-ctrl & no-altでテンキーを押した時
+		英語文字"A":
+			capslock & no-shift & no-ctrl & no-altでキーを押した時
+			no-capslock & shift & no-ctrl & no-altでキーを押した時
+		英語文字"a":
+			no-capslock & no-shift & no-ctrl & no-altでキーを押した時
+			capslock & shift & no-ctrl & no-altでキーを押した時
+
+		というわけで、Aとaを登録すると都合4パターンを登録する必要がある
+		キーの複雑な対応は、winman0で処理させる。
+
+
+	*/
+
+
+
+	/* ワークエリアから適当に切り取って転送して、ポインタを繋いでおわり。 */
+	ESI = work->last;
+	ECX = cmd[ 4]; /* len */
+	EDX = cmd[ 8]; /* rawコード */
+	EAX = cmd[12]; /* shiftmap */
+	(offset) cmd += 16;
+	[DS:ESI] = EAX;
+	EDI = ESI;
+	ESI += 8;
+	ECX -= 2;
+	do {
+		EAX = *cmd;
+		(offset) cmd += 4;
+		[DS:ESI] = EAX;
+		ESI += 4;
+		ECX--;
+	} while (!= 0);
+	[DS:EDI + 4] = ECX /* 0 */;
+	work->last = ESI;
+	ESI = work->declist[EDX * 4];
+	if (ESI == 0) {
+		work->declist[EDX * 4] = EDI;
+		goto nextcmd;
+	}
+	do {
+		EAX = ESI;
+		ESI = [DS:ESI + 4];
+	} while (ESI != 0);
+	[DS:EAX + 4] = EDI;
+	goto nextcmd;
+
+cmd0110:
+	/* decodeルール初期化 */
+	work->last = 1036;
+	(offset) cmd += 8;
+	LEA(ESI, work->declist[0]);
+	EAX = 0;
+	ECX = 257;
+	do {
+		[DS:ESI] = EAX;
+		ESI += 4;
+		ECX--;
+	} while (!= 0);
+	goto nextcmd;
+}
+
+void far Keydecode_Main()
+/* CLIしたほうがいいかも */
+{
+	unsigned int keyint_sel   ==  8 * 8, keydata_sel   ==  9 * 8;
+	WORK *work == DS:0;
+
+	int *msg == DS:ESI;
+
+	MOV(ECX, CS);
+	PUSH(DS);
+	ECX += 8;
+	EAX = msg[8];
+	DS = ECX;
+	PUSH(ESI);
+	if ((unsigned) EAX >= 0x04000000)
+		goto ignore;
+	ECX = EAX;
+//	EDX = EAX;
+	(unsigned int) ECX >>= 10;
+	EAX &= 0x00ffffff;
+	ECX &= 0xc000;
+	/* mode-1バッファを検索する */
+	/* コードが存在したら、shiftmapではなく、バッファ内のシフトコードをローディング */
+//	if (EAX == work->mode1buf[ 0])
+//		CX |= work->mode1buf[ 4];
+//	else if (EAX == work->mode1buf[ 8])
+//		CX |= work->mode1buf[12];
+//	else if (EAX == work->mode1buf[16])
+//		CX |= work->mode1buf[20];
+//	else if (EAX == work->mode1buf[24])
+//		CX |= work->mode1buf[28];
+//	else
+		CX |= work->shiftmap;
+
+	/* breakだったら、mode1buf, mode2bufから抹消する */
+
+	EDI = work->declist[EAX * 4];
+	if (EDI != 0) {
+		do {
+			/* このループ内でCXは保存すること */
+			EAX = ECX;
+			AX &= [DS:EDI + 0];
+			CMP(AX, [DS:EDI + 2]);
+			if (==) {
+				AL = [DS:EDI + 8 + 6];
+				LEA(ESI, [EDI + 8 + 8]);
+				if (AL == 0x01) {
+					/* send signal mode-1 */
+					INT(0x03);
+				}
+				if (AL == 0x02) {
+					/* send signal mode-2 */
+					INT(0x03);
+				}
+				if (AL == 0x03) {
+					/* send signal mode-3 */
+					PUSH(EDI);
+					PUSH(ECX);
+					asmout("CALL FAR [DS:EDI + 8]");
+					POP(ECX);
+					POP(EDI);
+					goto next;
+				}
+			//	DL = (char) work->shiftmap;
+				if (AL == 0x04) {
+					/* or shift-lock-bitmap */
+					EAX = [DS:EDI + 8];
+					work->shiftmap |= AX;
+	checkled:
+			//		DL ^= (char) work->shiftmap;
+			//		DL &= 0x0f;
+			//		if (!= 0)
+			//			Keydecode_led();
+
+					/* mode-2バッファを検索する */
+					/* コードが存在し、かつ、shift状態の変化によりmake状態にふさわしくなくなったら、
+						ブレイクしてから、あらたにmakeする */
+
+					goto next;
+				}
+				if (AL == 0x05) {
+					/* and shift-lock-bitmap */
+					EAX = [DS:EDI + 8];
+					work->shiftmap &= AX;
+				//	goto checkled;
+					goto next;
+				}
+				if (AL == 0x06) {
+					/* xor shift-lock-bitmap */
+					EAX = [DS:EDI + 8];
+					work->shiftmap ^= AX;
+				//	goto checkled;
+					goto next;
+				}
+				if (AL == 0x38) {
+				//	/* DMA停止 */
+					CLI();
+				//	AL = 0x0f;
+				//	OUT(0x00af, AL);
+					/* reset */
+					EAX = 0; /* AL = 0; */
+					OUT(0x00F0, AL);
+					for (;;)
+						HLT();
+				}
+			}
+	next:
+			EDI = [DS:EDI + 4];
+		} while (EDI != 0);
+	}
+ignore:
+	POP(ESI);
+	POP(DS);
+	return;
+}
+
+void near Keydecode_Init()
+{
+	unsigned int Init_sel     ==  2 * 8, TAPI_sel   == 12 * 8;
+
+	ECX = 4096 * 6 / 4;
+	EAX = 0;
+	ESI = 0;
+	do {
+		(int) [DS:ESI] = EAX;
+		ESI += 4;
+		ECX--;
+	} while (!= 0);
+
+	return;
+}
+
+#if 0
+void far filter0()
+// F1～F6しか通さないフィルター
+{
+	unsigned int keyint_sel   ==  8 * 8, keydata_sel   ==  9 * 8;
+
+	asmout("#work_keycode   EQU 0");
+	asmout("#work_keytype   EQU #work_keycode+256");
+	asmout("#work_msg       EQU #work_keytype+256");
+	asmout("#work_tenkey    EQU #work_msg+64");
+	asmout("#work_twocase   EQU #work_tenkey");
+	asmout("#work_signal    EQU #work_twocase+60H");
+	asmout("#work_jmptable  EQU #work_signal+8");
+	asmout("#work_shiftflag EQU #work_jmptable+20");
+	asmout("#work_pause     EQU #work_shiftflag+1");
+	asmout("#work_dummy0    EQU #work_pause+1");
+	asmout("#work_sigcall   EQU #work_dummy0+2");
+	asmout("#work_size      EQU #work_sigcall+8");
+
+	EAX = [DS:ESI + 8];
+	EAX &= 0x0fff;
+	if (EAX == 0x6a5 /* Ctrl + Alt + Delete */) {
+	//	PUSH(FS);
+		PUSH((int) 0);
+		PUSH(EAX);
+		PUSH(0x010c /* KeyResetCPU */);
+		AX = SS;
+		EBX = ESP;
+		FS = AX;
+		DB(0x9a); DD(0); DW((short) keyint_sel);
+		ESP += 12;
+	//	POP(FS);
+	//	asmout("fcall 8*8, KeyResetCPU");
+		for (;;)
+			HLT();
+	/*	// double-faultでリセットをかける
+		CLI();
+		// GDTとIDTのリミットを0にする。
+		EAX = 0;
+		PUSH(EAX);
+		PUSH(EAX);
+		asmout("LGDTE FWORD PTR SS:[ESP+2]");
+		asmout("LIDTE FWORD PTR SS:[ESP+2]");
+		ESP = 256;
+		INT(0x03);
+	*/
+
+	/*	PUSH([DS:ESI + 4]);
+		PUSH([DS:ESI + 0]);
+		(int) [DS:ESI + 0] = 0x00001241;
+		(int) [DS:ESI + 4] = 0xffffff00;
+		asmout("fcall 12*8,TAPI_SingnalMessageTimer");
+		POP([DS:ESI + 0]);
+		POP([DS:ESI + 4]);
+		return;
+*/	} else if (EAX == 0x6a4 /* Ctrl + Alt + Insert */) {
+		PUSH([DS:ESI + 4]);
+		PUSH([DS:ESI + 0]);
+		(int) [DS:ESI + 0] = 0x00001241;
+		(int) [DS:ESI + 4] = 0xffffff01;
+		asmout("CALL FWORD PTR DS:[#work_sigcall]");
+	//	asmout("fcall 12*8,TAPI_SingnalMessageTimer");
+		POP([DS:ESI + 0]);
+		POP([DS:ESI + 4]);
+		return;
+	}
+	PUSH(DS);
+	PUSH(ESI);
+	EAX *= 16;
+	ESI = 0x1000;
+	EAX &= 0x0ff0;
+	CX = CS; CX += 8; DS = CX;
+	ESI += EAX;
+	TEST((char) [DS:ESI], 0x0f);
+	if (!= 0) {
+		asmout("CALL FWORD PTR DS:[#work_sigcall]");
+	//	asmout("fcall 12*8,TAPI_SingnalMessageTimer");
+	}
+	POP(ESI);
+	POP(DS);
+	return;
+asmout("DecodeSiz:");
+}
+
+/*
+void far filter1()
+{
+	EAX = [DS:ESI + 8];
+	EAX &= 0x0fff;
+	if (EAX == 0x6a5 /* Ctrl + Alt + Delete */) {
+		asmout("fcall 8*8, KeyResetCPU");
+		for (;;)
+			HLT();
+
+	/*	// double-faultでリセットをかける
+		CLI();
+		// GDTとIDTのリミットを0にする。
+		EAX = 0;
+		PUSH(EAX);
+		PUSH(EAX);
+		asmout("LGDTE FWORD PTR SS:[ESP+2]");
+		asmout("LIDTE FWORD PTR SS:[ESP+2]");
+		ESP = 256;
+		INT(0x03);
+	*/
+	} else if (EAX == 0x6a4 /* Ctrl + Alt + Insert */) {
+		CL = 0x01;
+	} else if (EAX == 0x0ac /* left */) {
+		CL = 0x10;
+	} else if (EAX == 0x0ad /* right */) {
+		CL = 0x11;
+	} else if (EAX == 0x0a0 /* Enter */) {
+		CL = 0x12;
+	} else if (EAX == 0x1a0 /* Shift + Enter */) {
+		CL = 0x13;
+	} else if (EAX == 0x1ac /* Shift + left */) {
+		CL = 0x14;
+	} else if (EAX == 0x1ad /* Shift + right */) {
+		CL = 0x15;
+	} else if (EAX == 0x646 /* Ctrl + Alt + 'F' */) {
+		CL = 0x16;
+	} else if (EAX == 0x666 /* Ctrl + Alt + 'f' */) {
+		CL = 0x16;
+	} else if (EAX == 0x746 /* Shift + Ctrl + Alt + 'F' */) {
+		CL = 0x17;
+	} else if (EAX == 0x766 /* Shift + Ctrl + Alt + 'f' */) {
+		CL = 0x17;
+	} else
+		return;
+
+	ECX |= 0xffffff00;
+	PUSH([DS:ESI + 4]);
+	PUSH([DS:ESI + 0]);
+	(int) [DS:ESI + 0] = 0x00001241;
+	(int) [DS:ESI + 4] = ECX;
+	asmout("fcall 12*8,TAPI_SingnalMessageTimer");
+	POP([DS:ESI + 0]);
+	POP([DS:ESI + 4]);
+	return;
+asmout("DecodeSiz:");
+}
+*/
+
+#endif

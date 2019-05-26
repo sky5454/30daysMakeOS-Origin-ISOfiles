@@ -1,0 +1,1502 @@
+/* "papi0.ask" ver.0.6 copyright(C) 2002 H.Kawai(川合秀実) */
+/* 64bitタイプ */
+
+#include "osaskinc.ask"
+
+segment CODE(USE32, PARA);
+default(code == CODE);
+
+#define	DEBUG		0
+#define	DEBUG1		0
+
+/* ワークエリア */
+/* 雑用 4KB */
+/* 物理メモリの空き管理(2KB+2KB+4KB) */
+/* リニアアドレス → 64bitアドレス 4KB */
+/* 64bitアドレス → 物理アドレス 16KB */
+
+/* 暫定アドレスマップ */
+/*
+	0GB～ 4GB : 実メモリのためにリザーブ
+	4GB～ 8GB : フラグメンテーション用領域
+	8GB～12GB : フロッピーディスク(1メディアで2MB)
+	8EB～16EB : 仮想メモリ。無尽蔵にある。
+*/
+/*
+	仮想メモリの一部がメモリにロードされる
+	はがされるまでストアしない。
+	メモリが分断されるという問題はある。
+*/
+
+/* 暫定的な仕様で、16TBまでをサポート */
+/* 仮想メモリは、8TB～ */
+
+struct area_man_struct_sub {
+	unsigned int size;
+	unsigned int addr;
+};
+
+struct area_man_struct {
+	char res0[8];
+	unsigned int use, size0; // 単位はバイト
+	void [16];
+	area_man_struct_sub data0, data[0];
+	/* use < size0 は常に成立する */
+	/* data[use]は-1,-1を指す */
+	/* data0は番兵0,0 */
+};
+
+struct AAC_Node {
+	unsigned int len, index, data, [4];
+	/* index == 0xffffffff, len == 0は使えない */
+	/* indexの有効範囲は、[1,0xfffffffe) */
+	/* 0が使えないのは痛いから、indexに+1してから呼び出せばいいだろう */
+};
+
+struct AAC_Head {
+	int limit, last, [8];
+	AAC_Node head, node[0];
+	/* limitは領域範囲外の最初のバイトを指す */
+};
+
+struct WORK {
+	void [4096];
+//	int debug;
+	area_man_struct mem20_man[2048];
+	area_man_struct mem24_man[2048];
+	area_man_struct mem32_man[4096];
+	AAC_Head linear_addr64[4096];
+	AAC_Head addr64_addrp[16384];
+};
+
+void near mapping();
+void near map_sub();
+void near unmapping();
+void near init_areastr();
+void near count_free();
+void near get_area();
+void near free_area();
+void near init_AAChead();
+void near AAC_convert();
+void near AAC_regist();
+void near AAC_cancel();
+void near free_memory();
+
+void far PAPI_syscmd()
+/* PAPIコマンド受け付け
+   これは、かならずlv0から呼ばれる */
+{
+	unsigned int Init_sel     ==  2 * 8, TAPI_sel   == 12 * 8;
+	unsigned int pdepte_sel   == 14 * 8, idtgdt_sel    == 15 * 8;
+	int *cmd == FS:EBX;
+	WORK *work == DS:0;
+
+	PUSHAD();
+	MOV(EAX, CS);
+	PUSH(DS);
+	EAX += 8;
+	DS = EAX;
+nextcmd:
+	EAX = *cmd;
+	if (EAX == 0)
+		goto cmd0000;
+	if (EAX == 0x0100)
+		goto cmd0100; /* 初期化 */
+	if (EAX == 0x0104)
+		goto cmd0104; /* PageFaultハンドラ */
+	if (EAX == 0x0108)
+		goto cmd0108; /* mapping */
+	if (EAX == 0x010c)
+		goto cmd010c; /* unmapping */
+	if (EAX == 0x0110)
+		goto cmd0110; /* 利用可能物理メモリ通知(free_memory) */
+	if (EAX == 0x0114)
+		goto cmd0114; /* 物理メモリ取得(ページ単位・連続・アライン指定可) */
+	if (EAX == 0x0118)
+		goto cmd0118; /* delete pages */
+
+	INT(0x03);
+
+cmd0000:
+	POP(DS);
+	[SS:ESP + 16] = EBX;
+	POPAD();
+	return;
+
+cmd0100:
+	/* 初期化 */
+	/* cmd, opt, reserve0, reserve1 */
+	(offset) cmd += 16;
+	EDX = 0;
+	EAX = 0;
+	EDX--;
+	LEA(ESI, (int) work->mem20_man);
+	ECX = 2048 - 40;
+	init_areastr();
+	LEA(ESI, (int) work->mem24_man);
+	ECX = 2048 - 40;
+	init_areastr();
+	LEA(ESI, (int) work->mem32_man);
+	ECX = 4096 - 40;
+	init_areastr();
+	LEA(ESI, (int) work->linear_addr64);
+	ECX = 4096;
+	init_AAChead();
+	LEA(ESI, (int) work->addr64_addrp);
+	ECX = 16384;
+	init_AAChead();
+
+#if (DEBUG)
+PUSHAD();
+EAX = 0;
+EBX = 0;
+EAX--;
+ECX = 4096 / 4;
+do {
+	[DS:EBX] = EAX;
+	EBX += 4;
+	ECX--;
+} while (!= 0);
+POPAD();
+#endif
+
+	goto nextcmd;
+
+cmd0104:
+	asmout("MOV DWORD PTR FS:[EBX+4],OFFSET PageFaultHandler");
+	(short) cmd[8] = CS;
+	(offset) cmd += 12;
+	goto nextcmd;
+
+cmd0108:
+	/* mapping */
+	/* cmd, opt, size, linear, pageset, offset64, addr64(start or link) */
+
+	EAX = cmd[ 4];
+	TEST(EAX, 0x1000); /* over-mapping */
+	if (!= 0) {
+		ECX = cmd[ 8]; /* size */
+		EAX = cmd[12]; /* linear */
+		ECX += 4095;
+		(unsigned int) EAX >>= 12;
+		(unsigned int) ECX >>= 12;
+		EAX++;
+		LEA(ESI, (int) [work->linear_addr64]);
+		AAC_cancel();
+	}
+	if (cmd[32] == 0) {
+		PUSH(DS);
+		PUSH(pdepte_sel);
+		POP(DS);
+		ECX = cmd[ 8]; /* size */
+		EDX = cmd[12]; /* linear */
+		EAX = cmd[28];
+	//	if (ECX != 0) {
+			ESI = cmd[ 4] /* opt(bit0～11はページ属性) */;
+			EAX += cmd[20];
+			ESI &= 0xfff;
+			EAX |= ESI;
+//if ((unsigned) EAX >= 0x00800000) {
+//if (ECX != 0x00100000)
+//INT(0x03);
+//}
+			mapping();
+	//	}
+		EAX = cmd[ 4];
+		TEST(EAX, 0x1000); /* over-mapping */
+		if (!= 0) {
+			EAX = CR3;
+			CR3 = EAX;
+		}
+		(offset) cmd += 36;
+		POP(DS);
+		goto nextcmd;
+	}
+
+#if 0
+	/* 適当にget_memoryして、貼り付ける */
+	ECX = cmd[ 8]; /* size */
+	EDX = cmd[12]; /* linear */
+	LEA(ESI, (int) work->mem20_man);
+	get_area();
+	ESI = pdepte_sel;
+	EAX |= 0x007;
+	PUSH(DS);
+	DS = SI;
+	mapping();
+	EAX = cmd[ 4];
+	TEST(EAX, 0x1000); /* over-mapping */
+	if (!= 0) {
+		EAX = CR3;
+		CR3 = EAX;
+	}
+	(offset) cmd += 36;
+	POP(DS);
+	goto nextcmd;
+#endif
+
+	EAX = cmd[12 /* linear */];
+	EDX = cmd[28 /* addr64 */];
+	ECX = cmd[ 8 /* size */];
+	ESI = cmd[32 /* addr64(high) */];
+	(unsigned int) EAX >>= 12;
+	SHRD(EDX, ESI, 12);
+	(unsigned int) ECX >>= 12;
+	EAX++; /* linearで0は使いうるから */
+	LEA(ESI, (int) [work->linear_addr64]);
+//	if (ECX != 0) {
+		AAC_regist();
+		PUSH(DS);
+		PUSH(pdepte_sel);
+		POP(DS);
+		ECX = cmd[ 8]; /* size */
+		EDX = cmd[12]; /* linear */
+		unmapping();
+		POP(DS);
+//	}
+	(offset) cmd += 36;
+	goto nextcmd;
+
+cmd010c:
+	/* unmapping */
+	/* cmd, opt, size, linear, pageset */
+
+	PUSH(DS);
+	PUSH((int) pdepte_sel);
+	POP(DS);
+	ECX = cmd[ 8]; /* size */
+	EDX = cmd[12]; /* linear */
+	unmapping();
+	POP(DS);
+	ECX = cmd[ 8]; /* size */
+	EAX = cmd[12]; /* linear */
+	ECX += 4095;
+	(unsigned int) EAX >>= 12;
+	(unsigned int) ECX >>= 12;
+	EAX++;
+	LEA(ESI, (int) [work->linear_addr64]);
+	AAC_cancel();
+	(offset) cmd += 20;
+	goto nextcmd;
+
+cmd0110:
+	/* free_memory */
+	ECX = cmd[ 8];
+	EAX = cmd[12];
+	(offset) cmd += 16;
+PUSHFD();
+CLI();
+	TEST(EAX, 0xff000000);
+	/* ESI = (offset) work->mem32_man; */ LEA(ESI, (int) work->mem32_man);
+	if (== 0) {
+		TEST(EAX, 0xfff00000);
+		/* ESI = (offset) work->mem24_man; */ LEA(ESI, (int) work->mem24_man);
+		if (== 0)
+			/* ESI = (offset) work->mem20_man; */ LEA(ESI, (int) work->mem20_man);
+	}
+
+#if (DEBUG)
+PUSH(ECX);
+PUSH(EAX);
+(unsigned int) EAX >>= 12;
+(unsigned int) ECX >>= 12;
+do {
+	BTR([DS:0], EAX);
+	if (CF == 0)
+		INT(0x03);
+	EAX++;
+	ECX--;
+} while (!= 0);
+POP(EAX);
+POP(ECX);
+#endif
+
+	free_area();
+POPFD();
+	goto nextcmd;
+
+cmd0114:
+	/* 物理メモリ取得(連続) */
+PUSHFD();
+CLI();
+	EAX = cmd[12];
+	ECX = cmd[ 8];
+	if (EAX == 0)
+		goto cmd0114_get32;
+	if (EAX == 1)
+		goto cmd0114_get24;
+	if (EAX == 2)
+		goto cmd0114_get20;
+	if (EAX == 0x80000001)
+		goto cmd0114_special;
+	if (EAX == 0x80000101)
+		goto cmd0114_specialcheck;
+	if (EAX == 0x800000ff)
+		goto cmd0114_specialreport;
+
+	INT(0x03);
+
+cmd0114_get32:
+	/* ESI = (offset) work->mem32_man; */ LEA(ESI, (int) work->mem32_man);
+	get_area();
+	if (ZF == 1) {
+cmd0114_get24:
+		/* ESI = (offset) work->mem24_man; */ LEA(ESI, (int) work->mem24_man);
+		get_area();
+		if (ZF == 1) {
+cmd0114_get20:
+			/* ESI = (offset) work->mem20_man; */ LEA(ESI, (int) work->mem20_man);
+			get_area();
+			if (ZF == 1)
+				INT(0x03);
+		}
+	}
+
+#if (DEBUG)
+PUSH(ECX);
+PUSH(EAX);
+(unsigned int) EAX >>= 12;
+(unsigned int) ECX >>= 12;
+do {
+	BTS([DS:0], EAX);
+	if (CF == 1)
+		INT(0x03);
+	EAX++;
+	ECX--;
+} while (!= 0);
+POP(EAX);
+POP(ECX);
+#endif
+
+POPFD();
+	cmd[16] = EAX;
+	(offset) cmd += 20;
+	goto nextcmd;
+
+cmd0114_special:
+	/* special command */
+	work->mem24_man.data[0].addr += ECX;
+	work->mem24_man.data[0].size -= ECX;
+	if ((unsigned) <= 0) {
+		EAX = 0;
+		work->mem24_man.use -= sizeof (area_man_struct_sub);
+		EAX--;
+		work->mem24_man.data[0].addr = EAX;
+		work->mem24_man.data[0].size = EAX;
+	}
+	(offset) cmd += 16;
+POPFD();
+	goto nextcmd;
+
+cmd0114_specialcheck:
+	EAX = 0;
+	if ((unsigned) work->mem24_man.data[0].size >= 0x00e00000)
+		EAX |= 0x01;
+POPFD();
+	cmd[16] = EAX;
+	(offset) cmd += 20;
+	goto nextcmd;
+
+cmd0114_specialreport:
+	area_man_struct *cmd0114_areastr == DS:ESI;
+	EDX = 0;
+	/* ESI = (offset) work->mem20_man; */ LEA(ESI, (int) work->mem20_man);
+	EDX--;
+	count_free(); /* 本来は、init_taskにやらせる(計算中におかしくなるかもしれないから) */
+	EDI = cmd0114_areastr->use;
+	cmd[16] = EDX;
+	(unsigned int) EDI /= 8;
+	cmd[20] = ECX;
+	cmd[24] = EAX;
+	cmd[28] = EDI;
+	/* ESI = (offset) work->mem24_man; */ LEA(ESI, (int) work->mem24_man);
+	count_free();
+	EDI = cmd0114_areastr->use;
+	cmd[32] = EDX;
+	(unsigned int) EDI /= 8;
+	cmd[36] = ECX;
+	cmd[40] = EAX;
+	cmd[44] = EDI;
+	/* ESI = (offset) work->mem32_man; */ LEA(ESI, (int) work->mem32_man);
+	count_free();
+	EDI = cmd0114_areastr->use;
+	cmd[48] = EDX;
+	(unsigned int) EDI /= 8;
+	cmd[52] = ECX;
+	cmd[56] = EAX;
+	cmd[60] = EDI;
+POPFD();
+	(offset) cmd += 64;
+	goto nextcmd;
+
+cmd0118:
+	/* delete pages */
+	/* cmd, opt, size64, offset64, addr64(start or link) */
+	/* このバージョンでは、offsetは認識してない */
+	ECX = cmd[ 8]; /* size */
+	EAX = cmd[12];
+	ECX += 4095;
+	ADC(EAX, 0);
+	SHRD(ECX, EAX, 12);
+	EAX = cmd[24];
+	EDX = cmd[28];
+	SHRD(EAX, EDX, 12);
+	EAX++;
+	LEA(ESI, (int) [work->addr64_addrp]);
+	PUSH(ECX);
+	PUSH(EAX);
+	do {
+		AAC_convert();
+		if (CF == 0) {
+			PUSH(ECX);
+			PUSH(EAX);
+			EDX *= 4096;
+			ECX = 4096;
+			EAX = EDX;
+			free_memory();
+			POP(EAX);
+			POP(ECX);
+		}
+		EAX++;
+		ECX--;
+	} while (!= 0);
+	POP(EAX);
+	POP(ECX);
+	AAC_cancel();
+	(offset) cmd += 32;
+	goto nextcmd;
+
+
+	/* pre-load */
+	/* cmd, opt, size, linear, pageset */
+	/* cmd, opt, size, addr64 */
+
+	/* make-signal */
+	/* 将来はこのコマンドの形態は変わるだろうが、とりあえずはこの形式で行く */
+
+
+	/* 領域管理サービス */
+	/* 指定容量確保(含むnバイト挿入) */
+	/* 部分開放(含む全開放) */
+
+
+	/* cmd, opt, size, linear, pageset, offset64, addr64(start or link) */
+
+
+
+}
+
+
+void near mapping()
+/* DSにmapspace-module
+   EAXに物理アドレス
+   ECXにサイズ
+   EDXに線形アドレス */
+/* 将来的には、物理アドレスではなくデバイスアドレスになる */
+{
+	unsigned int pteofs == EDI;
+	int linear == EDX, size == EBP, size2 == EBX;
+	PUSHAD();
+	size = ECX;
+	do {
+		EBX = linear;
+		pteofs = linear;
+		(unsigned int) EBX >>= 22;
+		pteofs &= 0x003ff000;
+		ECX = 1024 * 4096;
+	//	ESI = [DS:EBX * 4];
+		asmout("MOV ESI,DWORD PTR DS:[EBX*4]");
+		ECX -= pteofs;
+		pteofs /= 1024;
+		if ((unsigned) ECX >= size)
+			ECX = size;
+		ESI += pteofs;
+		size2 = ECX;
+		(unsigned int) ECX /= 4096;
+		map_sub();
+		linear += size2;
+		size -= size2;
+	} while ((unsigned) > 0);
+	POPAD();
+	return;
+}
+
+void near map_sub()
+/* DS:ESIからマッピング
+   EAXに最初の値(含：アトリビュート)
+   ECXはページ数 */
+{
+	int *pte == DS:ESI;
+	do {
+		*pte = EAX;
+
+#if (DEBUG)
+PUSH(DS);
+PUSH(ECX);
+PUSH(EAX);
+MOV(ECX, CS);
+ECX += 8;
+if ((unsigned) EAX >= 0x00268000) {
+	if ((unsigned) EAX < 0x08000000) {
+		(unsigned int) EAX >>= 12;
+		DS = ECX;
+		BT([DS:0], EAX);
+		if (CF == 0) {
+			ESP += 16;
+			POPAD();
+			INT(0x03);
+		}
+	}
+}
+POP(EAX);
+POP(ECX);
+POP(DS);
+#endif
+
+		(offset) pte += 4;
+		EAX += 0x1000;
+		ECX--;
+	} while (!= 0);
+	return;
+}
+
+void near mapping1p()
+/* DSにmapspace-module
+   EAXに物理アドレス
+   EDXに線形アドレス */
+/* 将来的には、物理アドレスではなくデバイスアドレスになる */
+{
+	unsigned int pteofs == EDI;
+	unsigned int linear == EDX;
+	PUSH(EDI);
+	PUSH(ESI);
+	PUSH(linear);
+	pteofs = linear;
+	linear >>= 22;
+	pteofs &= 0x003ff000;
+//	ESI = [DS:EDX * 4];
+	asmout("MOV ESI,DWORD PTR DS:[EDX*4]");
+	pteofs /= 1024;
+//	ESI += pteofs;
+	POP(linear);
+//	[DS:ESI] = EAX;
+	[DS:ESI + EDI] = EAX;
+
+#if (DEBUG)
+PUSH(DS);
+PUSHAD();
+MOV(ECX, CS);
+ECX += 8;
+if ((unsigned) EAX >= 0x00268000) {
+	(unsigned int) EAX >>= 12;
+	DS = ECX;
+	BT([DS:0], EAX);
+	if (CF == 0)
+		INT(0x03);
+}
+POPAD();
+POP(DS);
+#endif
+
+	POP(ESI);
+	POP(EDI);
+	return;
+}
+
+void near unmapping()
+/* ページをはがすだけ */
+{
+	unsigned int pteofs == EDI;
+	int linear == EDX, size == EBP, size2 == EBX;
+	int *pte == DS:ESI;
+	PUSHAD();
+	size = ECX;
+	do {
+		EBX = linear;
+		pteofs = linear;
+		(unsigned int) EBX >>= 22;
+		pteofs &= 0x003ff000;
+		ECX = 1024 * 4096;
+	//	(offset) pte = [DS:EBX * 4];
+		asmout("MOV ESI,DWORD PTR DS:[EBX*4]");
+		ECX -= pteofs;
+		pteofs /= 1024;
+		if ((unsigned) ECX >= size)
+			ECX = size;
+		(offset) pte += pteofs;
+		size2 = ECX;
+		do {
+			*pte &= 0xfffffffe; /* not-present */
+			(offset) pte += 4;
+			ECX -= 4096;
+		} while (!= 0);
+		linear += size2;
+		size -= size2;
+	} while ((unsigned) > 0);
+	asmout("MOV EAX,CR3");
+	asmout("MOV CR3,EAX");
+	POPAD();
+	return;
+}
+
+void near get_area()
+/* DS:ESIに管理情報構造体へのポインタ。
+   ECXに要求連続サイズ。
+   EAXにページアドレス。-1の場合、エラー。 */
+
+/* 構造体の最初の8バイトはリザーブ
+   次の8バイトは、使用バイト数と構造体サイズ
+   その次の16バイトはリザーブ
+   ということで、最初のデーターは+40から */
+
+/* first_fitアルゴリズム
+   アクセス競合などは、上位ルーチンで解決しておくこと
+   ZF == 1はエラー (EAX == -1) */
+{
+	area_man_struct *work == DS:ESI;
+	area_man_struct_sub *dat == DS:EBX;
+	unsigned int req == ECX;
+	PUSH((offset) dat);
+	/* LEA((offset) dat,[(offset) work->data]); */ LEA((offset) dat, (int) [work->data]);
+
+	if (req > dat->size) {
+		do {
+			unsigned int next_size == EAX;
+			next_size = dat[sizeof (area_man_struct_sub)].size;
+			(offset) dat += sizeof (area_man_struct_sub);
+		} while (next_size < req);
+	}
+
+	EAX = dat->addr;
+	if (EAX != 0xffffffff) {
+		dat->addr += req;
+		dat->size -= req;
+		if (== 0) {
+			work->use -= sizeof (area_man_struct_sub);
+			/* 転送(sizeof (area_man_struct_sub) == 8を仮定) */
+			PUSH(ECX);
+			PUSH(EAX);
+			do {
+				EAX = /* (dat + 8)->size */ dat[8].size;
+				ECX = /* (dat + 8)->addr */ dat[8].addr;
+				dat->size = EAX;
+				dat->addr = ECX;
+				(offset) dat += 8;
+			} while (EAX != 0xffffffff);
+			POP(EAX);
+			POP(ECX);
+			CMP(EAX, 0xffffffff); /* for ZF == 0 */
+		}
+		/* ここに来るとき、ZF == 0 */
+	}
+	POP((offset) dat);
+	return;
+}
+
+void near free_area()
+/* DS:ESIに管理情報構造体へのポインタ。 */
+/* ECXに解放サイズ。 */
+/* EAXにページアドレス。 */
+/* 全レジスタ保存 */
+/* ２分検索アルゴリズム */
+/* アクセス競合などは、上位ルーチンで解決しておくこと */
+/* ZF == 1はエラー(管理領域不足) */
+{
+	area_man_struct *work == DS:ESI;
+	area_man_struct_sub *dat == DS:EBX;
+	unsigned int dat0 == EDX, dat1 == EDI;
+	unsigned int size == ECX, addr == EAX;
+	PUSH(dat1);
+	dat1 = work->use;
+	PUSH(dat0);
+	PUSH((offset) dat);
+	LEA(dat0, (int) work->data0);
+//	dat1 = (offset) work->data[dat1]; // これがうまくコンパイルできない
+	LEA(dat1, [dat1 + (offset) work->data]);
+
+	LEA((offset) dat, [dat0 + dat1]);
+	(offset) dat /= 2;
+	(offset) dat &= 0xfffffff8; // 8バイトアライン
+	if ((unsigned) (offset) dat > dat0) {
+		for (;;) {
+			if (addr < dat->addr) {
+				dat1 = (offset) dat;
+				(offset) dat += dat0;
+				(offset) dat /= 2;
+				(offset) dat &= 0xfffffff8; // 8バイトアライン
+				if ((unsigned) (offset) dat > dat0)
+					continue;
+				break;
+			}
+			/* == はありえない */
+			dat0 = (offset) dat;
+			(offset) dat += dat1;
+			(offset) dat /= 2;
+			(offset) dat &= 0xfffffff8; // 8バイトアライン
+			if ((unsigned) (offset) dat > dat0)
+				continue;
+			break;
+		}
+	}
+
+	/* dat->addr < addr < dat[8]->addr */
+
+	EDI = dat->size;
+	LEA(EDX, [addr + size]);
+	EDI += dat->addr;
+	if (!= 0) {
+		/* 上は番兵ではない */
+		if (addr == EDI) {
+			/* 上との融合は可能 */
+			dat->size += size;
+			if (EDX == dat[8].addr) {
+				/* 下との融合も可能 */
+				EDX = dat[8].size;
+				dat->size += EDX;
+				/* 転送(sizeof (area_man_struct_sub) == 8を仮定) */
+				(offset) dat += sizeof (area_man_struct_sub);
+				PUSH(ECX);
+				PUSH(EAX);
+				do {
+					EAX = /* (dat + 8)->size */ dat[8].size;
+					ECX = /* (dat + 8)->addr */ dat[8].addr;
+					dat->size = EAX;
+					dat->addr = ECX;
+					(offset) dat += 8;
+				} while (EAX != 0xffffffff);
+				work->use -= sizeof (area_man_struct_sub);
+				POP(EAX);
+				POP(ECX);
+				CMP(addr, 0xffffffff); // for ZF == 0
+			}
+			POP((offset) dat);
+			POP(dat0);
+			POP(dat1);
+			return;
+		}
+	}
+
+	if (EDX == dat[8].addr) {
+		/* 下との融合は可能 */
+		dat[8].size += size; // ZF = 0
+		dat[8].addr = addr;
+		POP((offset) dat);
+		POP(dat0);
+		POP(dat1);
+		return;
+	}
+
+	/* 融合不可能・要挿入 */
+
+	(offset) dat = work->use;
+	(offset) dat += sizeof (area_man_struct_sub); 
+	if ((unsigned) (offset) dat < work->size0) { /* これが成立しない場合、ZF == 1 */
+		work->use = (offset) dat;
+		LEA((offset) dat, [/* (offset) dat */ EBX + (offset) work->data]);
+	//	PUSH(EDX);
+		PUSH(ECX);
+		do {
+			ECX = /* (dat - 8)->size */ dat[-8].size;
+			EDX = /* (dat - 8)->addr */ dat[-8].addr;
+			dat->size = ECX;
+			dat->addr = EDX;
+			(offset) dat -= 8;
+		} while (addr < EDX); // 常にZF == 0
+		POP(ECX);
+	//	POP(EDX);
+		/* (dat + 8)->size */ dat[8].size = size;
+		/* (dat + 8)->addr */ dat[8].addr = addr;
+	}
+	POP((offset) dat);
+	POP((offset) dat0);
+	POP((offset) dat1);
+	return;
+}
+
+
+/* 最初に利用したい部分をdisposeしておく。そうすれば、ロードしようなんて思わない。 */
+/* 最初は全範囲がdisposeされていて、あとは利用が済んだらdisposeする */
+
+
+// getmemory();
+// freememory();
+// searchpage(); /* 64bitページがキャッシュされているかどうかを調べて、キャッシュされていれば物理アドレスを返す */
+/* 今のところ、ミスヒット==新規ページ */
+// disposepage(); /* 指定された64bitページは空白になる */
+
+/*
+	PageFaultが来る → リニアアドレスから64bitアドレスに変換
+	→ 判明した64bitアドレスでsearchpage();
+	(1)見付からない場合、getmemoryして、ロード（disposeされているかどうかを調べて、されていれば何もしない）。
+	(2)見付かったら、それをマップ。
+	とにかく該当ページをマッピング。
+
+*/
+
+
+/* ダミーヘッダも必要(ここは検索対象にはならない) */
+/* ターミネーターは、len = 0, addrp = -1, addr64 = -1 */
+
+/* 16バイトで1ページ。4KBで256ページ(1MB) */
+
+#if 0
+
+void near cacheoutpases()
+/* EDX:EAX から ECX バイト */
+{
+	/* ソートされているので二分検索で探せるのだが、手抜きで線形検索 */
+	CachePageNode *node == DS:EBX;
+
+	PUSH((offset) node);
+	PUSH(EDX);
+	PUSH(ECX);
+	PUSH(EAX);
+	(offset) node = work-> ;
+	SHRD(EAX, EDX, 12);
+
+	/* EAXを探して、ECX分を消去 */
+	if ((unsigned) EAX >= node->addr64[0]) {
+		do {
+			(offset) node += sizeof (CachePageNode);
+		} while ((unsigned) EAX >= node->addr64[0]);
+	}
+	/* 追い抜いてしまっているので、一つ戻って判定 */
+	(offset) node -= sizeof (CachePageNode);
+	EAX -= node->addr64[0];
+	if (== 0) {
+		if (ECX < node->len) {
+			node->len -= ECX;
+			node->addrp += ECX;
+			(unsigned int) ECX /= 4096;
+			node->addr64[0] += ECX;
+			POP(EAX);
+			POP(ECX);
+			POP(EDX);
+			POP((offset) node);
+			return;
+		}
+		do {
+			EAX = node[16 /* sizeof (CachePageNode) */].len;
+			ECX = node[16 /* sizeof (CachePageNode) */].addrp;
+			EDX = node[16 /* sizeof (CachePageNode) */].addr64[0];
+			node->len = EAX;
+			node->addrp = ECX;
+			node->addr64[0] = EDX;
+		} while (EDX != 0xffffffff);
+ret:
+		POP(EAX);
+		POP(ECX);
+		POP(EDX);
+		POP((offset) node);
+		return;
+	}
+	EAX *= 4096;
+	EDX = EAX;
+	EAX += ECX;
+	ECX = node->len;
+	node->len = EDX;
+	if (EAX == ECX)
+		goto ret;
+	/* EAX + addrp, EAX / 4096 + addr64[0] : 次のノードの先頭 */
+	/* len - EAX : 次のノードのlen */
+	PUSH(EBP);
+	PUSH(ESI);
+	PUSH(EDI);
+	EDX = node->addrp;
+	ECX -= EAX; /* new-len */
+	EDX += EAX;
+	EAX /= 4096;
+	EAX += node->addr64[0];
+	do {
+		(offset) node += sizeof (CachePageNode);
+		EBP = node->len;
+		ESI = node->addrp;
+		EDI = node->addr64[0];
+		node->len = ECX;
+		node->addrp = EDX;
+		node->addr64[0] = EAX;
+		ECX = EBP;
+		ESI = EDX;
+		EDI = EAX;
+	} while (EAX != 0xffffffff);
+	POP(EAX);
+	POP(ECX);
+	POP(EDX);
+	POP((offset) node);
+	return;
+}
+
+#endif
+
+/* cache管理はAAC_Nodeで行う。indexはaddr64を12bitシフトして扱うので、lenもdataも12bitシフトして扱う */
+
+/* dispose範囲の把握は、area_man_structで行う。disposeされている空間が構造体に記録される */
+/* 指定の範囲をdisposeするのはfree_areaでできるが、指定の範囲をdisposeから切り離すのはできないので、これを新しく用意する */
+
+/* ページングのリニアアドレスからaddr64への変換もAAC_Nodeで行う。 */
+
+
+void near AAC_searchsub()
+/* 2分検索で探す */
+/* EAXにindex。EDXとEDIを破壊。EBXに返す。 */
+{
+	AAC_Node *node == DS:EBX;
+	AAC_Head *head == DS:ESI;
+	unsigned int node0 == EDI, node1 == EDX, index == EAX;
+
+	LEA(node0, (int) head->head);
+	node1 = head->last;
+
+	LEA((offset) node, [node0 + node1]);
+	(offset) node /= 2;
+	(offset) node &= 0xfffffff0; /* 16バイトアライン */
+
+	if ((unsigned) (offset) node > node0) {
+		for (;;) {
+			if (index < node->index) {
+				node1 = (offset) node;
+				(offset) node += node0;
+				(offset) node /= 2;
+				(offset) node &= 0xfffffff0; /* 16バイトアライン */
+				if ((unsigned) (offset) node > node0)
+					continue;
+				break;
+			}
+			/* 等しくても続行 */
+			node0 = (offset) node;
+			(offset) node += node1;
+			(offset) node /= 2;
+			(offset) node &= 0xfffffff0; /* 16バイトアライン */
+			if ((unsigned) (offset) node > node0)
+				continue;
+			break;
+		}
+	}
+	/* node->index <= index < node[16].index */
+	return;
+}
+
+void near AAC_convert()
+/* EAX(index) → EDX(data) */
+/* DS:ESIにstruct AAC_Headへのポインタを */
+/* 変換に成功すればCF = 0, 失敗すればCF = 1 */
+{
+	AAC_Node *node == DS:EBX;
+	AAC_Head *head == DS:ESI;
+	unsigned int index == EAX;
+
+	PUSH((offset) node);
+	PUSH(EDI);
+
+	AAC_searchsub(); /* EDXとEDIは破壊される */
+	/* node->index <= index < node[16].index */
+
+	EDX = index;
+	POP(EDI);
+	EDX -= node->index;
+	if ((unsigned) EDX < node->len) {
+		EDX += node->data; /* CF = 0 */
+		POP((offset) node);
+		return;
+	}
+	STC(); /* CF = 1 */;
+	POP((offset) node);
+	return; 
+}
+
+void near AAC_regist()
+/* コンバート規則追加 */
+/* 重複登録は許さない */
+/* EAX(index), EDX(data), ECX(len) */
+{
+	AAC_Node *node == DS:EBX;
+	AAC_Head *head == DS:ESI;
+
+	PUSH((offset) node);
+	PUSH(EDI);
+	PUSH(EDX);
+
+	AAC_searchsub(); /* EDXとEDIは破壊される */
+	/* node->index <= EAX < node[16].index */
+
+	EDI = node->len;
+	EDX = EDI;
+	EDI += node->index;
+	EDX += node->data;
+	EDI ^= EAX;
+	EDX ^= [SS:ESP];
+	EDI |= EDX;
+	if (== 0) {
+		/* 追加成功 */
+		node->len += ECX;
+		EDX = [SS:ESP];
+		PUSH(EAX);
+		EAX += ECX;
+		EDX += ECX;
+		EAX ^= node[16].index;
+		EDX ^= node[16].data;
+		EAX |= EDX;
+		if (== 0) {
+			/* 統合 */
+			EAX = node[16].len;
+			head->last -= sizeof (AAC_Node);
+			node->len += EAX;
+			do {
+				(offset) node += sizeof (AAC_Node);
+				EAX = node[16].index;
+				EDI = node[16].len;
+				EDX = node[16].data;
+				node->index = EAX;
+				EAX++;
+				node->len = EDI;
+				node->data = EDX;
+			} while (!= 0);
+		}
+		POP(EAX);
+		POP(EDX);
+		POP(EDI);
+		POP((offset) node);
+		return;
+	}
+	/* 下との統合を調べる */
+	EDX = [SS:ESP];
+	PUSH(EAX);
+	EAX += ECX;
+	EDX += ECX;
+	EAX ^= node[16].index;
+	EDX ^= node[16].data;
+	EAX |= EDX;
+	if (== 0) {
+		/* 統合 */
+		POP(EAX);
+		POP(EDX);
+		node[16].index = EAX;
+		node[16].data = EDX;
+		POP(EDI);
+		POP((offset) node);
+		return;
+	}
+	/* 挿入 */
+	EAX = [SS:ESP];
+	EDX = [SS:ESP + 4];
+	PUSH(ESI);
+	(offset) node += sizeof (AAC_Node);
+	EDI = head->limit;
+	head->last += sizeof (AAC_Node);
+	PUSH(ECX);
+	if ((unsigned) head->last >= EDI)
+		goto err;
+	do {
+		EBP = node->index;
+		ESI = node->len;
+		EDI = node->data;
+		node->index = EAX;
+		node->len = ECX;
+		node->data = EDX;
+		(offset) node += sizeof (AAC_Node);
+		EAX = EBP;
+		EBP++;
+		ECX = ESI;
+		EDX = EDI;
+	} while (!= 0);
+	node->index = EAX;
+	node->len = ECX;
+	node->data = EDX;
+	POP(ECX);
+	POP(ESI);
+	POP(EAX);
+	POP(EDX);
+	POP(EDI);
+	POP((offset) node);
+	return;
+err:
+	INT(0x03);
+}
+
+void near AAC_cancel()
+/* コンバート規則削除 */
+/* 登録していない部分を削除してもよい */
+/* EAX(index), ECX(len) */
+{
+	AAC_Node *node == DS:EBX;
+	AAC_Head *head == DS:ESI;
+	unsigned int index == EAX;
+
+	PUSH((offset) node);
+	PUSH(EDI);
+	PUSH(EDX);
+	PUSH(ECX);
+	PUSH(index);
+
+	AAC_searchsub(); /* EDXとEDIは破壊される */
+	/* node->index <= index < node[16].index */
+
+	for (;;) {
+		if (ECX == 0)
+			goto ret;
+		EDX = node->index;
+		EDX += node->len;
+		if ((unsigned) EDX > index) {
+			/* 上のブロックの一部または全部を消す */
+			/* (ECXが大きすぎて消しきれないかもしれない) */
+			if (node->index == index) {
+cont2:
+				EDX = node->len;
+				if ((unsigned) ECX < EDX) {
+					/* 先頭から消すが、残りはある */
+					node->len -= ECX;
+					node->index += ECX;
+					node->data += ECX;
+					goto ret;
+				}
+del:
+				head->last -= sizeof (AAC_Node);
+				index += EDX;
+				ECX -= EDX;
+				PUSH(EAX);
+				PUSH((offset) node);
+				do {
+					EAX = node[16].index;
+					EDI = node[16].len;
+					EDX = node[16].data;
+					node->index = EAX;
+					EAX++;
+					node->len = EDI;
+					node->data = EDX;
+				//	(LEA) (offset) node += sizeof (AAC_Node);
+					LEA(EBX, [EBX + 16]);
+				} while (!= 0);
+				POP((offset) node);
+				POP(EAX);
+				if ((unsigned) node->index <= index)
+					continue;
+				(offset) node -= sizeof (AAC_Node);
+				continue;
+			}
+			/* 途中から消す */
+			/* ECXが少ないと、分割される */
+			/*
+				if (node->index + node->len <= index + ECX)
+					末尾まで消える
+				else
+					分割される(分割後、終了)
+			*/
+			EDX = index;
+			EDI = node->len;
+			EDX -= node->index; /* EDX = 先頭から残るサイズ */
+			PUSH(EDI);
+			EDI -= EDX; /* EDI = 一度に消去できるサイズ */
+			node->len = EDX;
+			index += EDI; /* index = node->index + 旧node->len */
+			ECX -= EDI;
+			POP(EDX); /* EDX = 旧node->len */
+			if ((unsigned) >= 0) /* 途中から末尾まで消える */
+				continue;
+			/* 分割される(分割後、終了) */
+			/* ECXは負の値 */
+			EDX += node->data;
+			(offset) node += sizeof (AAC_Node);
+			index += ECX;
+			EDX += ECX;
+			EDI = head->limit;
+			head->last += sizeof (AAC_Node);
+			ECX =- ECX;
+			if ((unsigned) head->last >= EDI)
+				goto err;
+			PUSH(ESI);
+			PUSH(EBP);
+			do {
+				EBP = node->index;
+				ESI = node->len;
+				EDI = node->data;
+				node->index = EAX;
+				node->len = ECX;
+				node->data = EDX;
+				(offset) node += sizeof (AAC_Node);
+				EAX = EBP;
+				EBP++;
+				ECX = ESI;
+				EDX = EDI;
+			} while (!= 0);
+			POP(EBP);
+			POP(ESI);
+			node->index = EAX;
+			node->len = ECX;
+			node->data = EDX;
+			goto ret;
+		}
+		(offset) node += sizeof (AAC_Node);
+		EDX = node->index;
+		EDX -= index;
+		ECX -= EDX;
+		index = node->index;
+		if ((unsigned) > 0)
+			goto cont2;
+ret:
+		POP(index);
+		POP(ECX);
+		POP(EDX);
+		POP(EDI);
+		POP((offset) node);
+		return;
+	}
+err:
+	INT(0x03);
+}
+
+void near init_areastr()
+/* EAX = 0; EDX = -1; ECX = size0;
+  area_man_struct *areastr == DS:ESI; */
+{
+	area_man_struct *areastr == DS:ESI;
+
+	areastr->use = EAX;
+	areastr->size0 = ECX;
+	areastr->data0.size = EAX;
+	areastr->data0.addr = EAX;
+	areastr->data[0].size = EDX;
+	areastr->data[0].addr = EDX;
+	return;
+}
+
+void near free_memory()
+/* EAX, ECX */
+{
+	WORK *work == DS:0;
+	PUSH(ESI);
+	TEST(EAX, 0xff000000);
+	/* ESI = (offset) work->mem32_man; */ LEA(ESI, (int) work->mem32_man);
+	if (!= 0)
+		goto free;
+	TEST(EAX, 0xfff00000);
+	/* ESI = (offset) work->mem24_man; */ LEA(ESI, (int) work->mem24_man);
+	if (!= 0)
+		goto free;
+	/* ESI = (offset) work->mem20_man; */ LEA(ESI, (int) work->mem20_man);
+free:
+
+#if (DEBUG1)
+unsigned int pdepte_sel   == 14 * 8, idtgdt_sel    == 15 * 8;
+PUSH(DS);
+PUSHAD();
+/* EDXは既に使われていたりはしないか？ */
+/* どうやら、図星のようだ */
+EDX = EAX;
+LEA(EBP, [EAX + ECX]);
+EAX = pdepte_sel;
+EBX = 0x4200; /* 4.5MB */
+DS = EAX;
+LSL(ECX, EAX);
+ECX -= EBX;
+do {
+	EAX = [DS:EBX];
+	EBX += 4;
+	TEST(AL, 0x01);
+	if (!= 0) {
+		EAX &= 0xfffff000;
+		if ((unsigned) EDX <= EAX) {
+			if ((unsigned) EAX < EBP) {
+				[DS:EBX - 4] = AL;
+			//	INT(0x03);
+			}
+		}
+	}
+	ECX -= 4;
+} while ((unsigned) > 0);
+POPAD();
+POP(DS);
+#endif
+
+#if (DEBUG)
+PUSH(ECX);
+PUSH(EAX);
+(unsigned int) EAX >>= 12;
+(unsigned int) ECX >>= 12;
+do {
+	BTR([DS:0], EAX);
+	if (CF == 0)
+		INT(0x03);
+	EAX++;
+	ECX--;
+} while (!= 0);
+POP(EAX);
+POP(ECX);
+#endif
+
+	free_area();
+	POP(ESI);
+	return;
+}
+
+void near init_AAChead()
+/* EAX = 0; EDX = -1; ECX = size;
+  AAC_Head *head == DS:ESI; */
+{
+	AAC_Head *head == DS:ESI;
+	PUSH(EBX);
+	LEA(EBX, (int) head->node[0]);
+	head->last = EBX;
+	LEA(EBX, [ESI + ECX]);
+	head->limit = EBX;
+	head->head.len = EAX;
+	head->head.index = EAX;
+	head->node[0].len = EAX;
+	head->node[0].index = EDX;
+	POP(EBX);
+	return;
+}
+
+void near count_free()
+/* DS:ESIに管理情報構造体へのポインタ。 */
+/* ECXに合計サイズが返り、EAXに最大サイズが返る */
+{
+	area_man_struct *work == DS:ESI;
+	area_man_struct_sub *dat == DS:EBX;
+	PUSH(EBX);
+	PUSH(EDX);
+	LEA((offset) dat, (int) [work->data]);
+	EDX = 0;
+	EAX = 0;
+	EDX--;
+	ECX = 0;
+	if (EDX != dat->size) {
+		do {
+			ECX += dat->size;
+			if ((unsigned) EAX <= dat->size)
+				EAX = dat->size;
+			(offset) dat += sizeof (area_man_struct_sub);
+		} while (EDX != dat->size);
+	}
+	POP(EDX);
+	POP(EBX);
+	return;
+}
+
+void far PageFaultHandler()
+{
+	unsigned int pdepte_sel   == 14 * 8, idtgdt_sel    == 15 * 8;
+	WORK *work == DS:0;
+
+	PUSH(DS);
+	PUSHAD();
+	MOV(EAX, CS);
+	EAX += 8;
+	DS = EAX;
+	asmout("TEST BYTE PTR SS:[ESP+36],01H");
+	if (== 0) {
+		/* ページ不在 */
+		EAX = CR2;
+		(unsigned int) EAX >>= 12;
+		LEA(ESI, (int) [work->linear_addr64]);
+		EAX++;
+		AAC_convert();
+		if (CF == 1) {
+			EAX = CR2;
+			ECX = [SS:ESP + 40]; /* EIP */
+			EDX = [SS:ESP + 44]; /* CS */
+
+ESI = [SS:ESP + 4]; /* ESI */
+			INT(0x03); /* mapしてないのに参照された */
+		}
+		LEA(EAX, [EDX + 1]);
+		LEA(ESI, (int) [work->addr64_addrp]);
+		AAC_convert();
+		if (CF == 1) {
+			/* 新規ページだと強引に仮定 */
+			PUSH(EAX);
+			ECX = 4096;
+			PUSH(ESI);
+			/* ESI = (offset) work->mem32_man; */ LEA(ESI, (int) work->mem32_man);
+			get_area();
+			if (ZF == 1) {
+				/* ESI = (offset) work->mem24_man; */ LEA(ESI, (int) work->mem24_man);
+				get_area();
+				if (ZF == 1) {
+					/* ESI = (offset) work->mem20_man; */ LEA(ESI, (int) work->mem20_man);
+					get_area();
+					if (ZF == 1)
+						INT(0x03);
+				}
+			}
+
+#if (DEBUG)
+PUSH(ECX);
+PUSH(EAX);
+(unsigned int) EAX >>= 12;
+(unsigned int) ECX >>= 12;
+do {
+	BTS([DS:0], EAX);
+	if (CF == 1)
+		INT(0x03);
+	EAX++;
+	ECX--;
+} while (!= 0);
+POP(EAX);
+POP(ECX);
+#endif
+
+		//	LEA(ESI, (int) [work->addr64_addrp]);
+			POP(ESI);
+			EDX = EAX;
+			ECX = 0;
+		//	EAX = [SS:ESP]; /* index(addr64 + 1) */
+			POP(EAX);
+		//	ECX = 1;
+			ECX++;
+			(unsigned int) EDX >>= 12;
+
+#if (DEBUG1)
+PUSH(DS);
+PUSHAD();
+/* EDXは既に使われていたりはしないか？ */
+/* どうやら、図星のようだ */
+EAX = pdepte_sel;
+EBX = 0x4200; /* 4.5MB */
+DS = EAX;
+LSL(ECX, EAX);
+ECX -= EBX;
+do {
+	EAX = [DS:EBX];
+	EBX += 4;
+	TEST(AL, 0x01);
+	if (!= 0) {
+		(unsigned int) EAX >>= 12;
+		if (EAX == EDX) {
+			EDX = CR2;
+			INT(0x03);
+		}
+	}
+	ECX -= 4;
+} while ((unsigned) > 0);
+POPAD();
+POP(DS);
+#endif
+			AAC_regist();
+		}
+		/* 物理アドレス:EDX */
+		EDX <<= 12;
+		PUSH((int) pdepte_sel);
+		POP(DS);
+		LEA(EAX, [EDX + 0x007]);
+		EDX = CR2;
+	//	ECX = 4096;
+	//	EDX &= 0xfffff000;
+		mapping1p();
+		POPAD();
+		POP(DS);
+		ESP += 4;
+		IRETD();
+	}
+	INT(0x03);
+}
+
+/*
+
+
+  ・ページング空間オープン／クローズ
+  ・マッピング／アンマッピング    引数は、opt(32bit)、サイズ(32bit)とアドレス(64bit)。
+  ・プリロード（含む：ロック・・・優先順位がある）。
+  ・プリストア
+  ・ディゼーブルキャッシュ
+
+*/

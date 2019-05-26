@@ -1,0 +1,304 @@
+"edimg0j"の説明
+
+  これはDiskExplorerのCUI版のバグフィクス＋α、みたいなものを目指しているツール
+です。とりあえずOSASKのディスクイメージくらいは作れるようになりました。
+
+[コマンドライン]
+
+  prompt>edimg コマンド列 （@スクリプトファイル が混在していてもよい）
+
+  example>edimg imgin:osaimgat.bin bias:9 copy from:@:!guide!.txt to:./
+  example>edimg @srcipt0.txt
+  example>edimg imgin:osaimgat.bin @script1.txt
+  example>edimg binin:osask.exe exe2bin seg:2048 binout:osask.sys
+
+  スクリプトファイルはコマンド列が並んだだけのものです。コマンドライン中の指定
+された場所に展開されます。edimgではスペースや改行をパラメータの区切りとして見な
+すので、スペースを含むファイル名は扱えません。
+
+[コマンドの説明]
+
+  コマンドは次のようなフォーマットになります。
+
+    コマンド名  パラメータ名:パラメータ  パラメータ名:パラメータ  ...
+
+  コマンド名は、optコマンドに限り省略可能です。
+
+・optコマンド
+
+  optコマンドはパラメータを一つだけ持ちます。複数書いた場合は、optコマンドその
+ものが複数個あると見なされます。このコマンドはパラメータによって与える動作が大
+きく異なります。なお、パラメータが与えられなければ、optコマンドは何もしません。
+
+  imginパラメータ：
+    書式： [opt] imgin:ファイル名
+      指定されたファイルをディスクイメージとして読み込みます。パーティション情
+    報を持っているディスクイメージの場合、最初のパーティションへアクセスするこ
+    とになります。
+
+  imgoutパラメータ：
+    書式： [opt] imgout:ファイル名
+      ディスクイメージを指定されたファイルとして出力します。
+
+  vsizパラメータ：
+    書式： [opt] vsiz:イメージサイズ
+      ディスクイメージを指定された大きさに変更します。SF16に対して使います。
+
+  bininパラメータ：
+    書式： [opt] binin:ファイル名
+      指定されたファイルをバイナリイメージとして読み込みます。これに対しては、
+    wbinimgコマンドとwritedataコマンドとexe2binコマンドしか使えません。
+
+  binoutパラメータ：
+    書式： [opt] binout:ファイル名
+      バイナリイメージを指定されたファイルとして出力します。
+
+  _pathパラメータ：
+    書式： [opt] _path:ベースパス
+      パス指定で、先頭に"_:"という表記があれば、指定されたベースパスに置換して
+    解釈します。ベースパスに@:は指定できません。
+
+  biasパラメータ：
+    書式： [opt] bias:時差
+      ディスクイメージ内のファイルのタイムスタンプ補正のためのパラメータです。
+    日本では9を指定します。
+
+・copyコマンド
+
+  書式： copy [nocmp:] from:ファイル名 to:ファイル名
+
+  copyコマンドは2つのパラメータを持ち、fromからtoへファイルをコピーします。from
+とtoの順序を逆に書くことはできません。toのファイル名に限り、ファイル名の最後を
+":"、"/"で打ち切ることが許されます。この場合、fromのファイル名が補われます。フ
+ァイル名ではなくディレクトリ名を書くときは必ず最後の/を忘れないでください。
+
+  ファイル名においてドライブ名"@"を使うと、それはディスクイメージを意味します。
+ディスクイメージ内のファイルをディスクイメージ内へコピーすることもできますし、
+普通のファイルコピーも可能です。
+
+  オプションのnocmp:を使うと、fromで指定されたファイルが圧縮されていた場合、展
+開した結果をtoへ書き込みます。圧縮されていなかった場合はそのまま書き込みます。
+
+  ワイルドカードは使えません。
+
+・ovrcopyコマンド
+
+  書式： ovrcopy [nocmp:] from:ファイル名 to:ファイル名
+
+  オーバーライトコピーコマンドです。toのファイルが既に存在していれば、クラスタ
+の位置が変わらないように注意深くコピーされます。ファイルが存在していなければ、
+コピーコマンドと全く変わりません。そのほかのこともコピーコマンドと同じです。
+
+・createコマンド
+
+  書式： create file:ファイル名 size:サイズ [begin:開始クラスタ番号]
+
+  中身が0x00で埋まったファイルを作ります。
+
+・ovrcreateコマンド
+
+  書式： ovrcreate file:ファイル名 size:サイズ [begin:開始クラスタ番号]
+
+  基本的にcreateコマンドと同じですが、もしファイルが既に存在していて、さらに指定
+サイズよりも大きいか等しければ、ファイルサイズを変更することなく、サイズ分だけ
+0x00で埋め尽くすだけにします。
+
+・setattrコマンド
+
+  書式： setattr file:ファイル名(@:～でなければいけない) attr:アトリビュート値
+
+  ディスクイメージ内のファイルの、ファイル属性値を変更します。
+
+・deleteコマンド
+
+  書式： delete file:ファイル名
+
+  ファイルを削除します。
+
+・wbinimgコマンド
+
+  書式： wbinimg src:バイナリファイル名 len:転送バイト数
+             from:読み込み開始オフセット to:書き込み開始オフセット
+
+  これはつまり、ブートセクタを書き込むためのコマンドです。fromはバイナリファイル
+内のオフセットで、toはパーティションの先頭からのオフセットです。
+
+・releaseコマンド
+
+  書式： release [mini:] [zerofill:] [efat:] [nofrag:] [minibpb:]
+
+  これは主にimgout直前に実行するコマンドです。デフォルトだと1440KB用のディスク
+イメージが1440KBとして出てきますが(たとえ読み込み時に後ろが切ってあっても)、
+mini:を指定すると末尾の空きセクタを出力しなくなります。またzerofill:をやると、
+deleteした部分に残っていたファイルの残骸がゼロクリアされます。
+
+  edimg0dからはさらに3つのパラメータが追加されました。これらはSF16のときのみ有
+効で、efat:はFATを拡張FAT形式で出力させること、nofrag:は全てのファイルが断片化
+していないことを確認したあと検査済みフラグを立てること、そしてminibpb:はmini:と
+同じ方法で切り詰めたあとにそれに合うようにBPB情報を更新すること、をそれぞれ意味
+します。
+
+・writedataコマンド
+
+  書式： writedata offset:書き込み開始オフセット [byte:データ,...,データ]
+    [word:データ,データ,...,データ] [dwrd:データ,データ,...,データ]
+
+  書き込み開始オフセットから、指定されたデータを指定されたデータ幅で書き込みま
+す。wbinimgコマンドの、書き込むデータをスクリプト上で指定するもの、という感じで
+す。
+
+・listコマンド
+
+  書式： list
+
+  ディスクイメージのディレクトリ一覧を出力します。
+
+・copyallコマンド
+
+  書式： copyall from:@: to:ディレクトリ名
+
+  ディスクイメージのファイルを全てコピーします。主にアーカイブの展開に使います
+。ディレクトリ名は/で終わる必要があるので、たとえばカレントパスに展開したいとき
+は、to:./と書くことになります。
+
+・exe2binコマンド
+
+  書式： exe2bin seg:イメージがロードされるセグメント
+
+  16bit-EXEファイルをバイナリイメージにします。imgtolのsコマンドの代用です。
+
+・/*コマンド
+
+  書式： /*
+
+  リマーク部開始コマンドです。コマンドなので、"/**"などとやると認識できずエラー
+になります。リマークの入れ子も可能です。
+
+・*/コマンド
+
+  書式： */
+
+  リマーク部終了コマンドです。コマンドなので、"**/"などとやると認識できずエラー
+になります。
+
+[例 - 1]
+
+  OSASK.SYSの大きさと位置は決まっているので、次のようにするのが普通です(AT互換機
+版の場合)。最初の2行を変えると、TOWNSや98用のイメージができます。
+
+opt imgin:fdimg0at.tek /* 1440KBブランクディスクイメージ */
+wbinimg src:osaskbs1.bin len:512 from:0 to:0
+create file:@:osask.sys size:108k begin:5
+ovrcopy from:osask.sys to:@:
+setattr file:@:osask.sys attr:0x06 /* system+hidden */
+copy from:osask0.psf to:@: /* これは一番最初に */
+/* 以下順不同 */
+copy from:!guide!.txt to:@:
+copy from:!guide2!.txt to:@:
+    /* 中略 */
+copy from:videomod.txt to:@:
+/* ここまでアプリの転送 */
+release mini:
+opt imgout:testimg.bin
+
+[例 - 2]
+
+  OSASK.SYSはデフォルトでは起動時にFDを読みに行きますが、これをATAやCFにするこ
+とができます。
+
+"sys_cf0.txt"
+
+opt binin:osask.sys
+writedata offset:2 word:0x8200
+
+というファイルを作っておいて、
+
+prompt>edimg @sys_cf0.txt binout:osaskcf0.sys
+
+とやれば、CF用に書き換わります。
+
+[例 - 3]
+
+  同じことをOSASK.EXEに対してやってみます。
+
+"exe_cf0.txt"
+
+opt binin:osask.exe
+writedata offset:0x202 word:0x8200
+
+というファイルを作っておいて、
+
+prompt>edimg @exe_cf0.txt binout:osaskcf0.exe
+
+とやれば、CF用に書き換わります。
+
+[例 - 4]
+
+  同じことをOSAIMGAT.BINに対してやってみます。
+
+"img_cf0.txt"
+
+opt imgin:osaimgat.bin
+writedata offset:0x4802 word:0x8200
+
+というファイルを作っておいて、
+
+prompt>edimg @img_cf0.txt binout:osaskcf0.bin
+
+とやれば、CF用に書き換わります。
+
+[例 - 5]
+
+  sf16_40s.tekを使って、ディスクイメージをアーカイブ代わりにしてみます。
+
+opt imgin:sf16_40s.tek /* SF16_40 simplest image */
+opt vsiz:8m
+copy from:document.txt to:@:
+copy from:edimg.exe    to:@:
+copy from:fdimg0at.tek to:@:
+copy from:fdimg0tw.tek to:@:
+copy from:sf16_40s.tek to:@:
+copy from:edimg.c      to:@:
+copy from:Makefile     to:@:
+copy from:make.bat     to:@:
+copy from:!cons_9x.bat to:@:
+copy from:!cons_nt.bat to:@:
+release minibpb: nofrag: efat:
+opt imgout:imgarc.bin
+
+[例 - 6]
+
+  同じくsf16_40s.tekを使って、OSASK用のアーカイブを作る例です。
+
+opt imgin:sf16_40s.tek /* SF16_40 simplest image */
+opt vsiz:8m
+copy from:teditarc.txt to:@:ARCINFO0.TXT
+copy nocmp: from:teditc02.bin to:@:
+copy nocmp: from:teditc02.buf to:@:
+copy nocmp: from:teditc02.ini to:@:
+copy nocmp: from:te_alph0.bin to:@:
+copy nocmp: from:te_roma0.bin to:@:
+release minibpb: nofrag: efat:
+opt imgout:teditc02.org
+
+[例 - 7]
+
+  OSASK用のアーカイブをカレントディレクトリに展開してみます（上記のteditc02.org
+をbim2binでteditc02.tkにしたとして。OSASKで使うときはおそらくbinにしていると思
+いますが、binのまま展開すると内部のteditc02.binと名前が衝突して上書きされてしま
+います）。
+
+prompt>edimg imgin:teditc02.tk copyall from:@: to:./
+
+[例 - 8]
+
+  くだらない使い方としては、ただのtek解凍ツールとしてbim2binの代わりをさせるこ
+とも一応できます。ただしrjcが掛かっているものはrjcが付いた状態で展開されます。
+OSASK ver.4.6以降ならrjcが掛かっていても問題なく実行できるので基本的に問題はあ
+りません。
+
+prompt>edimg copy nocmp: from:helloc4.bin to:helloc4.org
+
+[メモ]
+
+2006.11.05	edimg0i→edimg0j	hrb-wikiのq_and_aのざんにさんの問題を解消

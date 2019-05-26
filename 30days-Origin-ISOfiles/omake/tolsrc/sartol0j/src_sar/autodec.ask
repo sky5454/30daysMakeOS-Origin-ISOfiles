@@ -1,0 +1,2047 @@
+segment CODE(USE32, PARA);
+default(code == CODE);
+
+asmout("[FILE 'autodec.ask']");
+asmout("GLOBAL _autodecomp");
+
+/* int autodecomp(int siz0, UCHAR *p0, int siz); */
+
+void getnum_s7s();
+void getnum_s7();
+void lzrestore_stk1();
+void lzrestore_stk2();
+void lzrestore_tek5();
+
+#define SEG_ES		DS
+#define SEG_CS		DS
+
+void _autodecomp()
+{
+	PUSHFD();
+	PUSHAD();
+	CLD();
+	EDI = (int) [SS:ESP + 48]; /* siz */
+	ESI = (int) [SS:ESP + 44]; /* p0 */
+	if ((unsigned) EDI < 17)
+		goto skip;
+	EDI += ESI;
+	ECX = 14;
+	do {
+		AL = [DS:ESI + ECX + 1];
+		asmout("CMP AL,[DS:.sign+ECX]");
+		if (!= 0)
+			goto skip;
+		ECX--;
+	} while ((signed) >= 0);
+	AL = [DS:ESI];
+	ESI += 16;
+	if (AL == 0x83)
+		goto pass;
+	if (AL == 0x85)
+		goto pass;
+	if (AL != 0x89)
+		goto err;
+pass:
+	getnum_s7s();
+	XCHG(EAX, EBP);
+	if (== 0)
+		goto decomped;
+	NEG(ESI);
+	LEA(ECX, [EDI + ESI]); /* ECX:圧縮データサイズ */
+	NEG(ESI);
+	EDI = (int) [SS:ESP + 40]; /* siz0 */
+	LEA(EBX, [ECX + EBP]);
+	if ((unsigned) EBX > EDI)
+		goto err;
+	EDI += (int) [SS:ESP + 44]; /* p0 */
+	PUSH(EDI);
+	EDI -= ECX;
+	PUSH(EDI);
+	asmout("REP MOVSB");
+	POP(ESI);
+	POP(EDX);
+	EDI = (int) [SS:ESP + 44]; /* p0 */
+	/* ESI, EDI, EBP, EDX */
+	getnum_s7s();
+	CH = [DS:EDI];
+	TEST(AL, 0x01);
+	if (== 0) {
+		/* ショート形式(tek5のみ) */
+		if (CH != 0x89)
+			goto err;
+		ESI--;
+	} else {
+		TEST(AL, 0x20);
+		if (!= 0)
+			goto err;
+		PUSH(EAX);
+		CL = AL;
+		(unsigned char) CL >>= 1;
+		EAX = 0;
+		CL &= 0x0f;
+		EAX++;
+		CL += 8;
+		SHL(EAX, CL);
+		CMP(EAX, EBP);
+		POP(EAX);
+		if ((unsigned) <) {
+			if (CL != 8)
+				goto err;
+		}
+		TEST(AL, 0x40);
+		if (!= 0)
+			getnum_s7s();
+	}
+	PUSH(EBP);
+	if (CH == 0x89)
+		lzrestore_tek5();
+	else if (CH == 0x85)
+		lzrestore_stk2();
+	else
+		lzrestore_stk1();
+	TEST(AL, AL);
+	POP(EBP);
+	if (== 0) {
+decomped:
+		(int) [SS:ESP + 28] = EBP; /* EAX */
+		POPAD();
+		POPFD();
+		return;
+	}
+err:
+	POPAD();
+	POPFD();
+	EAX |= -1;
+	return;
+skip:
+	POPAD();
+	POPFD();
+	EAX = (int) [SS:ESP + 12]; /* siz */
+	return;
+
+sign:
+	DB(      0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00);
+	DB(0x4f, 0x53, 0x41, 0x53, 0x4b, 0x43, 0x4d, 0x50);
+}
+
+void getnum_s7s()
+/* DS:ESIからリード */
+{
+	EAX = 0;
+	do {
+		EAX <<= 8;
+		LODSB();
+		(unsigned int) EAX >>= 1;
+	} while (CF == 0);
+	return; /* CF = 1, TEST(EAX, EAX); */
+}
+
+/* 以下tek5用 */
+
+void decodemain();
+void decodemain1();
+
+struct STR_BITMODEL { /* 32バイト */
+	unsigned char t, m, s, dmy;
+	unsigned int prb0, prb1, tmsk, ntm, lt, lt0, prb01;
+};
+
+struct STR_TEK5 { /* 320x4 */
+	int p;
+	unsigned int range, code, lit1, repdis[16];
+	STR_BITMODEL bm[1024]; /* 32 * 32 */
+	int ptbm[64]; /* 16 * 4 */
+	int nowPos, state, posStateMask;
+	unsigned char lc8, lc, lit0cntmsk, dmy_uc;
+	int literalPosMask, outSize, outStream, q0, dmy2[128];
+};
+
+struct STR_LZMA {
+	int repdis[16], nowPos, state, posStateMask;
+	unsigned char lc8, lc, previousIsMatch, previousByte;
+	int literalPosMask, outSize, outStream;
+	int rd_src, rd_src1, rd_range, rd_code;
+	int p[1234];
+};
+
+void setbm();
+
+/* ASKAのバグ回避用 */
+#define aBM		bm[EDI]
+
+void lzrestore_tek5()
+/* ESI, EDI, EBP */
+{
+	LODSB();
+	AH = AL;
+	AL &= 0x0f;
+	if (AL == 0x01)
+		goto tek5_z0;
+	if (AL == 0x05)
+		goto tek5_z1;
+	if (AL == 0x09)
+		goto tek5_z2;
+err:
+	EAX = 0;
+	EAX++;
+	return;
+tek5_z0:
+	(unsigned char) EAX >>= 12;
+	CL = 9 * 5;
+	EAX &= 0x0f;
+	if (!= 0) {
+		if ((unsigned) AL >= 3)
+			goto err;
+		asmout("MOV AL,[CS:.prm_table-1+EAX]");
+	} else
+		LODSB();
+	DIV(CL);
+	ROR(EAX, 8); /* pbを24-31へ, AHをALへ */
+	CL = 9;
+	AH = 0;
+	DIV(CL);
+	CL = AL; /* lp */
+	CL += AH; /* lc */
+	EBX = 768; /* LZMA_LIT_SIZE */
+	SHL(EBX, CL);
+	EBX += 1846; /* LZMA_BASE_SIZE */
+
+	ECX = ESP;
+	do {
+		PUSH(1024);
+		EBX--;
+	} while (!= 0);
+	PUSH(EAX); /* rd->Code */
+	PUSH(-1); /* rd->Range */
+	PUSH(EDI); /* rd->BufferLim -> outstream0 */
+	PUSH(ESI);
+	PUSH(EDI);
+	PUSH(EBP); /* 出力サイズ */
+	EDI = ECX;
+
+	CL = AL; /* lp */
+	EBX = 256;
+	CL += AH; /* lc */
+	SHL(EBX, CL);
+	EBX += 1846 /* Literal */;
+
+	EDX = 0;
+	EDX++;
+	CL = AL; /* lp */
+	SHL(EDX, CL);
+	EDX--;
+	PUSH(EDX); /* literalPosMask */
+	AL = 8;
+	AL -= AH;
+	/* AH:lc, AL:8-lc */
+	PUSH(EAX); /* 8-lc, lc, 0, pb */
+	ROL(EAX, 8);
+	EDX = 0;
+	EDX++;
+	CL = AL; /* pb */
+	SHL(EDX, CL);
+	EDX--;
+	PUSH(EDX); /* posStateMask */
+	PUSH(0); /* state */
+	PUSH(1); /* nowPos */
+	PUSH(-4); /* rep0-3 */
+	PUSH(-3);
+	PUSH(-2);
+	PUSH(-1);
+
+	EBP = ESP;
+	PUSH(EDI); /* 旧スタック */
+	/* 合計で64KBくらいの余裕がほしい */
+
+	CL = 4;
+	do {
+		EAX <<= 8;
+		LODSB();
+		CL--;
+	} while (!= 0);
+	STR_LZMA *work0 == SS:EBP;
+	work0->rd_src = ESI;
+	work0->rd_code = EAX;
+	work0->p[1846 * 4] = EBX;
+
+	decodemain();
+
+	POP(EAX);
+	XCHG(EAX, ESP);
+	EAX = 0;
+	return;
+
+prm_table:
+	DB(0x5d, 0x00);
+
+tek5_z1:
+tek5_z2:
+	BL = AL;
+	(unsigned char) EAX >>= 12;
+	CL = 9 * 5;
+	EAX &= 0x0f;
+	if (!= 0) {
+		if ((unsigned) AL >= 2)
+			goto err;
+		asmout("MOV AL,[CS:.prm_table1-1+EAX]");
+	} else
+		LODSB();
+	DIV(CL);
+	/* AL = lp; AH = lc + pb * 9; */
+	BH = AL; /* lp */
+	AL = AH;
+	CL = 9;
+	AH = 0;
+	DIV(CL);
+	/* AL = pb, AH = lc, BH = lp */
+	CL = BH;
+	CL += AH;
+	EDX = 768;
+	SHL(EDX, CL);
+	EDX += 2064;
+	ECX = ESP;
+	do {
+		PUSH(0x8000);
+		EDX--;
+	} while (!= 0);
+	ESP -= 128;
+	EDX++; /* EDX = 1 */
+	PUSH(EDI); /* q0 */
+	PUSH(EDI); /* q */
+	EDI = ECX; /* old ESP */
+	PUSH(EBP); /* siz */
+	CL = BH; /* lp */
+	SHL(EDX, CL);
+	EDX--;
+	PUSH(EDX); /* literalPosMask */
+	EDX = 0x00780008;
+	DH = AH;
+	DL -= AH;
+	PUSH(EDX); /* とりあえず lit0cntmsk=0x78 */
+	EDX |= -1;
+	CL = AL; /* pb */
+	SHL(EDX, CL);
+	NOT(EDX);
+	PUSH(EDX); /* posStateMask */
+	PUSH(0); /* state */
+	PUSH(1); /* nowPos */
+	DL = 16;
+	do {
+		PUSH(8); /* ptbm */
+		DL--;
+	} while (!= 0);
+	ESP -= 1024;
+	PUSH(-4); /* rep0-3 */
+	PUSH(-3);
+	PUSH(-2);
+	PUSH(-1);
+	EDX = 256;
+	CL = AH;
+	CL += BH;
+	SHL(EDX, CL);
+	EDX += 320 + 2064;
+	PUSH(EDX); /* lit1 */
+	/* 以降EAX破壊 */
+	BH = -1;
+	if (BL == 0x09) {
+		LODSB();
+		BH = AL;
+	}
+	CL = 4;
+	do {
+		EAX <<= 8;
+		LODSB();
+		CL--;
+	} while (!= 0);
+	PUSH(EAX); /* code(仮) */
+	PUSH(-1); /* range */
+	PUSH(ESI);
+	EBP = ESP;
+	PUSH(EDI); /* 旧スタック */
+
+	STR_TEK5 *work == SS:EBP;
+//	STR_BITMODEL *bm == SS:EBP + EDI;
+	STR_BITMODEL *bm == SS:EBP;
+	EDI = 32;
+	do {
+		aBM.lt  = 1;
+		aBM.lt0 = 16 * 1024;
+		if ((unsigned) EDI < 160) { /* 32 + 4 * 32 */
+			aBM.lt  = 0x7fffffff;
+			aBM.lt0 = 0x80000000;
+		}
+		if ((unsigned) EDI >= 800) /* 32 + 24 * 32 */
+			aBM.lt0 = 8 * 1024;
+		aBM.t = 5;
+		aBM.m = 5;
+		aBM.s = 0;
+		EDI += 32;
+	} while ((unsigned) EDI < 1056); /* 32 + 32 * 32 */
+//	bm[64].t = 5; /* bm[1], for fchgprm */
+	bm[64].m = 3;
+	bm[96].t = 9; /* bm[2], for tbmt, tbmm */
+	bm[96].m = 2;
+	TEST(BH, 0x40);
+	if (!= 0) {
+		bm[128].t = 0; /* bm[3], for fchglt */
+		bm[128].m = 1;
+		(int) [SS:EBP + 1536] = 0xffff; /* (320 + 64) * 4 == fchglt */
+	}
+	bm[736].t = 0; /* bm[22], for repg3 */
+	bm[736].m = 1;
+	(int) [SS:EBP + 1540] = 0xffff; /* (320 + 65) * 4 == repg3 */
+	AL = 18;
+	(char) [SS:EBP + 1096] = AL; /* 32 + 1024 + 4 * 10 == ptbm[10] */
+	(char) [SS:EBP + 1100] = AL; /* 32 + 1024 + 4 * 11 == ptbm[11] */
+	(char) [SS:EBP + 1104] = AL; /* 32 + 1024 + 4 * 12 == ptbm[12] */
+	if (BL == 0x05) {
+		/* z1 */
+		bm[736].lt  = 0x7fffffff; /* bm[22], for repg3 */
+		bm[736].lt0 = 0x80000000;
+	} else {
+		EDI = 32 + 1024;
+		AL = 8;
+		do {
+			(char) [SS:EBP + EDI] = AL;
+			EDI += 4;
+			EAX++;
+		} while ((unsigned) AL < 22);
+		CL = BH;
+		AL = 0x7f;
+		CL &= 0x03;
+		SHR(AL, CL);
+		AL &= 0x78;
+		work->lit0cntmsk = AL;
+		TEST(BH, 0x04);
+		if (== 0)
+			(char) [SS:EBP + 1060]--; /* 32 + 1024 +  1 * 4 == ptbm[ 1] */
+		TEST(BH, 0x08);
+		if (== 0)
+			(char) [SS:EBP + 1076]--; /* 32 + 1024 +  5 * 4 == ptbm[ 5] */
+		TEST(BH, 0x10);
+		if (== 0)
+			(char) [SS:EBP + 1092]--; /* 32 + 1024 +  9 * 4 == ptbm[ 9] */
+		TEST(BH, 0x20);
+		if (== 0)
+			(char) [SS:EBP + 1100]--; /* 32 + 1024 + 11 * 4 == ptbm[11] */
+	}
+	EDI = 32 + 1024;
+	do {
+		EAX = [SS:EBP + EDI];
+		EAX++;
+		EAX *= 32;
+		[SS:EBP + EDI] = EAX;
+		EDI += 4;
+	} while ((unsigned) EDI < 1120); /* 32 + 1024 + 16 * 4 */
+	EDI = 32;
+	do {
+		setbm();
+		EDI += 32;
+	} while ((unsigned) EDI < 1056); /* 32 + 32 * 32 */
+
+	decodemain1();
+
+	POP(EAX);
+	XCHG(EAX, ESP);
+	EAX = 0;
+	return;
+
+prm_table1:
+	DB(0x00);
+}
+
+/* 以下z0専用 */
+
+#define kTopValue				0x01000000
+#define kNumBitModelTotalBits 	11
+#define kBitModelTotal			0x0800
+#define kNumMoveBits			5
+
+void rdd_direct();
+void rdd_bit();
+void rdd_bittree();
+void rdd_literal();
+void getlen();
+
+void rdd_direct()
+/* EBP, ECX, ESI */
+{
+	STR_LZMA *work == SS:EBP;
+	unsigned int result == EDX, range == EDI, code == EAX;
+	unsigned char *src == DS:ESI;
+	do {
+		if ((unsigned) range < kTopValue)
+			goto shift;
+shift1:
+		range >>= 1;
+		CMP(code, range); /* >= なら CF = 0 */
+		if ((unsigned) >=)
+			code -= range; /* 相変わらずCF = 0 */
+		RCL(result, 1);
+		ECX--;
+	} while (!= 0);
+	return;
+shift:
+	code <<= 8;
+	range <<= 8;
+	LODSB();
+	goto shift1;	/* 1回でかならず足りるかどうかはそれより前による */
+}
+
+/* 00000011111 */
+/* 11111100001 */
+/* どちらにしても、1回で足りる */
+
+void rdd_bittree()
+{
+	EDX = 1;
+}
+
+void rdd_bittree0()
+/* 結果は上位ビットにごみがつくので、呼び出し元でマスクせよ */
+/* EBX:prob0 */
+{
+	STR_LZMA *work == SS:EBP;
+	unsigned int result == EDX, range == EDI, code == EAX;
+	unsigned int bound == EBX, prob == EDX, tmp == ECX;
+	unsigned char *src == DS:ESI;
+
+	do {
+		PUSH(EBX);
+		EBX += result;
+		PUSH(result);
+		PUSH(ECX);
+		PUSH(EBX);
+		prob = work->p[EBX * 4];
+		if ((unsigned) range < kTopValue)
+			goto shift;
+shift1:
+		bound = range;
+		tmp = prob;
+		bound >>= kNumBitModelTotalBits;
+		IMUL(bound, prob);
+		if ((unsigned) code < bound) {
+			range = bound;
+			prob--;
+			bound = 0;
+			tmp -= kBitModelTotal + 1;
+		}
+		code -= bound;
+		range -= bound;
+		(signed int) tmp >>= kNumMoveBits;
+		POP(EBX);
+		prob -= tmp; /* CFにデコード結果 */
+		POP(ECX);
+		work->p[EBX * 4] = prob;
+		POP(result);
+		POP(EBX);
+		RCL(result, 1);
+		CL--;
+	} while (!= 0);
+	return;
+shift:
+	code <<= 8;
+	range <<= 8;
+	LODSB();
+	goto shift1;
+}
+
+#define LenChoice			0
+#define LenChoice2			1
+#define LenLow				2
+#define LenMid				130
+#define LenHigh				258
+#define kLenNumLowBits		3
+#define kLenNumMidBits		3
+#define kLenNumHighBits		8
+
+void getlen()
+/* EBXにprob0, EDX:posState */
+/* EDXに返す */
+{
+	PUSH(EDX);
+	rdd_bit(); /* LenChoice */
+	if (CF == 0) {
+		POP(EDX);
+		CL = kLenNumLowBits;
+		LEA(EBX, [EBX + EDX * 8 + 2]); /* EBX += LenLow + posState << kLenNumLowBits */
+		rdd_bittree();
+		EDX -= 8;
+		return;
+	}
+	EBX++;
+	rdd_bit(); /* LenChoice2 */
+	POP(EDX);
+	if (CF == 0) {
+		CL = kLenNumMidBits;
+		LEA(EBX, [EBX + EDX * 8 + 129]); /* EBX += LenMid - 1 + posState << kLenNumMidBits */
+	//	rdd_bittree();
+	//	EDX += 8 - 8;
+	//	return;
+		goto rdd_bittree;
+	}
+	EBX += LenHigh - 1;
+	CL = kLenNumHighBits;
+	rdd_bittree();
+	EDX -= 248 + 256; /* kLenNumHighSymbols - 8 */
+	if ((unsigned) > 0) {
+		ECX = EDX;
+		EDX = 1;
+		rdd_direct();
+		LEA(ECX, [EDX - 1]);
+		EDX = 1;
+		rdd_direct();
+		EDX--;
+	}
+	EDX += 16 + 248;
+	return;
+}
+
+#define kNumPosSlotBits 		6
+#define kNumLenToPosStates1 	3
+#define kNumPosBitsMax 			4
+#define kStartPosModelIndex 	4
+#define kEndPosModelIndex		14
+#define kNumAlignBits			4
+#define kMatchMinLen			2
+
+#define IsMatch			0
+#define IsRep			192
+#define IsRepG0			204
+#define IsRepG1			216
+#define IsRepG2			228
+#define IsRep0Long		240
+#define PosSlot			432
+#define SpecPos			688
+#define Align			802
+#define LenCoder		818
+#define RepLenCoder		1332
+#define Literal			1846
+
+void rdd_bit()
+/* prob:EBX > CF */
+{
+	STR_LZMA *work == SS:EBP;
+	unsigned int range == EDI, code == EAX;
+	unsigned int bound == EBX, prob == EDX, tmp == ECX;
+	unsigned char *src == DS:ESI;
+
+	PUSH(EBX);
+	prob = work->p[EBX * 4];
+	if ((unsigned) range < kTopValue)
+		goto shift;
+shift1:
+	bound = range;
+	tmp = prob;
+	bound >>= kNumBitModelTotalBits;
+	IMUL(bound, prob);
+	if ((unsigned) code >= bound) {
+		code -= bound;
+		range -= bound;
+		(signed int) tmp >>= kNumMoveBits;
+		POP(EBX);
+		prob -= tmp; /* CF = 0 */
+		work->p[EBX * 4] = prob;
+		return;
+	}
+	prob--;
+//	tmp += - kBitModelTotal + 32 - 1;
+	tmp -= kBitModelTotal + 1;
+	range = bound;
+	(signed int) tmp >>= kNumMoveBits;
+	POP(EBX);
+	prob -= tmp; /* CF = 1 */
+	work->p[EBX * 4] = prob;
+	return;
+shift:
+	do {
+		code <<= 8;
+		range <<= 8;
+		LODSB();
+	} while ((unsigned) range < kTopValue);
+	goto shift1;
+}
+
+void decodemain()
+/* EBP */
+{
+	STR_LZMA *work == SS:EBP;
+	ESI = work->rd_src;
+//	EDI = work->rd_range;
+	EDI |= -1;
+	EAX = work->rd_code;
+	EBX = IsMatch;
+	rdd_bit(); /* これはかならずCF = 0になる（stk5では） */
+	if (CF != 0)
+		goto err;
+	EBX = Literal;
+	CL = 8;
+	rdd_bittree();
+	EBX = work->outStream;
+	[SEG_ES:EBX] = DL;
+	EBX++;
+	work->outStream = EBX;
+	EDX = work->nowPos;
+	if ((unsigned) EDX < work->outSize) {
+loophead:
+		EBX = work->state;
+		EDX &= work->posStateMask;
+		EBX <<= kNumPosBitsMax;
+		PUSH(EDX); /* posState */
+		EBX += EDX;
+		rdd_bit();
+		if (CF == 0) {	/* not LZ */
+			POP(EDX);
+			EBX = work->state;
+			PUSH(EDI);
+			EDX = work->nowPos;
+			EDI = work->outStream;
+		//	BL = [SEG_CS:state_table + EBX];
+			asmout("MOV BL,[DS:.state_table+EBX]");
+			EDX &= work->literalPosMask;
+			(char) work->state = BL;
+			CL = work->lc;
+			EBX = (unsigned char) [SEG_ES:EDI - 1];
+			SHL(EDX, CL);
+			CL = work->lc8;
+			SHR(EBX, CL);
+			EBX += EDX;
+		//	EDX = work->repdis[0];
+			EBX *= 256;
+			POP(EDI);
+		//	if (work->previousIsMatch != 0)
+		//		goto lit1;
+			EBX += Literal;
+			CL = 8;
+			rdd_bittree();
+//lit11:
+			EBX = work->outStream;
+			[SEG_ES:EBX] = DL;
+			EDX = work->nowPos;
+			EBX++;
+			EDX++;
+			work->outStream = EBX;
+			work->nowPos = EDX;
+			if ((unsigned) EDX < work->outSize)
+				goto loophead;
+			goto fin;
+		}
+lzphase:
+		/* LZ */
+	//	work->previousIsMatch = 1;
+		EBX = work->state;
+		EBX += IsRep;
+		rdd_bit();
+		if (CF != 0) {	/* repdis */
+			EBX += IsRepG0 - IsRep;
+			rdd_bit();
+			if (CF == 0) {	/* rep[0] */
+				EBX = work->state;
+				POP(EDX);
+				EBX <<= kNumPosBitsMax;
+				PUSH(EDX);
+				LEA(EBX, [EBX + EDX + IsRep0Long]);
+				rdd_bit();
+				if (CF == 0) { /* rep[0] && len == 1 */
+					POP(EDX);
+					BL = (char) work->state;
+					PUSH(EDI);
+					CMP(BL, 7);
+					EDI = work->outStream;
+					EDX = work->repdis[0];
+					SBB(BL, BL); /* -1, 0 */
+					PUSH(EAX);
+					BL &= -2;
+					AL = [SEG_ES:EDI + EDX];
+					EDX = work->nowPos;
+					BL += 11; /* 9, 11 */
+					STOSB();
+					(char) work->state = BL;
+					EDX++;
+					work->outStream = EDI;
+					POP(EAX);
+					work->nowPos = EDX;
+					POP(EDI);
+					if ((unsigned) EDX < work->outSize)
+						goto lzdone;
+					goto fin;
+				}
+			} else {
+				EBX += IsRepG1 - IsRepG0;
+				rdd_bit();
+				EDX = work->repdis[4];
+				if (CF != 0) {	/* not rep[1] */
+					EBX += IsRepG2 - IsRepG1;
+					rdd_bit();
+					EDX = work->repdis[8];
+					if (CF != 0) {	/* not rep[2] */
+						EBX = EDX;
+						EDX = work->repdis[12];
+						work->repdis[12] = EBX;
+					}
+					EBX = work->repdis[4];
+					work->repdis[8] = EBX;
+				}
+				EBX = work->repdis[0];
+				work->repdis[0] = EDX;
+				work->repdis[4] = EBX;
+			}
+			BL = (char) work->state;
+			POP(EDX);
+			CMP(BL, 7);
+			SBB(BL, BL); /* -1, 0 */
+			BL &= -3;
+			BL += 11; /* 8, 11 */
+			(char) work->state = BL;
+			EBX = RepLenCoder;
+			getlen();
+			ECX = EDX;
+			EDX = work->repdis[0];
+		} else {
+			/* not repdis */
+			EDX = work->repdis[8];
+			EBX = work->repdis[4];
+			work->repdis[12] = EDX;
+			EDX = work->repdis[0];
+			work->repdis[8] = EBX;
+			work->repdis[4] = EDX;
+			BL = (char) work->state;
+			POP(EDX); /* posState */
+			CMP(BL, 7);
+			SBB(BL, BL); /* -1, 0 */
+			BL &= -3;
+			BL += 10; /* 7, 10 */
+			(char) work->state = BL;
+			EBX = LenCoder;
+			getlen();
+			EBX = EDX;
+			PUSH(EDX); /* len */
+			if ((unsigned) EBX >= kNumLenToPosStates1)
+				EBX = kNumLenToPosStates1;
+			EBX <<= kNumPosSlotBits;
+			CL = kNumPosSlotBits;
+			EBX += PosSlot;
+			rdd_bittree();
+			EDX &= 0x3f;
+			if ((unsigned) EDX >= kStartPosModelIndex) {
+				ECX = EDX;
+				EBX = EDX;
+				(unsigned int) ECX >>= 1;
+				EDX = 1;
+				ECX--; /* CF不変 */
+				RCL(EDX, 1);
+				if ((unsigned) EBX < kEndPosModelIndex) {
+					/* リバースでECXビットをEDXに押し込む */
+					PUSH(EDX);
+					SHL(EDX, CL);
+					NOT(EBX);
+					PUSH(ECX);
+					LEA(EBX, [EBX + EDX + SpecPos]);
+					rdd_bittree();
+					EBX = EDX;
+					POP(ECX);
+				} else {
+					ECX -= kNumAlignBits;
+					rdd_direct();
+					CL = kNumAlignBits;
+					EBX = Align;
+					PUSH(EDX);
+					rdd_bittree();
+					EBX = EDX;
+					CL = kNumAlignBits;
+				}
+				POP(EDX);
+				do {
+					(unsigned int) EBX >>= 1;
+					RCL(EDX, 1);
+					ECX--;
+				} while (!= 0);
+			}
+			NOT(EDX);
+			POP(ECX); /* len */
+			work->repdis[0] = EDX;
+		}
+	//	if (EDX == 0)
+	//		break;
+		PUSH(EDI);
+		ECX += kMatchMinLen;
+		PUSH(ESI);
+		EDI = work->outStream;
+		ESI = work->outSize;
+		ESI -= work->nowPos;
+		if ((unsigned) ECX >= ESI)
+			ECX = ESI;
+		LEA(ESI, [EDI + EDX]);
+		work->nowPos += ECX;
+		if ((unsigned) ESI < work->rd_src1)
+			goto err;
+		asmout("rep movsb");
+		work->outStream = EDI;
+		POP(ESI);
+		EDX = work->nowPos;
+		POP(EDI);
+		if ((unsigned) EDX >= work->outSize)
+			goto fin;
+lzdone:
+		EBX = work->state;
+		EDX &= work->posStateMask;
+		EBX <<= kNumPosBitsMax;
+		PUSH(EDX); /* posState */
+		EBX += EDX;
+		rdd_bit();
+		if (CF != 0)
+			goto lzphase;
+		POP(EDX);
+		EBX = work->state;
+		PUSH(EDI);
+	//	BL = [SEG_CS:state_table + EBX];
+		asmout("MOV BL,[DS:.state_table+EBX]");
+		EDX = work->nowPos;
+		(char) work->state = BL;
+		EDI = work->outStream;
+		EDX &= work->literalPosMask;
+		CL = work->lc;
+		EBX = (unsigned char) [SEG_ES:EDI - 1];
+		SHL(EDX, CL);
+		CL = work->lc8;
+		SHR(EBX, CL);
+		EBX += EDX;
+		EDX = work->repdis[0];
+		EBX *= 256;
+		CL = [SEG_ES:EDI + EDX];
+		POP(EDI);
+lit1:
+		unsigned int result == EDX, range == EDI, code == EAX;
+		unsigned int bound == EBX, prob == EDX, tmp == ECX;
+		PUSH(EBX);
+		MOV(result, 1);
+		EBX *= 2;
+		EBX += work->p[Literal * 4];
+	//	work->previousIsMatch = DH;
+		do {
+			ECX *= 2;
+			PUSH(EBX);
+			EBX += result;
+			PUSH(result);
+			PUSH(ECX);
+			ECX &= 0x100;
+			EBX += ECX;
+			PUSH(EBX);
+			prob = work->p[EBX * 4];
+			if ((unsigned) range < kTopValue)
+				goto lit1load0;
+lit1load1:
+			bound = range;
+			tmp = prob;
+			bound >>= kNumBitModelTotalBits;
+			IMUL(bound, prob);
+			if ((unsigned) code < bound) {
+				range = bound;
+				prob--;
+				bound = 0;
+				tmp -= kBitModelTotal + 1;
+			}
+			code -= bound;
+			range -= bound;
+			(signed int) tmp >>= kNumMoveBits;
+			POP(EBX);
+			prob -= tmp; /* CFにデコード結果 */
+			POP(ECX);
+			work->p[EBX * 4] = prob;
+			POP(result);
+			POP(EBX);
+			RCL(result, 1);
+			if ((unsigned) result >= 0x100)
+				goto finlit1;
+			DH = DL;
+			DH ^= CH;
+			TEST(DH, 1);
+			MOV(DH, 0);
+		} while (== 0);
+		EBX = result;
+		CL = 0;
+		do {
+			EBX *= 2;
+			CL++;
+		} while ((unsigned) EBX < 0x100);
+		POP(EBX);
+		EBX += Literal;
+		rdd_bittree0();
+		goto lit11;
+	}
+lit1load0:
+	code <<= 8;
+	range <<= 8;
+	LODSB();
+	goto lit1load1;
+finlit1:
+	POP(EBX);
+	goto lit11;
+lit11:
+	EBX = work->outStream;
+	[SEG_ES:EBX] = DL;
+	EDX = work->nowPos;
+	EBX++;
+	EDX++;
+	work->outStream = EBX;
+	work->nowPos = EDX;
+	if ((unsigned) EDX < work->outSize)
+		goto loophead;
+fin:
+	return;
+err:
+	EAX = 0;
+	ESP = [SS:EBP - 4];
+	EAX++;
+	return;
+state_table:
+	DB(0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 4, 5);
+}
+
+/* 以上z0専用 */
+
+/* 以下z1/z2用 */
+
+void rdd_direct1b()
+{
+	EDX = 1;
+}
+
+void rdd_direct1()
+/* EBP, ECX, ESI > EDX, ESI */
+{
+	STR_TEK5 *work == SS:EBP;
+	unsigned int result == EDX, range == EDI, code == EAX;
+	unsigned char *src == DS:ESI;
+	range = work->range;
+	code = work->code;
+	do {
+		if ((unsigned) range < 0x01000000)
+			goto shift;
+shift1:
+		range >>= 1;
+		CMP(code, range); /* >= なら CF = 0 */
+		if ((unsigned) >=)
+			code -= range; /* 相変わらずCF = 0 */
+		RCL(result, 1);
+		ECX--;
+	} while (!= 0);
+	work->range = range;
+	work->code = code;
+	return;
+shift:
+	code <<= 8;
+	range <<= 8;
+	LODSB();
+	if ((unsigned) range >= 0x01000000)
+		goto shift1;
+	goto shift;
+}
+
+void setbm()
+/* EBP, EDI */
+/* EAX, ECX, EDXは破壊 */
+{
+//	STR_BITMODEL *bm == SS:EBP + EDI;
+	STR_BITMODEL *bm == SS:EBP;
+	CL = aBM.t;
+	EAX |= -1;
+	SHL(EAX, CL); /* EAX = -1 << t; */
+	CL = aBM.m;
+	EDX = EAX;
+	aBM.tmsk = EAX; /* tmsk = -1 << t; */
+	SHL(EDX, CL); /* EDX = -1 << (m + t); */
+	ECX = EAX;
+	NEG(EAX); /* EAX = 1 << t; */
+	ECX &= 0xffff;
+	EAX |= EDX; /* EAX = -1 << (m + t) | 1 << t; */
+	NOT(EDX); /* EDX = ~(-1 << (m + t)); */
+	EAX &= ECX;
+	EDX &= ECX;
+	aBM.prb1 = EAX;
+	aBM.prb0 = EDX;
+	EAX -= EDX;
+	aBM.prb01 = EAX;
+	return;
+}
+
+void rdd_probtree1()
+{
+	EDX = 1;
+}
+
+void rdd_probtree()
+/* rangeとcodeはworkから参照 */
+/* EDIは破壊される EBXはキープされる */
+{
+//	unsigned int result == EDX, range == EDI, code == EAX;
+//	unsigned int bound == EBX, prob == EDX, tmp == ECX;
+//	unsigned char *src == DS:ESI;
+
+	unsigned int bound == EAX, prob == EBX, tmp == EDX, result == EDX;
+//	STR_BITMODEL *bm == SS:EBP + EDI;
+	STR_BITMODEL *bm == SS:EBP;
+	STR_TEK5 *work == SS:EBP;
+
+//	EBP, EDI, work->range, work->code, EDX, ESI, CH
+	do {
+		PUSH(EBX); /* prob0 */
+		EBX += result;
+		PUSH(EBX);
+		PUSH(result);
+		aBM.lt--;
+		EDX = [SS:EBP + EBX * 4];
+		if ((signed) <= 0)
+			goto bm_timeout0;
+		/* lt=0もこれで分岐して毎回元に戻す...のではなく、lt0の最上位か何かをフラグにさせよう */
+bm_timeout1:
+		prob = EDX;
+		EDX -= aBM.prb0; /* もしprb0よりも小さければ、この時点ででかい値になる */
+		prob &= aBM.tmsk;
+		EAX = work->range; /* スタックから拾ってもいいが */
+		if ((unsigned) EDX > aBM.prb01)
+			goto fixprob0;
+fixprob2:
+		if ((unsigned) EAX < 0x01000000)
+			goto shift;
+shift1:
+		MUL(prob);
+		CL = aBM.m;
+		SHRD(bound, EDX, 16);
+		tmp = prob;
+		if ((unsigned) work->code < bound) {
+			work->range = bound;
+			prob += aBM.tmsk;
+			tmp -= 0x10000 + 1;
+			bound = 0;
+		}
+		SAR(tmp, CL);
+		work->code -= bound;
+		tmp &= aBM.tmsk; /* tmskの上位は1（そうでないと負の値がおかしくなる） */
+		work->range -= bound;
+		prob -= tmp; /* CFにデコード結果 */
+		POP(result);
+		POP(EAX);
+		RCL(result, 1);
+		[SS:EBP + EAX * 4] = prob;
+		AL = CH;
+		CH--;
+		(unsigned char) AL >>= 4;
+		POP(EBX);
+		AL &= CH;
+		CMP(AL, 1); /* TEST(AL, CH);の結果が0ならCF=1 */
+		SBB(EAX, EAX);
+		EAX &= 32;
+		EDI += EAX;
+		TEST(CH, 0x07); /* このために、8回以上のループはできない */
+	} while (!= 0);
+	TEST(result, result);
+	return;
+shift:
+	EDX = EAX;
+	EAX = work->code;
+	do {
+		EDX <<= 8; /* range */
+		EAX <<= 8;
+		LODSB();
+	} while ((unsigned) EDX < 0x01000000);
+	work->code = EAX;
+	work->range = EDX;
+	EAX = EDX;
+	goto shift1;
+fixprob0:
+	prob = aBM.prb0;
+	if ((signed) EDX >= 0)
+		prob += aBM.prb01;
+	goto fixprob2;
+bm_timeout0:
+	EBX = aBM.lt0;
+	if ((signed) EBX >= 0) {
+		PUSH(EDX);
+		aBM.lt = EBX;
+		PUSH(ECX);
+		EBX = 320 + 64 /* &rd->probs.fchglt */;
+		PUSH(EDI);
+		EDX = 0;
+		EDI = 32 + 96 /* &rd->bm[3] */;
+		CH = 0x71;
+		rdd_probtree(); /* == 1 */
+		if (== 0)
+			goto err;
+		POP(EBX);
+		EDI = EBX;
+		EBX -= 32 /* &rd->bm[0] */;
+		PUSH(EDI);
+		EBX /= 16;
+		EDX = 0;
+		BL |= aBM.s;
+		EDI = 32 + 32 /* &rd->bm[1] */;
+		EBX += 320 + 0 /* rd->probs.fchgprm */;
+		CH = 0x71;
+		rdd_probtree();
+		POP(EDI);
+		aBM.s = DL;
+		if (== 0) {
+			PUSH(EDI);
+			EBX = 320 + 1600 - 1 /* rd->probs.tbmt - 1 */;
+			EDI = 32 + 64 /* &rd->bm[2] */;
+			CH = 0x74;
+			rdd_probtree1();
+			POP(EDI);
+			DL &= 0x0f;
+			aBM.t = DL;
+			if (DL == 15)
+				goto err;
+			PUSH(EDI);
+			EBX = 320 + 1616 - 1 /* rd->probs.tbmm - 1 */;
+			EDI = 32 + 64 /* &rd->bm[2] */;
+			CH = 0x74;
+			rdd_probtree1();
+			POP(EDI);
+			DL &= 0x0f;
+			if (== 0)
+				goto err; /* m==0はリザーブ */
+			aBM.m = DL;
+			DL += aBM.t;
+			if ((unsigned) DL > 15)
+				goto err;
+			setbm(); /* EDI */
+		}
+		POP(ECX);
+		POP(EDX);
+		goto bm_timeout1;
+	}
+	aBM.lt = 0x7fffffff;
+	goto bm_timeout1;
+err:
+	EAX = 0;
+	ESP = [SS:EBP - 4];
+	EAX++;
+	return;
+}
+
+void rdd_probtree1_f()
+{
+	EDX = 1;
+}
+
+void rdd_probtree_f()
+/* rangeとcodeはworkから参照 */
+/* "EDIは破壊される" EBXはキープされる */
+/* BM不変型, CHにカウンタ(上位は0) */
+{
+	unsigned int bound == EAX, prob == EBX, tmp == EDX, result == EDX;
+//	STR_BITMODEL *bm == SS:EBP + EDI;
+	STR_BITMODEL *bm == SS:EBP;
+	STR_TEK5 *work == SS:EBP;
+
+//	EBP, EDI, work->range, work->code, EDX, ESI, CH
+
+	PUSH(ESI);
+	PUSH(EBX); /* prob0 */
+	EAX = aBM.prb01;
+	EBX = aBM.prb0;
+	PUSH(EAX);
+	PUSH(EBX);
+	EBX = (unsigned char) CH;
+	EAX = aBM.lt;
+	CL  = aBM.m;
+	EAX -= EBX;
+	ESI = aBM.tmsk;
+	if ((signed) <= 0)
+		goto slow;
+	aBM.lt = EAX;
+	/* これ以降ESI,EDIはどうでもいい */
+	int tmsk == ESI, code == EDI;
+	code = work->code;
+	do {
+		EBX = [SS:ESP + 8]; /* prob0 */
+		PUSH(result);
+		EBX += result;
+		EAX = work->range;
+		PUSH(EBX);
+		EDX = [SS:EBP + EBX * 4];
+		prob = EDX;
+		EDX -= [SS:ESP + 8]; /* aBM.prb0 */
+		prob &= tmsk;
+		if ((unsigned) EDX > [SS:ESP + 12] /* aBM.prb01 */)
+			goto fixprob0;
+fixprob2:
+		if ((unsigned) EAX < 0x01000000)
+			goto shift;
+shift1:
+		MUL(prob);
+		SHRD(bound, EDX, 16);
+		tmp = prob;
+		if ((unsigned) code < bound) {
+			work->range = bound;
+			tmp -= 0x10000 + 1;
+			bound = 0;
+			prob += tmsk;
+		}
+		SAR(tmp, CL);
+		code -= bound;
+		tmp &= tmsk;
+		work->range -= bound;
+		POP(EAX);
+		prob -= tmp; /* CFにデコード結果 */
+		POP(result);
+		[SS:EBP + EAX * 4] = prob;
+		RCL(result, 1);
+		CH--;
+	} while (!= 0);
+	work->code = code;
+	POP(EBX);
+	POP(ESI);
+	POP(EBX);
+	POP(ESI);
+	TEST(result, result);
+	return;
+shift:
+	PUSH(ESI);
+	EDX = EAX;
+	ESI = [SS:ESP + 24];
+	EAX = code;
+	do {
+		EDX <<= 8;
+		EAX <<= 8;
+		LODSB();
+	} while ((unsigned) EDX < 0x01000000);
+	[SS:ESP + 24] = ESI;
+	code = EAX;
+	work->range = EDX;
+	POP(ESI);
+	EAX = EDX;
+	goto shift1;
+fixprob0:
+	prob = [SS:ESP + 8]; /* aBM.prb0 */
+	if ((signed) EDX < 0)
+		goto fixprob2;
+	prob += [SS:ESP + 12]; /* aBM.prb01 */
+	goto fixprob2;
+slow:
+	POP(EBX);
+	POP(ESI);
+	POP(EBX);
+	POP(ESI);
+	CH |= 0x70;
+	asmout("JMP rdd_probtree");
+}
+
+/*
+	  +0:lensel0
+	  +8:lensel1
+	  +0:low(16*8)
+	+128:mid(16*8)
+	+256:high(256)
+	+512:
+*/
+
+void getlen1()
+/* EBXにprob0, EDX:posState */
+/* EDXに返す */
+{
+	STR_TEK5 *work == SS:EBP;
+	EDX *= 8;
+	EDI = work->ptbm[12];
+	PUSH(EDX);
+	CH = 0x01;
+	EDX = 0;
+	rdd_probtree_f();
+	if (!= 0) {
+		POP(EDX);
+		EDI = work->ptbm[16];
+		CH = 0x03;
+		EBX += EDX;
+		rdd_probtree1_f();
+		EDX -= 8;
+		return;
+	}
+	EDI = work->ptbm[12];
+	EBX -= -128;
+	CH = 0x01;
+	EDX = 0;
+	rdd_probtree_f();
+	POP(EDX);
+	if (!= 0) {
+		EDI = work->ptbm[20];
+		CH = 0x03;
+		EBX += EDX;
+		goto rdd_probtree1_f;
+	}
+	EDI = work->ptbm[24];
+	EBX -= -128;
+	CH = 0x08;
+	rdd_probtree1_f();
+	EDX -= 248 + 256;
+	if ((unsigned) > 0) {
+		if ((unsigned) EDX < 6) {
+			EDI = work->ptbm[28];
+			EBX = 0;
+			CL = DL;
+			EBX++;
+			CH = DL;
+			SHL(EBX, CL);
+			EBX += 320 + 66 - 2; /* lenext */
+			rdd_probtree1_f();
+		} else {
+			ECX = EDX;
+			rdd_direct1b();
+		}
+		LEA(ECX, [EDX - 1]);
+		rdd_direct1b();
+		EDX--;
+	}
+	EDX += 16 + 248;
+	return;
+}
+
+void decodemain1()
+/* EBP */
+{
+	STR_TEK5 *work == SS:EBP;
+	ESI = work->p;
+	EDI = work->ptbm[0];
+	EBX = 320 + 1632; /* mch */
+	CH = 0x01;
+	EDX = 0;
+	rdd_probtree_f(); /* これは1になる */
+	if (== 0)
+		goto err;
+	EDI = 32 + 768; /* bm[24] */
+	EBX = 320 + 2064; /* lit0 */
+	CH = work->lit0cntmsk;
+	rdd_probtree1();
+	EDI = work->outStream;
+	XCHG(EAX, EDX);
+	STOSB();
+	EDX = work->nowPos;
+	work->outStream = EDI;
+	if ((unsigned) EDX >= work->outSize)
+		goto fin;
+mainloop:
+	EBX = work->state;
+	EDI = work->ptbm[4];
+	EDX &= work->posStateMask;
+	EBX *= 16;
+	if (== 0)
+		EDI = work->ptbm[0];
+	PUSH(EDX); /* posState */
+	LEA(EBX, [EBX + EDX + 320 + 1632]); /* mch */
+	CH = 0x01;
+	EDX = 0;
+	rdd_probtree_f();
+	if (!= 0) { /* lit0 */
+		POP(EDX);
+		EBX = work->state;
+		EDX = work->nowPos;
+		EDI = work->outStream;
+	//	BL = [SEG_CS:state_table + EBX];
+		asmout("MOV BL,[DS:.state_table+EBX]");
+		EDX &= work->literalPosMask;
+		(char) work->state = BL;
+		CL = work->lc;
+		EBX = (unsigned char) [SEG_ES:EDI - 1];
+		SHL(EDX, CL);
+		PUSH(EDI);
+		CL = work->lc8;
+		SHR(EBX, CL);
+		EBX += EDX;
+		EDI = 32 + 768; /* bm[24] */
+		EBX *= 256;
+		CH = work->lit0cntmsk;
+		EBX += 320 + 2064; /* lit0 */
+		if (CH == 0x78) {
+			CH = 0x08;
+			rdd_probtree1_f();
+		} else if (CH == 0x38) {
+			CH = 0x04;
+			rdd_probtree1_f();
+			CH = 0x04;
+			EDI = 32 + 800; /* bm[25] */
+			rdd_probtree_f();
+		} else
+			rdd_probtree1();
+lit11:
+		POP(EDI);
+		AL = DL;
+		EDX = work->nowPos;
+		STOSB();
+		EDX++;
+		work->outStream = EDI;
+		work->nowPos = EDX;
+		if ((unsigned) EDX < work->outSize)
+			goto mainloop;
+		goto fin;
+	}
+	/* LZ */
+lzphase:
+	EBX = work->state;
+	EDI = work->ptbm[52];
+	EBX += 320 + 2016; /* rep */
+	EDX = 0;
+	PUSH(EDI);
+	CH = 0x01;
+	rdd_probtree_f();
+	POP(EDI);
+	if (== 0) { /* repなLZ */
+		EBX += 12; /* repg0 */
+	//	EDX = 0;
+		PUSH(EDI);
+		CH = 0x01;
+		rdd_probtree_f();
+		POP(EDI);
+		if (!= 0) { /* rep[0] */
+			EBX = work->state;
+			POP(EDX);
+			EBX *= 16;
+			PUSH(EDX);
+			LEA(EBX, [EBX + EDX + 2144]); /* 320 + 1632 + 12 * 16 */
+			EDX = 0;
+			PUSH(EDI);
+			CH = 0x01;
+			rdd_probtree_f();
+			POP(EDI);
+			ECX = work->repdis[0];
+			if (== 0) { /* rep[0], len = 1; */
+				AL = (char) work->state;
+				POP(EDX);
+				CMP(AL, 7);
+				EDX = work->repdis[0];
+				SBB(AL, AL); /* -1, 0 */
+				AL &= -2;
+				AL += 11; /* 9, 11 */
+				EDX = ECX;
+				(char) work->state = AL;
+				ECX |= -1;
+				goto rep0l1skip;
+			}
+		} else {
+			EBX += 12; /* repg1 */
+			EDX = 0;
+			PUSH(EDI);
+			CH = 0x01;
+			rdd_probtree_f();
+			ECX = work->repdis[4];
+			POP(EDI);
+			if (== 0) { /* rep[1]ではない */
+				EBX += 12; /* regp2 */
+			//	EDX = 0;
+				CH = 0x01;
+				rdd_probtree_f();
+				ECX = work->repdis[8];
+				if (== 0) { /* rep[2]ではない */
+					EDI = 32 + 704; /* bm[22] */
+					EBX = 320 + 65; /* repg3 */
+				//	EDX = 0;
+					CH = 0x01;
+					rdd_probtree_f();
+					EAX = work->repdis[ 8];
+					ECX = work->repdis[12];
+					work->repdis[12] = EAX;
+				}
+				EAX = work->repdis[4];
+				work->repdis[8] = EAX;
+			}
+			EDX = work->repdis[0];
+			work->repdis[0] = ECX;
+			work->repdis[4] = EDX;
+		}
+		AL = (char) work->state;
+		CMP(AL, 7);
+		POP(EDX); /* posState */
+		SBB(AL, AL); /* -1, 0 */
+		AL &= -3;
+		PUSH(ECX);
+		AL += 11; /* 8, 11 */
+		EBX = 320 + 512; /* len0 */
+		(char) work->state = AL;
+		getlen1();
+		ECX = EDX;
+		POP(EDX);
+	} else { /* 非repなLZ */
+		EAX = work->repdis[8];
+		EDX = work->repdis[4];
+		EBX = work->repdis[0];
+		work->repdis[12] = EAX;
+		work->repdis[ 8] = EDX;
+		AL = (char) work->state;
+		work->repdis[ 4] = EBX;
+		CMP(AL, 7);
+		POP(EDX); /* posState */
+		SBB(AL, AL); /* -1, 0 */
+		AL &= -3;
+		AL += 10; /* 7, 10 */
+		EBX = 320 + 1024; /* len1 */
+		(char) work->state = AL;
+		getlen1();
+		EBX = EDX;
+		PUSH(EDX); /* len */
+		EDI = work->ptbm[32];
+		if ((unsigned) EBX >= 3) {
+			EBX = 3;
+			EDI = work->ptbm[36];
+		}
+		EBX *= 64;
+		CH = 0x06;
+		EBX += 320 + 256; /* pslot */
+		rdd_probtree1_f();
+		EDX &= 0x3f;
+		if (EDX >= 4) {
+			ECX = EDX;
+			EBX = EDX;
+			(unsigned int) ECX >>= 1;
+			EDX = 1;
+			ECX--; /* CF不変 */
+			RCL(EDX, 1);
+			if ((unsigned) EBX < 14) {
+				/* リバースでECXビットをEDXに押し込む */
+				PUSH(EDX);
+				SHL(EDX, CL);
+				NOT(EBX);
+				PUSH(ECX);
+				EDI = work->ptbm[40];
+				CH = CL;
+				LEA(EBX, [EBX + EDX + 448]); /* spdis */
+				if (CL >= 4)
+					EDI = work->ptbm[44];
+				rdd_probtree1_f();
+				POP(ECX);
+			} else {
+				ECX -= 6;
+				if ((unsigned) > 0)
+					rdd_direct1();
+				EDI = work->ptbm[48];
+				CH = 0x06;
+				EBX = 320 + 1536; /* align */
+				PUSH(EDX);
+				rdd_probtree1_f();
+				CL = 6;
+			}
+			EBX = EDX;
+			POP(EDX);
+			do {
+				(unsigned int) EBX >>= 1;
+				RCL(EDX, 1);
+				CL--;
+			} while (!= 0);
+		}
+		NOT(EDX);
+		POP(ECX); /* len */
+		work->repdis[0] = EDX;
+	}
+
+rep0l1skip:
+	PUSH(EDI);
+	ECX += 2;
+	PUSH(ESI);
+	EDI = work->outStream;
+	ESI = work->outSize;
+	ESI -= work->nowPos;
+	if ((unsigned) ECX >= ESI)
+		ECX = ESI;
+	LEA(ESI, [EDI + EDX]);
+	work->nowPos += ECX;
+	if ((unsigned) ESI < work->q0)
+		goto err;
+	asmout("rep movsb");
+	work->outStream = EDI;
+	POP(ESI);
+	EDX = work->nowPos;
+	POP(EDI);
+	if ((unsigned) EDX >= work->outSize)
+		goto fin;
+lzdone:
+	EBX = work->state;
+	EDI = work->ptbm[4];
+	EDX &= work->posStateMask;
+	EBX *= 16;
+	if (== 0)
+		EDI = work->ptbm[0];
+	PUSH(EDX); /* posState */
+	LEA(EBX, [EBX + EDX + 320 + 1632]); /* mch */
+	CH = 0x01;
+	EDX = 0;
+	rdd_probtree_f();
+	if (== 0)
+		goto lzphase;
+
+	POP(EDX);
+	EBX = work->state;
+	EDX = work->nowPos;
+	EDI = work->outStream;
+//	BL = [SEG_CS:state_table + EBX];
+	asmout("MOV BL,[DS:.state_table+EBX]");
+	EDX &= work->literalPosMask;
+	(char) work->state = BL;
+	CL = work->lc;
+	EBX = (unsigned char) [SEG_ES:EDI - 1];
+	SHL(EDX, CL);
+	PUSH(EDI);
+	CL = work->lc8;
+	SHR(EBX, CL);
+	EBX += EDX;
+	EDX = work->repdis[0];
+	EBX *= 256;
+	CL = [SEG_ES:EDI + EDX];
+
+	PUSH(EBX);
+	EDX = 0;
+	EBX *= 2; /* 512 */
+	EDX++; /* EDX = 1 */
+	EBX += work->lit1;
+	AL = work->lit0cntmsk;
+	EDI = 32 + 768; /* bm[24] */
+	do {
+		ECX *= 2;
+		PUSH(EBX);
+		PUSH(ECX);
+		PUSH(EDI);
+		PUSH(EAX);
+		ECX &= 0x100;
+		EDI = work->ptbm[8];
+		EBX += ECX;
+		CH = 0x01;
+		rdd_probtree_f();
+		POP(EAX);
+		POP(EDI);
+		CL = AL;
+		EAX--;
+		(unsigned char) CL >>= 4;
+		TEST(AL, CL);
+		if (== 0)
+			EDI += 32;
+		POP(ECX);
+		AH = DL;
+		POP(EBX);
+		AH ^= CH;
+		if (EDX >= 0x100)
+			goto finlit1;
+		TEST(AH, 1);
+	} while (== 0);
+	CH = AL;
+	POP(EBX);
+	EBX += 320 + 2064; /* lit0 */
+	if (AL > 0x70) {
+		CH &= 0x0f;
+		rdd_probtree_f();
+		goto lit11;
+	}
+	rdd_probtree();
+	goto lit11;
+finlit1:
+	POP(EBX);
+	goto lit11;
+err:
+	EAX = 0;
+	ESP = [SS:EBP - 4];
+	EAX++;
+fin:
+	return;
+state_table:
+	DB(0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 4, 5);
+}
+
+/* 以上tek5用 */
+
+void lzrestore_stk2()
+/* ESI, EDI, EBP */
+{
+	ESI++; /* 01をスキップ */
+	EBP += EDI;
+	DH = 0;
+	PUSH(EDI);
+	PUSH(EBP);
+	PUSH(3);
+	PUSH(2);
+	PUSH(1);
+	PUSH(0);
+	EBP = ESP;
+	do {
+		/* byの長さの取得 */
+		/* これは長くなりやすい */
+		ECX = 0;
+		do {
+			ECX++;
+			if ((unsigned) ECX >= 17)
+				goto long_by0;
+			if (DH == 0) {
+				DH = 8;
+				DL = [DS:ESI];
+				ESI++;
+			}
+			DH--;
+			(unsigned char) DL >>= 1;
+		} while (CF == 0);
+long_by1:
+		asmout("REP MOVSB");
+		if ((unsigned) EDI >= [SS:EBP + 16])
+			break;
+
+		/* lzの長さの取得 */
+		ECX = 0;
+		do {
+			ECX++;
+			if ((unsigned) ECX >= 17)
+				goto long_lz0;
+			if (DH == 0) {
+				DH = 8;
+				DL = [DS:ESI];
+				ESI++;
+			}
+			DH--;
+			(unsigned char) DL >>= 1;
+		} while (CF == 0);
+long_lz1:
+		EBX = ECX;
+		PUSH(EDX);
+		do {
+			EDX = (unsigned char) [DS:ESI];
+			ESI++;
+			PUSH(EDX);
+			EDX &= 0x0f;
+			(unsigned int) EDX >>= 1;
+			if (CF == 0) {
+				EAX = (unsigned char) [DS:ESI];
+				ESI++;
+				(unsigned int) EAX >>= 1;
+				if (CF == 0)
+					goto long_ds0;
+	long_ds1:
+				LEA(EDX, [EDX + EAX * 8 + 8]);
+			}
+			PUSH(EDI);
+			ECX = [SS:EBP +  8];
+			EAX = [SS:EBP +  4];
+			EDI = [SS:EBP +  0];
+			EDX -= 6;
+			if ((unsigned) < 0)
+				goto repdis_hit;
+	repdis_hit3:
+			[SS:EBP + 12] = ECX;
+	repdis_hit2:
+			[SS:EBP +  8] = EAX;
+	repdis_hit1:
+			[SS:EBP +  4] = EDI;
+	repdis_hit0:
+			POP(EDI);
+			[SS:EBP +  0] = EDX;
+			POP(ECX);
+			NOT(EDX);
+			(unsigned int) ECX >>= 4;
+			if (== 0)
+				goto long_cp0;
+			ECX++;
+	long_cp1:
+			PUSH(ESI);
+			LEA(EAX, [EDI + ECX]);
+			LEA(ESI, [EDI + EDX]);
+			if ((unsigned) EAX > [SS:EBP + 16])
+				goto fix_ECX;
+fix_ECX1:
+			if ((unsigned) ESI < [SS:EBP + 20])
+				goto err;
+			asmout("REP MOVSB");
+		//	asmout("REP ES MOVSB");
+			POP(ESI);
+			EBX--;
+		} while (!= 0);
+		POP(EDX);
+	} while ((unsigned) EDI < [SS:EBP + 16]);
+fin:
+	ESP += 24;
+	EAX = 0;
+	return;
+
+long_by0:
+	getnum_s7s();
+	ECX += EAX;
+	goto long_by1;
+
+long_lz0:
+	getnum_s7s();
+	ECX += EAX;
+	goto long_lz1;
+
+long_ds0:
+	PUSH(EDX);
+	ESI--;
+	getnum_s7();
+	POP(EDX);
+	goto long_ds1;
+
+long_cp0:
+	ECX = (unsigned char) [DS:ESI];
+	ESI++;
+	ECX += 17 * 2;
+	(unsigned int) ECX >>= 1;
+	if (CF != 0)
+		goto long_cp1;
+	PUSH(EDX);
+	ESI--;
+	getnum_s7();
+	POP(EDX);
+	LEA(ECX, [EAX + 17]);
+	goto long_cp1;
+
+repdis_hit:
+	if (DL == -6)
+		goto repdis0_hit;
+	if (DL == -5)
+		goto repdis1_hit;
+	if (DL == -4)
+		goto repdis2_hit;
+	if (DL == -2)
+		goto rel0;
+	if (DL == -1)
+		goto rel1;
+	EDX = [SS:EBP + 12];
+	goto repdis_hit3;
+repdis0_hit:
+	EDX = [SS:EBP + 0];
+	goto repdis_hit0;
+repdis1_hit:
+	EDX = [SS:EBP + 4];
+	goto repdis_hit1;
+repdis2_hit:
+	EDX = [SS:EBP + 8];
+	goto repdis_hit2;
+
+rel0:
+	[SS:EBP + 12] = ECX;
+	[SS:EBP +  8] = EAX;
+	getnum_s7();
+	LEA(EDX, [EDI + EAX + 1]);
+	goto repdis_hit1;
+
+rel1:
+	[SS:EBP + 12] = ECX;
+	[SS:EBP +  8] = EAX;
+	getnum_s7();
+	NEG(EAX);
+	LEA(EDX, [EDI + EAX - 1]);
+	goto repdis_hit1;
+
+fix_ECX:
+	ECX = [SS:EBP + 16];
+	ECX -= EDI;
+	goto fix_ECX1;
+
+err:
+	ESP += 28;
+	EAX = 0;
+	EAX++;
+	return;
+}
+
+void getnum_s7()
+/* DS:ESIからリード */
+/* ECX, EDX 破壊 */
+{
+	int tmp0 == ECX, tmp1 == EDX;
+	EAX = 0;
+	LODSB();
+	(unsigned int) EAX >>= 1;
+	if (CF == 0) {
+		tmp1 = 0;
+		tmp0 = 0;
+		tmp1++;
+		do {
+			tmp1 <<= 7;
+			EAX <<= 8;
+			tmp0 += tmp1;
+			LODSB();
+			(unsigned int) EAX >>= 1;
+		} while (CF == 0);
+		EAX += tmp0;
+	}
+	return;
+}
+
+void lzrestore_stk1()
+{
+	ESI++; /* 01をスキップ */
+	EBP += EDI;
+	ECX = 0; /* bugfix by K, 2004.07.26 */
+	PUSH(EDI);
+	do {
+		CL = (unsigned char) [DS:ESI];
+		ESI++;
+		EBX = ECX; /* by */
+		ECX &= 0x0f;
+		if (== 0)
+			goto getlong_by;
+getlong_by0:
+		(unsigned int) EBX >>= 4;
+		if (== 0)
+			goto getlong_lz;
+getlong_lz0:
+		asmout("REP MOVSB");
+		if ((unsigned) EDI >= EBP)
+			break;
+		do {
+			EDX = (unsigned char) [DS:ESI];
+			ESI++;
+			ECX = EDX;
+			EDX &= 0x0f;
+			(unsigned int) EDX >>= 1;
+			if (CF == 0) {
+				do {
+					EDX <<= 8;
+					DL = [DS:ESI];
+					ESI++;
+					(unsigned int) EDX >>= 1;
+				} while (CF == 0);
+			}
+			ECX >>= 4;
+			if (== 0)
+				goto long_cp;
+long_cp0:
+			ECX++;
+			NOT(EDX);
+			PUSH(ESI);
+			LEA(EAX, [EDI + ECX]);
+			LEA(ESI, [EDI + EDX]);
+			if ((unsigned) EAX > EBP)
+				goto fix_ECX;
+fix_ECX1:
+			if ((unsigned) ESI < [SS:ESP + 4])
+				goto err;
+			asmout("REP MOVSB");
+		//	asmout("REP ES MOVSB");
+			POP(ESI);
+			EBX--;
+		} while (!= 0);
+	} while ((unsigned) EDI < EBP);
+fin:
+	POP(ESI);
+	EAX = 0;
+	return;
+
+getlong_lz:
+	getnum_s7s();
+	XCHG(EAX, EBX);
+	goto getlong_lz0;
+
+getlong_by:
+	getnum_s7s();
+	XCHG(EAX, ECX);
+	goto getlong_by0;
+
+long_cp:
+	getnum_s7s();
+	XCHG(EAX, ECX);
+	goto long_cp0;
+
+fix_ECX:
+	ECX = EBP;
+	ECX -= EDI;
+	goto fix_ECX1;
+
+err:
+	POP(ESI);
+	EAX = 0;
+	POP(ESI);
+	EAX++;
+	return;
+}

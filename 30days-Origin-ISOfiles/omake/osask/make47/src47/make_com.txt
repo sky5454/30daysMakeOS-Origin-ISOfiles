@@ -1,0 +1,20 @@
+# Makefileのインクルードファイル
+# 全機種共通
+
+MAKE     = $(TOOLPATH)make.exe -r
+SJISCONV = $(TOOLPATH)sjisconv.exe -s
+CC1      = $(TOOLPATH)cc1.exe -I$(INCPATH) -Os -Wall -quiet
+GAS2NASK = $(TOOLPATH)gas2nask.exe -a
+NASK     = $(TOOLPATH)nask.exe
+OBJ2BIM  = $(TOOLPATH)obj2bim.exe
+BIM2BIN  = $(TOOLPATH)bim2bin.exe
+CPP0     = $(TOOLPATH)cpp0.exe -P -I$(INCPATH)
+ASKA     = $(TOOLPATH)aska.exe
+NASKCNV  = $(TOOLPATH)naskcnv0.exe -l -s
+GOLIB    = $(TOOLPATH)golib00.exe
+OSALINK  = $(TOOLPATH)osalink1.exe
+EDIMG    = $(TOOLPATH)edimg.exe
+DELE     = del
+COPY     = copy
+
+TXT2BIN  = ../ankfont0/txt2bin.exe

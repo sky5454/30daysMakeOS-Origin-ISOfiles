@@ -1,0 +1,107 @@
+﻿关于omake目录的内容
+
+  关于下面的说明如果有不明白的地方，请到支持页面提问。
+
+1.tolsrc目录
+
+  tolset的源代码。虽然这些代码可能没有什么人会去看，不过有总比没有要好吧（
+读者当中总归有一两个人想看这些源代码的）。
+
+    aksa1a      aksa.exe的源代码。
+      -- 这是对ASKA进行反汇编的软件（将可执行文件转换为源代码）。
+         关于ASKA请参见下面的说明。
+
+    aska        aska.exe的源代码。
+      -- 这是一个和nask语法不大一样汇编器。比如用 EAX = ECX; 来代替 MOV。
+         笔者很喜欢用，不过bug比较多，不太好用，因此也没向大家推荐。
+
+    bim2bi4w    bim2bin.exe的源代码。
+
+    bim2hrb     bim2hrb.exe的源代码。
+
+    bin2obj     bin2obj.exe的源代码。
+
+    doscmd0a    doscmd.exe的源代码。
+      -- 这主要是为Cygwin中tolset无法正常工作的人所准备的工具。详细请参见
+         tolopt/fix_cygw/readme.txt 或者参见支持页面。
+
+    edimg0j     edimg.exe的源代码。
+
+    go_0023s    cc1.exe, cpp0.exe, nask.exe, gas2nask.exe, golib00.exe,
+                naskcnv0.exe, sjisconv.exe, golibc.lib, w32clibc.lib 的
+				源代码。
+                  cc1.exe      -- C语言编译器
+                  cpp0.exe     -- 仅处理 #include 和 #define 的程序
+                  nask.exe     -- 汇编器
+                  gas2nask.exe --  将cc1输出的文件转换为nask格式
+                  golib00.exe  -- 库管理器
+                  naskcnv0.exe -- 将aska输出的文件转换为nask格式
+                  sjisconv.exe -- 将包含全角字符的源代码转换为cc1可安全
+								  处理的格式
+                  golibc.lib   -- sprintf等不依赖操作系统的标准函数库
+                                  随编译器附带的
+                  w32clibc.lib -- Windows用的标准函数库
+
+    hrblib0a    z_tools/haribote/harilibc.lib的源代码。
+      -- 用来调用HariMain的库。
+
+    imgtol0d    imgtol.com的源代码。
+
+    makefont    makefont.exe的源代码。
+
+    obj2bi4d    obj2bim.exe的源代码。
+
+    osalink1    osalink1.exe的源代码。
+      -- 这是OSASK的操作系统核心专用的连接器。这个东西可能也没什么用处，
+	     不过将这个程序放到tolset中是OSASK界的惯例，因此也就放进去了。
+		 既然如此这里也需要提供这个程序的源代码，仅此而已。
+
+   sartol0j     sartol.exe的源代码。
+     -- 用tek压缩算法对文件进行压缩、解压缩的软件。标准扩展名为.sar。
+
+   tk5lgpl1    t5lzma.exe的源代码。
+
+2.osask目录
+
+  这是笔者正在开发的OSASK的ver.4.7版本，附送给大家的。也许这个没有什么用，
+有兴趣的话就权当消遣也无所谓。
+
+    osat47i    最基本的OSASK软件包。只要参照README0.TXT的第4.章就可以完成
+               安装。其他章节中介绍了如何安装到硬盘或移动存储器，不过有很多
+               相关的注意事项，不遵守的话可能会比较危险，不推荐大家这样做。
+
+    osat47uf   如果使用USB软盘驱动器的话，请用这个代替osat47i。
+
+    osat47cd   用于CD-ROM启动的.ISO版OSASK。
+
+    make47     OSASK ver.4.7 的源代码。
+
+3.heboos目录
+
+  这是一个笔者发表在 http://community.osdev.info/?FirstStep 上面的一个功能非常
+低级的操作系统。这个系统全部用汇编语言编写，而且是16位模式的。在本书出版之前，
+一直是用这个系统作为“操作系统自制入门”的。
+
+  minifsos是“迷你版（mini）初级（first-step）操作系统”的意思，操作系统只有80个
+字节，只能画出一些图形。详情请参见上述网页。
+
+  heboos是另外一个操作系统，核心的大小增加到1.08KB。虽然这个大小只有“纸娃娃系统”
+的3%不到，但是可以执行dir等命令。详情请参见上述网页。
+
+  上面提到的两个系统，在看完本书学习了操作系统编写方法之后，基本上都没有参考价值
+了，作为一个只用asmhead.nas来编写的操作系统实例来说还是不错的，因此笔者将它们也
+放在光盘中附送给大家，给大家展示一个只用汇编语言就能编写出操作系统的世界。
+
+4.tolopt目录
+
+  这是为扩展、改良tolset用的tolset扩展工具包，有需要的话可以使用（基本上不会用到）。
+每个工具的使用方法详见各目录中的readme.txt。
+
+    fix_cygw   由于使用Cygwin而无法正常make的人可以用这个。
+    bochs226   QEMU无论如何也无法正常工作，或者不喜欢QEMU想要换用其他模拟器的话，
+               这里给大家准备了bochs-2.2.6。
+
+5.其他
+
+  如果想要用QEMU随便体验一下笔者开发的OSASK，请双击 tolset/z_osabin/ 的run.bat。
+关于使用方法，请参见上述osat47i中的readme文件。

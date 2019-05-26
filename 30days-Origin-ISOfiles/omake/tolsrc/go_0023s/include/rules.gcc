@@ -1,0 +1,22 @@
+GCC = e:\mingw\bin\gcc.exe
+MAKE = make.exe
+LIBRARIAN = golib00.exe
+DEL = del
+
+MAKER = $(MAKE) -r
+MAKEC = $(MAKE) -C
+COMPILE = $(GCC) -c -Os
+LINK = $(GCC) -Wl,-s
+LINK_ADDLIB =
+
+GODRV = ../drv_stdc/drv_stdc.obj
+GODRVDIR = ../drv_stdc
+LINKOPT_CPP0 =
+LINKOPT_CC1  =
+LINKOPT_CC1P =
+
+%.o : %.c Makefile ../include/rules.mak
+	$(COMPILE) -DIN_GCC -DHAVE_CONFIG_H -I../include -o $*.o $*.c
+
+%.obj : %.c Makefile ../include/rules.mak
+	$(COMPILE) -o $*.obj $*.c

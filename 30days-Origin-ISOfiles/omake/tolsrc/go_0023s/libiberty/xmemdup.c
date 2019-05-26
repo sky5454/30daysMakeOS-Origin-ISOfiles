@@ -1,0 +1,39 @@
+/* xmemdup.c -- Duplicate a memory buffer, using xcalloc.
+   This trivial function is in the public domain.
+   Jeff Garzik, September 1999.  */
+
+/*
+
+@deftypefn Replacement void* xmemdup (void *@var{input}, size_t @var{copy_size}, size_t @var{alloc_size})
+
+Duplicates a region of memory without fail.  First, @var{alloc_size} bytes
+are allocated, then @var{copy_size} bytes from @var{input} are copied into
+it, and the new memory is returned.  If fewer bytes are copied than were
+allocated, the remaining memory is zeroed.
+
+@end deftypefn
+
+*/
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+/* !kawai! */
+#include "../include/ansidecl.h"
+#include "../include/libiberty.h"
+/* end of !kawai! */
+
+#ifdef HAVE_STRING_H
+#include "../include/string.h"
+#endif
+
+PTR
+xmemdup (input, copy_size, alloc_size)
+  const PTR input;
+  size_t copy_size;
+  size_t alloc_size;
+{
+  PTR output = xcalloc (1, alloc_size);
+  memcpy (output, input, copy_size);
+  return output;
+}

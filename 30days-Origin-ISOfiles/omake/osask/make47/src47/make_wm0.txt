@@ -1,0 +1,17 @@
+# linker options for winmain0
+
+STK_WM_AT = 64k
+STK_WM_TW = 64k
+STK_WM_NE = 64k
+
+MLC_WM_AT = 4272k
+MLC_WM_TW = 4272k
+MLC_WM_NE = 4272k
+
+MMA_WM_AT = 4160k
+MMA_WM_TW = 4160k
+MMA_WM_NE = 4160k
+
+BIM_WM_AT = -tek5 eopt:-fb75  eprm:z1
+BIM_WM_TW = -tek5 eopt:-fb83  eprm:z1
+BIM_WM_NE = -tek5 eopt:-fb124 eprm:z1

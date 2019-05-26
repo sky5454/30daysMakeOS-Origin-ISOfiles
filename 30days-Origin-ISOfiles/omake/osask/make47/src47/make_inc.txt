@@ -1,0 +1,31 @@
+# Makefileのインクルードファイル
+# 各種設定用
+
+# ウィンドウデザイン
+DESIGN = WIN9X
+# DESIGN = WIN9X
+# DESIGN = TMENU
+# DESIGN = WIN31
+# DESIGN = CHO_OSASK
+# DESIGN = NEWSTYLE
+
+# 標準半角フォント
+FONTSRC = ibmank0.txt
+# FONTSRC = ibmank0.txt
+# FONTSRC = win31.txt
+# FONTSRC = newstyle.txt
+
+# pcat用のオプション
+DEFINES_AT =
+# DEFINES_AT = -DBOCHS
+
+# towns用のオプション
+DEFINES_TW = -DTWVSW=1024 -DVMODE -DCLGD543X
+# DEFINES_TW = -DTWVSW=1024 -DVMODE -DCLGD543X
+
+# nec98用のオプション
+DEFINES_NE = 
+# DEFINES_NE =
+
+# その他のオプション
+#  今のところなし
