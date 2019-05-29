@@ -1,6 +1,8 @@
 # 30daysMakeOS-Origin-ISOfiles
-[WIKI](https://github.com/sky5454/30daysMakeOS-Origin-ISOfiles/wiki)  
-《30天自制操作系统》光盘完整原版镜像文件 ，中文说明在下面  
+本项目为《30天自制操作系统》光盘完整日文原版镜像文件  
+[WIKI地址](https://github.com/sky5454/30daysMakeOS-Origin-ISOfiles/wiki)  
+附上：[《30天自制操作系统》源码中文版](https://github.com/yourtion/30dayMakeOS)  
+本项目中文说明在下面  
 <br/>
 
 ## En-readme
